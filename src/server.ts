@@ -201,7 +201,8 @@ app.get("/health", (_req, res) => {
 });
 
 app.get("/session/:sessionId/status", authMiddleware, (req, res) => {
-  const { sessionId } = req.params;
+  // Correção 1: type casting explicito para string
+  const sessionId = req.params.sessionId as string;
 
   if (!safeSessionId(sessionId)) {
     res.status(400).json({ error: "Invalid sessionId" });
@@ -219,7 +220,8 @@ app.get("/session/:sessionId/status", authMiddleware, (req, res) => {
 });
 
 app.post("/session/:sessionId/start", authMiddleware, async (req, res) => {
-  const { sessionId } = req.params;
+  // Correção 2: type casting explicito para string
+  const sessionId = req.params.sessionId as string;
 
   if (!safeSessionId(sessionId)) {
     res.status(400).json({ error: "Invalid sessionId" });
@@ -252,7 +254,8 @@ app.post("/session/:sessionId/start", authMiddleware, async (req, res) => {
 });
 
 app.get("/session/:sessionId/qr", authMiddleware, (req, res) => {
-  const { sessionId } = req.params;
+  // Correção 3: type casting explicito para string
+  const sessionId = req.params.sessionId as string;
 
   if (!safeSessionId(sessionId)) {
     res.status(400).json({ error: "Invalid sessionId" });
@@ -278,7 +281,8 @@ app.get("/session/:sessionId/qr", authMiddleware, (req, res) => {
 });
 
 app.post("/session/:sessionId/logout", authMiddleware, async (req, res) => {
-  const { sessionId } = req.params;
+  // Correção 4: type casting explicito para string
+  const sessionId = req.params.sessionId as string;
 
   if (!safeSessionId(sessionId)) {
     res.status(400).json({ error: "Invalid sessionId" });
