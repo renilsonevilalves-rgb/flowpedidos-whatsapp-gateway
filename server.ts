@@ -56,6 +56,7 @@ type Session = {
 const sessions = new Map<string, Session>();
 const processedMessages = new Set<string>();
 const userLastReply = new Map<string, number>();
+const replyInFlight = new Set<string>();
 const manualLogouts = new Set<string>();
 
 function authMiddleware(req: Request, res: Response, next: NextFunction) {
@@ -173,31 +174,41 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
       const lastReplyTime = userLastReply.get(userKey) || 0;
       const fourHours = 1000 * 60 * 60 * 4;
 
-      // Responde automaticamente apenas uma vez a cada 4 horas por cliente.
-      // Mensagens posteriores, mesmo contendo "oi" ou outro gatilho, não recebem
-      // o cardápio novamente durante esse período. Isso evita spam quando o cliente
-      // está apenas conversando com a lanchonete.
+      // No máximo uma resposta automática a cada 4 horas por cliente.
       if (now - lastReplyTime <= fourHours) continue;
       if (!isTrigger) continue;
 
-      const storeInfo = await fetchStoreInfo(id);
-      if (!storeInfo?.menuUrl) {
-        logger.warn({ sessionId: id }, "[Auto-Reply] Store has no menuUrl");
+      // Impede duplicações quando várias mensagens chegam quase ao mesmo tempo.
+      // Sem este lock, todas as mensagens concorrentes podem observar lastReplyTime=0
+      // antes que a primeira consulta ao Vercel e o envio do WhatsApp terminem.
+      if (replyInFlight.has(userKey)) {
+        logger.info({ sessionId: id, remoteJid }, "[Auto-Reply] Resposta já em processamento; mensagem ignorada");
         continue;
       }
+      replyInFlight.add(userKey);
 
-      let replyText = storeInfo.autoReplyMessage;
-      if (!replyText) {
-        replyText = `Olá! 👋 Seja bem-vindo ao nosso atendimento.\n\nConfira nosso cardápio digital e faça seu pedido:\n\n${storeInfo.menuUrl}`;
-      } else if (replyText.includes("{link}")) {
-        replyText = replyText.replace(/\{link\}/g, storeInfo.menuUrl);
-      } else if (!replyText.includes(storeInfo.menuUrl)) {
-        replyText = `${replyText}\n\n${storeInfo.menuUrl}`;
+      try {
+        const storeInfo = await fetchStoreInfo(id);
+        if (!storeInfo?.menuUrl) {
+          logger.warn({ sessionId: id }, "[Auto-Reply] Store has no menuUrl");
+          continue;
+        }
+
+        let replyText = storeInfo.autoReplyMessage;
+        if (!replyText) {
+          replyText = `Olá! 👋 Seja bem-vindo ao nosso atendimento.\n\nConfira nosso cardápio digital e faça seu pedido:\n\n${storeInfo.menuUrl}`;
+        } else if (replyText.includes("{link}")) {
+          replyText = replyText.replace(/\{link\}/g, storeInfo.menuUrl);
+        } else if (!replyText.includes(storeInfo.menuUrl)) {
+          replyText = `${replyText}\n\n${storeInfo.menuUrl}`;
+        }
+
+        await sock.sendMessage(remoteJid, { text: replyText });
+        userLastReply.set(userKey, Date.now());
+        logger.info({ sessionId: id, remoteJid }, "[Auto-Reply] Resposta enviada com sucesso");
+      } finally {
+        replyInFlight.delete(userKey);
       }
-
-      await sock.sendMessage(remoteJid, { text: replyText });
-      userLastReply.set(userKey, now);
-      logger.info({ sessionId: id, remoteJid }, "[Auto-Reply] Resposta enviada com sucesso");
     } catch (error: any) {
       logger.error({ error: error?.message || error, sessionId: id }, "[Auto-Reply] Erro ao processar mensagem");
     }
