@@ -143,6 +143,25 @@ function extractMessageText(message: any) {
   return message?.conversation || message?.extendedTextMessage?.text || message?.imageMessage?.caption || message?.videoMessage?.caption || "";
 }
 
+function isAutoReplyTrigger(text: string) {
+  const normalized = text
+    .toLowerCase()
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .trim();
+
+  if (!normalized) return false;
+
+  // Greetings must be standalone words. This prevents strings such as
+  // "foi", "coisa" or "depois" from accidentally matching "oi".
+  const greetingOnly = /^(oi|ola|bom dia|boa tarde|boa noite|tudo bem)[!,.?\s]*$/i;
+  if (greetingOnly.test(normalized)) return true;
+
+  // Explicit requests for the menu/order are also valid triggers.
+  const explicitRequest = /\b(cardapio|menu|fazer\s+um\s+pedido|quero\s+(pedir|fazer\s+um\s+pedido)|gostaria\s+de\s+(pedir|ver\s+o\s+cardapio)|como\s+fac(o|o|a)\s+um\s+pedido)\b/i;
+  return explicitRequest.test(normalized);
+}
+
 async function handleIncomingMessages(id: string, sock: WASocket, messages: any[], type: string) {
   if (type !== "notify") return;
 
@@ -166,30 +185,34 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
 
       logger.info({ sessionId: id, remoteJid, text }, "[Incoming] WhatsApp message received");
 
-      const lowerText = text.toLowerCase();
-      const triggers = ["oi", "olá", "ola", "bom dia", "boa tarde", "boa noite", "tudo bem", "quero fazer um pedido", "cardápio", "cardapio", "menu", "pedido"];
-      const isTrigger = triggers.some((trigger) => lowerText.includes(trigger));
-      const userKey = `${id}-${remoteJid}`;
-      const now = Date.now();
-      const lastReplyTime = userLastReply.get(userKey) || 0;
-      const fourHours = 1000 * 60 * 60 * 4;
-
-      // No máximo uma resposta automática a cada 4 horas por cliente.
-      if (now - lastReplyTime <= fourHours) continue;
+      const isTrigger = isAutoReplyTrigger(text);
       if (!isTrigger) continue;
 
-      // Impede duplicações quando várias mensagens chegam quase ao mesmo tempo.
-      // Sem este lock, todas as mensagens concorrentes podem observar lastReplyTime=0
-      // antes que a primeira consulta ao Vercel e o envio do WhatsApp terminem.
-      if (replyInFlight.has(userKey)) {
-        logger.info({ sessionId: id, remoteJid }, "[Auto-Reply] Resposta já em processamento; mensagem ignorada");
+      const userKey = `${id}-${remoteJid}`;
+      const now = Date.now();
+      const fourHours = 1000 * 60 * 60 * 4;
+      const lastReplyTime = userLastReply.get(userKey) || 0;
+
+      // Reserve the reply BEFORE any await. This is the important idempotency
+      // guarantee: another socket/event cannot pass the check while the first
+      // request is still waiting for Vercel or WhatsApp.
+      if (now - lastReplyTime <= fourHours) {
+        logger.info({ sessionId: id, remoteJid }, "[Auto-Reply] 4-hour cooldown active; message ignored");
         continue;
       }
+
+      if (replyInFlight.has(userKey)) {
+        logger.info({ sessionId: id, remoteJid }, "[Auto-Reply] Reply already reserved; duplicate event ignored");
+        continue;
+      }
+
       replyInFlight.add(userKey);
+      userLastReply.set(userKey, now);
 
       try {
         const storeInfo = await fetchStoreInfo(id);
         if (!storeInfo?.menuUrl) {
+          userLastReply.delete(userKey);
           logger.warn({ sessionId: id }, "[Auto-Reply] Store has no menuUrl");
           continue;
         }
@@ -204,8 +227,12 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
         }
 
         await sock.sendMessage(remoteJid, { text: replyText });
-        userLastReply.set(userKey, Date.now());
         logger.info({ sessionId: id, remoteJid }, "[Auto-Reply] Resposta enviada com sucesso");
+      } catch (error) {
+        // If sending failed, allow a later message to retry instead of locking
+        // the customer out for four hours.
+        userLastReply.delete(userKey);
+        throw error;
       } finally {
         replyInFlight.delete(userKey);
       }
