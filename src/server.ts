@@ -136,176 +136,6 @@ async function waitForQrOrConnected(id: string, timeoutMs = 10000) {
   return session.status;
 }
 
-async function connectSession(id: string, forceFresh = false): Promise<void> {
-  const session = getOrCreateSession(id);
-
-  if (session.starting) {
-    return session.starting;
-  }
-
-  if (session.status === "connected" && session.sock) {
-    return;
-  }
-
-  if (forceFresh) {
-    await clearAuthState(id);
-  }
-
-  session.status = "starting";
-  session.qr = undefined;
-  session.qrDataUrl = undefined;
-  session.phone = undefined;
-
-  session.starting = (async () => {
-    const authPath = authPathFor(id);
-    const { state, saveCreds } = await useMultiFileAuthState(authPath);
-
-    const sock = makeWASocket({
-      auth: state,
-      printQRInTerminal: false,
-      qrTimeout: 60000,
-      logger: logger.child({ sessionId: id }),
-      markOnlineOnConnect: false,
-      syncFullHistory: false,
-      shouldIgnoreJid: (jid) => jid === "status@broadcast",
-    });
-
-    session.sock = sock;
-    sock.ev.on("creds.update", saveCreds);
-
-    sock.ev.on("connection.update", async (update) => {
-      const { connection, lastDisconnect, qr } = update;
-
-      if (qr) {
-        try {
-          session.status = "qr";
-          session.qr = qr;
-          session.qrDataUrl = await QRCode.toDataURL(qr, {
-            errorCorrectionLevel: "M",
-            margin: 2,
-            width: 420,
-          });
-          logger.info({ sessionId: id }, "QR code generated");
-        } catch (error) {
-          session.status = "error";
-          logger.error({ error, sessionId: id }, "Failed to generate QR data URL");
-        }
-      }
-
-      if (connection === "open") {
-        session.status = "connected";
-        session.qr = undefined;
-        session.qrDataUrl = undefined;
-        session.phone = sock.user?.id?.split(":")[0];
-        logger.info({ sessionId: id, phone: session.phone }, "WhatsApp connected");
-      }
-
-      if (connection === "close") {
-        const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
-        const loggedOut = statusCode === DisconnectReason.loggedOut;
-        const badSession = statusCode === DisconnectReason.badSession;
-        const manuallyLoggedOut = manualLogouts.has(id);
-
-        session.sock = undefined;
-        session.qr = undefined;
-        session.qrDataUrl = undefined;
-        session.phone = undefined;
-
-        if (manuallyLoggedOut) {
-          manualLogouts.delete(id);
-          session.status = "logged_out";
-          logger.info({ sessionId: id }, "WhatsApp session logged out manually");
-          return;
-        }
-
-        if (loggedOut || badSession) {
-          session.status = "disconnected";
-          await clearAuthState(id);
-          logger.warn({ sessionId: id, statusCode }, "WhatsApp auth state invalid; preparing fresh QR");
-          scheduleReconnect(id, true, 1000);
-          return;
-        }
-
-        session.status = "disconnected";
-        logger.warn({ sessionId: id, statusCode }, "WhatsApp connection closed; reconnecting");
-        scheduleReconnect(id, false, 3000);
-      }
-    });
-  })();
-
-  try {
-    await session.starting;
-  } finally {
-    session.starting = undefined;
-  }
-}
-
-async function startSessionWithRecovery(id: string) {
-  const session = getOrCreateSession(id);
-
-  if (session.status === "connected" && session.sock) {
-    return;
-  }
-
-  await connectSession(id, session.status === "logged_out");
-
-  let status = await waitForQrOrConnected(id, 10000);
-
-  if (status === "starting" || status === "disconnected") {
-    logger.warn({ sessionId: id, status }, "No QR/connection after initial start; resetting auth state");
-
-    if (session.sock) {
-      try {
-        session.sock.end(undefined);
-      } catch {}
-      session.sock = undefined;
-    }
-
-    if (session.reconnectTimer) {
-      clearTimeout(session.reconnectTimer);
-      session.reconnectTimer = undefined;
-    }
-
-    await clearAuthState(id);
-    session.status = "disconnected";
-    await connectSession(id, true);
-    status = await waitForQrOrConnected(id, 10000);
-  }
-
-  if (status === "error") {
-    throw new Error("Could not initialize WhatsApp session");
-  }
-}
-
-async function logoutSession(id: string) {
-  const session = sessions.get(id);
-  if (!session) {
-    await clearAuthState(id);
-    return;
-  }
-
-  manualLogouts.add(id);
-
-  if (session.reconnectTimer) {
-    clearTimeout(session.reconnectTimer);
-    session.reconnectTimer = undefined;
-  }
-
-  try {
-    await session.sock?.logout();
-  } catch (error) {
-    logger.warn({ error, sessionId: id }, "WhatsApp logout returned an error");
-  }
-
-  session.sock = undefined;
-  session.qr = undefined;
-  session.qrDataUrl = undefined;
-  session.phone = undefined;
-  session.status = "logged_out";
-
-  await clearAuthState(id);
-}
-
 async function fetchStoreInfo(sessionId: string) {
   if (!VERCEL_API_URL) {
     throw new Error("VERCEL_API_URL is not configured on the gateway");
@@ -422,10 +252,171 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
   }
 }
 
-async function attachMessageHandler(id: string, sock: WASocket) {
-  sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    await handleIncomingMessages(id, sock, messages, type);
-  });
+async function connectSession(id: string, forceFresh = false): Promise<void> {
+  const session = getOrCreateSession(id);
+
+  if (session.starting) return session.starting;
+  if (session.status === "connected" && session.sock) return;
+
+  if (forceFresh) {
+    await clearAuthState(id);
+  }
+
+  session.status = "starting";
+  session.qr = undefined;
+  session.qrDataUrl = undefined;
+  session.phone = undefined;
+
+  session.starting = (async () => {
+    const authPath = authPathFor(id);
+    const { state, saveCreds } = await useMultiFileAuthState(authPath);
+
+    const sock = makeWASocket({
+      auth: state,
+      printQRInTerminal: false,
+      qrTimeout: 60000,
+      logger: logger.child({ sessionId: id }),
+      markOnlineOnConnect: false,
+      syncFullHistory: false,
+      shouldIgnoreJid: (jid) => jid === "status@broadcast",
+    });
+
+    session.sock = sock;
+    sock.ev.on("creds.update", saveCreds);
+
+    sock.ev.on("messages.upsert", async ({ messages, type }) => {
+      await handleIncomingMessages(id, sock, messages, type);
+    });
+
+    sock.ev.on("connection.update", async (update) => {
+      const { connection, lastDisconnect, qr } = update;
+
+      if (qr) {
+        try {
+          session.status = "qr";
+          session.qr = qr;
+          session.qrDataUrl = await QRCode.toDataURL(qr, {
+            errorCorrectionLevel: "M",
+            margin: 2,
+            width: 420,
+          });
+          logger.info({ sessionId: id }, "QR code generated");
+        } catch (error) {
+          session.status = "error";
+          logger.error({ error, sessionId: id }, "Failed to generate QR data URL");
+        }
+      }
+
+      if (connection === "open") {
+        session.status = "connected";
+        session.qr = undefined;
+        session.qrDataUrl = undefined;
+        session.phone = sock.user?.id?.split(":")[0];
+        logger.info({ sessionId: id, phone: session.phone }, "WhatsApp connected");
+      }
+
+      if (connection === "close") {
+        const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+        const loggedOut = statusCode === DisconnectReason.loggedOut;
+        const badSession = statusCode === DisconnectReason.badSession;
+        const manuallyLoggedOut = manualLogouts.has(id);
+
+        session.sock = undefined;
+        session.qr = undefined;
+        session.qrDataUrl = undefined;
+        session.phone = undefined;
+
+        if (manuallyLoggedOut) {
+          manualLogouts.delete(id);
+          session.status = "logged_out";
+          logger.info({ sessionId: id }, "WhatsApp session logged out manually");
+          return;
+        }
+
+        if (loggedOut || badSession) {
+          session.status = "disconnected";
+          await clearAuthState(id);
+          logger.warn({ sessionId: id, statusCode }, "WhatsApp auth state invalid; preparing fresh QR");
+          scheduleReconnect(id, true, 1000);
+          return;
+        }
+
+        session.status = "disconnected";
+        logger.warn({ sessionId: id, statusCode }, "WhatsApp connection closed; reconnecting");
+        scheduleReconnect(id, false, 3000);
+      }
+    });
+  })();
+
+  try {
+    await session.starting;
+  } finally {
+    session.starting = undefined;
+  }
+}
+
+async function startSessionWithRecovery(id: string) {
+  const session = getOrCreateSession(id);
+
+  if (session.status === "connected" && session.sock) return;
+
+  await connectSession(id, session.status === "logged_out");
+
+  let status = await waitForQrOrConnected(id, 10000);
+
+  if (status === "starting" || status === "disconnected") {
+    logger.warn({ sessionId: id, status }, "No QR/connection after initial start; resetting auth state");
+
+    if (session.sock) {
+      try {
+        session.sock.end(undefined);
+      } catch {}
+      session.sock = undefined;
+    }
+
+    if (session.reconnectTimer) {
+      clearTimeout(session.reconnectTimer);
+      session.reconnectTimer = undefined;
+    }
+
+    await clearAuthState(id);
+    session.status = "disconnected";
+    await connectSession(id, true);
+    status = await waitForQrOrConnected(id, 10000);
+  }
+
+  if (status === "error") {
+    throw new Error("Could not initialize WhatsApp session");
+  }
+}
+
+async function logoutSession(id: string) {
+  const session = sessions.get(id);
+  if (!session) {
+    await clearAuthState(id);
+    return;
+  }
+
+  manualLogouts.add(id);
+
+  if (session.reconnectTimer) {
+    clearTimeout(session.reconnectTimer);
+    session.reconnectTimer = undefined;
+  }
+
+  try {
+    await session.sock?.logout();
+  } catch (error) {
+    logger.warn({ error, sessionId: id }, "WhatsApp logout returned an error");
+  }
+
+  session.sock = undefined;
+  session.qr = undefined;
+  session.qrDataUrl = undefined;
+  session.phone = undefined;
+  session.status = "logged_out";
+
+  await clearAuthState(id);
 }
 
 app.get("/health", (_req, res) => {
