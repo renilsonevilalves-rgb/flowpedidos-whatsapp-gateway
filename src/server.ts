@@ -163,6 +163,28 @@ function extractMessageText(message: any) {
   return message?.conversation || message?.extendedTextMessage?.text || message?.imageMessage?.caption || message?.videoMessage?.caption || "";
 }
 
+function isTrackOrderTrigger(text: string) {
+  const normalized = text.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+  return /^(acompanhar\s+pedido|acompanhar\s+meu\s+pedido|status\s+do\s+pedido|rastrear\s+pedido)[!,.?\s]*$/i.test(normalized);
+}
+
+async function fetchOrderStatus(sessionId: string, phone: string) {
+  if (!VERCEL_API_URL) throw new Error("VERCEL_API_URL is not configured on the gateway");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(`${VERCEL_API_URL}/api/webhook/whatsapp/order-status`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-API-Key": API_KEY },
+      body: JSON.stringify({ sessionId, phone }),
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.error || `Order-status returned HTTP ${response.status}`);
+    return data;
+  } finally { clearTimeout(timer); }
+}
+
 function isAutoReplyTrigger(text: string) {
   const normalized = text
     .toLowerCase()
@@ -201,6 +223,20 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
       if (!text) continue;
 
       logger.info({ sessionId: id, remoteJid, text }, "[Incoming] WhatsApp message received");
+
+      const isTrackingTrigger = isTrackOrderTrigger(text);
+      if (isTrackingTrigger) {
+        try {
+          const customerPhone = remoteJid.split("@")[0].split(":")[0];
+          const result = await fetchOrderStatus(id, customerPhone);
+          await sock.sendMessage(remoteJid, { text: result.message });
+          logger.info({ sessionId: id, remoteJid, orderId: result.orderId }, "[Order-Tracking] Status enviado com sucesso");
+        } catch (error: any) {
+          logger.error({ error: error?.message || error, sessionId: id, remoteJid }, "[Order-Tracking] Falha ao consultar/enviar status");
+          await sock.sendMessage(remoteJid, { text: "Não consegui localizar seu pedido agora. Verifique se o pedido foi feito com este mesmo número de WhatsApp e tente novamente. 🙏" }).catch(() => undefined);
+        }
+        continue;
+      }
 
       const isTrigger = isAutoReplyTrigger(text);
       if (!isTrigger) continue;
