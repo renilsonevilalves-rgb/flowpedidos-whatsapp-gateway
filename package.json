@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
+    "prebuild": "node scripts/patch-lid-tracking.cjs",
     "build": "tsc",
     "start": "node dist/server.js"
   },
