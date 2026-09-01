@@ -365,6 +365,14 @@ async function logoutSession(id: string) {
   await clearAuthState(id);
 }
 
+function normalizeRecipientPhone(value: unknown) {
+  const raw = String(value || "").replace(/\D/g, "");
+  if (!raw) return null;
+  if (raw.startsWith("55") && (raw.length === 12 || raw.length === 13)) return raw;
+  if (raw.length === 10 || raw.length === 11) return `55${raw}`;
+  return null;
+}
+
 app.get("/health", (_req, res) => res.json({ ok: true, service: "flowpedidos-whatsapp-gateway", uptime: Math.round(process.uptime()), timestamp: new Date().toISOString() }));
 
 app.get("/session/:sessionId/status", authMiddleware, (req, res) => {
@@ -386,6 +394,42 @@ app.post("/session/:sessionId/start", authMiddleware, async (req, res) => {
     session.status = "error";
     logger.error({ error: error?.message || error, sessionId }, "Could not start session");
     res.status(500).json({ ok: false, error: "Could not start WhatsApp session" });
+  }
+});
+
+app.post("/session/:sessionId/send", authMiddleware, async (req, res) => {
+  const sessionId = req.params.sessionId as string;
+  if (!safeSessionId(sessionId)) { res.status(400).json({ ok: false, error: "Invalid sessionId" }); return; }
+
+  const phone = normalizeRecipientPhone(req.body?.phone);
+  const text = typeof req.body?.text === "string" ? req.body.text.trim() : "";
+
+  if (!phone) {
+    res.status(400).json({ ok: false, error: "Telefone do cliente inválido." });
+    return;
+  }
+  if (!text) {
+    res.status(400).json({ ok: false, error: "Mensagem vazia." });
+    return;
+  }
+  if (text.length > 12000) {
+    res.status(400).json({ ok: false, error: "Mensagem muito longa." });
+    return;
+  }
+
+  const session = getOrCreateSession(sessionId);
+  if (session.status !== "connected" || !session.sock) {
+    res.status(409).json({ ok: false, error: "O WhatsApp da loja não está conectado.", status: session.status });
+    return;
+  }
+
+  try {
+    await session.sock.sendMessage(`${phone}@s.whatsapp.net`, { text });
+    logger.info({ sessionId, phone }, "[Outbound] Mensagem enviada com sucesso");
+    res.json({ ok: true, phone });
+  } catch (error: any) {
+    logger.error({ error: error?.message || error, sessionId, phone }, "[Outbound] Falha ao enviar mensagem");
+    res.status(502).json({ ok: false, error: "Não foi possível enviar a mensagem pelo WhatsApp." });
   }
 });
 
