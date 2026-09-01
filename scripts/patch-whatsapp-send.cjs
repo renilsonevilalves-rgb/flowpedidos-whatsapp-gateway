@@ -27,9 +27,16 @@ if (!source.includes('function isTrackOrderTrigger')) {
   source = source.replace(marker, trackingHelper + marker);
 }
 
+// TypeScript strict mode treats catch variables as unknown. The tracking handler
+// needs an explicit type because it logs error.message.
+source = source.replace(
+  '        } catch (error) {\n          logger.error({ error: error?.message || error, sessionId: id, remoteJid }, "[Order-Tracking] Falha ao consultar/enviar status");',
+  '        } catch (error: any) {\n          logger.error({ error: error?.message || error, sessionId: id, remoteJid }, "[Order-Tracking] Falha ao consultar/enviar status");'
+);
+
 if (!source.includes('const isTrackingTrigger = isTrackOrderTrigger(text);')) {
   const marker = `      const isTrigger = isAutoReplyTrigger(text);\n      if (!isTrigger) continue;`;
-  const replacement = `      const isTrackingTrigger = isTrackOrderTrigger(text);\n      if (isTrackingTrigger) {\n        try {\n          const customerPhone = remoteJid.split("@")[0].split(":")[0];\n          const result = await fetchOrderStatus(id, customerPhone);\n          await sock.sendMessage(remoteJid, { text: result.message });\n          logger.info({ sessionId: id, remoteJid, orderId: result.orderId }, "[Order-Tracking] Status enviado com sucesso");\n        } catch (error) {\n          logger.error({ error: error?.message || error, sessionId: id, remoteJid }, "[Order-Tracking] Falha ao consultar/enviar status");\n          await sock.sendMessage(remoteJid, { text: "Não consegui localizar seu pedido agora. Verifique se o pedido foi feito com este mesmo número de WhatsApp e tente novamente. 🙏" }).catch(() => undefined);\n        }\n        continue;\n      }\n\n      const isTrigger = isAutoReplyTrigger(text);\n      if (!isTrigger) continue;`;
+  const replacement = `      const isTrackingTrigger = isTrackOrderTrigger(text);\n      if (isTrackingTrigger) {\n        try {\n          const customerPhone = remoteJid.split("@")[0].split(":")[0];\n          const result = await fetchOrderStatus(id, customerPhone);\n          await sock.sendMessage(remoteJid, { text: result.message });\n          logger.info({ sessionId: id, remoteJid, orderId: result.orderId }, "[Order-Tracking] Status enviado com sucesso");\n        } catch (error: any) {\n          logger.error({ error: error?.message || error, sessionId: id, remoteJid }, "[Order-Tracking] Falha ao consultar/enviar status");\n          await sock.sendMessage(remoteJid, { text: "Não consegui localizar seu pedido agora. Verifique se o pedido foi feito com este mesmo número de WhatsApp e tente novamente. 🙏" }).catch(() => undefined);\n        }\n        continue;\n      }\n\n      const isTrigger = isAutoReplyTrigger(text);\n      if (!isTrigger) continue;`;
   if (!source.includes(marker)) {
     console.error('[patch-whatsapp-send] Message handler marker not found. Build interrupted.');
     process.exit(1);
