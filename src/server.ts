@@ -227,7 +227,16 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
       const isTrackingTrigger = isTrackOrderTrigger(text);
       if (isTrackingTrigger) {
         try {
-          const customerJid = msg.key.remoteJidAlt || remoteJid;
+          const customerJid = [
+            msg.key.remoteJidAlt,
+            msg.key.senderPn,
+            msg.key.participantPn,
+            remoteJid,
+          ].find((value: unknown) => typeof value === "string" && /@s\.whatsapp\.net$/.test(value)) ||
+            msg.key.remoteJidAlt ||
+            msg.key.senderPn ||
+            msg.key.participantPn ||
+            remoteJid;
           const customerPhone = customerJid.split("@")[0].split(":")[0];
           const result = await fetchOrderStatus(id, customerPhone);
           await sock.sendMessage(remoteJid, { text: result.message });
