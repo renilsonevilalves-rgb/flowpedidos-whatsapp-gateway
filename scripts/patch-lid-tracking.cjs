@@ -12,18 +12,43 @@ if (!source.includes('async function resolveCustomerPhone(')) {
   source = source.replace(marker, helper + '\n' + marker);
 }
 
-const replacement = 'const customerPhone = await resolveCustomerPhone(sock, msg, remoteJid);\n          if (!customerPhone) throw new Error("Não foi possível identificar o número de telefone deste contato do WhatsApp.");\n          const result = await fetchOrderStatus(id, customerPhone);';
+const newFetchOrderStatus = `async function fetchOrderStatus(sessionId: string, phone: string, orderNumber = '') {
+  if (!VERCEL_API_URL) throw new Error("VERCEL_API_URL is not configured on the gateway");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(\`${'${VERCEL_API_URL}'}/api/webhook/whatsapp/order-status\`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-API-Key": API_KEY },
+      body: JSON.stringify({ sessionId, phone, orderNumber }),
+      signal: controller.signal,
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(data?.error || \`Order-status returned HTTP ${'${response.status}'}\`);
+    return data;
+  } finally { clearTimeout(timer); }
+}`;
+
+const fetchPattern = /async function fetchOrderStatus\(sessionId: string, phone: string\) \{[\s\S]*?\n\}\n\nfunction isAutoReplyTrigger/;
+if (fetchPattern.test(source)) {
+  source = source.replace(fetchPattern, newFetchOrderStatus + '\n\nfunction isAutoReplyTrigger');
+} else if (!source.includes('async function fetchOrderStatus(sessionId: string, phone: string, orderNumber = \'\')')) {
+  throw new Error('patch-lid-tracking: fetchOrderStatus function not found');
+}
+
+const replacement = `const trackingOrderNumber = text.match(/^acompanhar\\s+pedido\\s+(FP-[A-Z0-9-]+)$/i)?.[1]?.toUpperCase() || '';
+          const customerPhone = trackingOrderNumber ? null : await resolveCustomerPhone(sock, msg, remoteJid);
+          if (!customerPhone && !trackingOrderNumber) throw new Error("Não foi possível identificar o número de telefone deste contato do WhatsApp.");
+          const result = await fetchOrderStatus(id, customerPhone || '', trackingOrderNumber);`;
 
 const oldSimple = 'const customerPhone = remoteJid.split("@")[0].split(":")[0];\n          const result = await fetchOrderStatus(id, customerPhone);';
 const oldCurrent = /const customerJid = \[[\s\S]*?const customerPhone = customerJid\.split\("@"\)\.split\(":"\)\[0\];\n\s*const result = await fetchOrderStatus\(id, customerPhone\);/;
+const oldHelper = /const customerPhone = await resolveCustomerPhone\(sock, msg, remoteJid\);\n\s*if \(!customerPhone\) throw new Error\("Não foi possível identificar o número de telefone deste contato do WhatsApp\."\);\n\s*const result = await fetchOrderStatus\(id, customerPhone\);/;
 
-if (source.includes(oldSimple)) {
-  source = source.replace(oldSimple, replacement);
-} else if (oldCurrent.test(source)) {
-  source = source.replace(oldCurrent, replacement);
-} else if (!source.includes(replacement)) {
-  throw new Error('patch-lid-tracking: tracking phone extraction block not found');
-}
+if (source.includes(oldSimple)) source = source.replace(oldSimple, replacement);
+else if (oldCurrent.test(source)) source = source.replace(oldCurrent, replacement);
+else if (oldHelper.test(source)) source = source.replace(oldHelper, replacement);
+else if (!source.includes('const trackingOrderNumber = text.match(/^acompanhar\\s+pedido')) throw new Error('patch-lid-tracking: tracking block not found');
 
 fs.writeFileSync(file, source);
 console.log('patch-lid-tracking: OK');
