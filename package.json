@@ -8,6 +8,7 @@
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
+    "prebuild": "node scripts/patch-whatsapp-send.cjs",
     "build": "tsc",
     "start": "node dist/server.js"
   },
@@ -15,7 +16,6 @@
     "@whiskeysockets/baileys": "6.7.24",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
-    "express": "^5.1.0",
     "pino": "^9.7.0",
     "qrcode": "^1.5.4"
   },
