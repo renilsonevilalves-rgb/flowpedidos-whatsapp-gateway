@@ -227,7 +227,8 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
       const isTrackingTrigger = isTrackOrderTrigger(text);
       if (isTrackingTrigger) {
         try {
-          const customerPhone = remoteJid.split("@")[0].split(":")[0];
+          const customerJid = msg.key.remoteJidAlt || remoteJid;
+          const customerPhone = customerJid.split("@")[0].split(":")[0];
           const result = await fetchOrderStatus(id, customerPhone);
           await sock.sendMessage(remoteJid, { text: result.message });
           logger.info({ sessionId: id, remoteJid, orderId: result.orderId }, "[Order-Tracking] Status enviado com sucesso");
