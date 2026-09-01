@@ -1,0 +1,36 @@
+name: Fix WhatsApp order tracking
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply tracking code
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('src/server.ts')
+          s=p.read_text()
+          if 'function isTrackOrderTrigger' not in s:
+              marker='function isAutoReplyTrigger(text: string) {'
+              helper='''function isTrackOrderTrigger(text: string) {\n  const normalized = text.toLowerCase().normalize("NFD").replace(/[\\u0300-\\u036f]/g, "").trim();\n  return /^(acompanhar\\s+pedido|acompanhar\\s+meu\\s+pedido|status\\s+do\\s+pedido|rastrear\\s+pedido)[!,.?\\s]*$/i.test(normalized);\n}\n\nasync function fetchOrderStatus(sessionId: string, phone: string) {\n  if (!VERCEL_API_URL) throw new Error("VERCEL_API_URL is not configured on the gateway");\n  const controller = new AbortController();\n  const timer = setTimeout(() => controller.abort(), 8000);\n  try {\n    const response = await fetch(`${VERCEL_API_URL}/api/webhook/whatsapp/order-status`, {\n      method: "POST",\n      headers: { "Content-Type": "application/json", "X-API-Key": API_KEY },\n      body: JSON.stringify({ sessionId, phone }),\n      signal: controller.signal,\n    });\n    const data = await response.json().catch(() => ({}));\n    if (!response.ok) throw new Error(data?.error || `Order-status returned HTTP ${response.status}`);\n    return data;\n  } finally { clearTimeout(timer); }\n}\n\n'''
+              if marker not in s: raise SystemExit('tracking insertion marker not found')
+              s=s.replace(marker,helper+marker,1)
+          needle='''      const isTrigger = isAutoReplyTrigger(text);\n      if (!isTrigger) continue;'''
+          replacement='''      const isTrackingTrigger = isTrackOrderTrigger(text);\n      if (isTrackingTrigger) {\n        try {\n          const customerPhone = remoteJid.split("@")[0].split(":")[0];\n          const result = await fetchOrderStatus(id, customerPhone);\n          await sock.sendMessage(remoteJid, { text: result.message });\n          logger.info({ sessionId: id, remoteJid, orderId: result.orderId }, "[Order-Tracking] Status enviado com sucesso");\n        } catch (error: any) {\n          logger.error({ error: error?.message || error, sessionId: id, remoteJid }, "[Order-Tracking] Falha ao consultar/enviar status");\n          await sock.sendMessage(remoteJid, { text: "Não consegui localizar seu pedido agora. Verifique se o pedido foi feito com este mesmo número de WhatsApp e tente novamente. 🙏" }).catch(() => undefined);\n        }\n        continue;\n      }\n\n      const isTrigger = isAutoReplyTrigger(text);\n      if (!isTrigger) continue;'''
+          if 'const isTrackingTrigger = isTrackOrderTrigger(text);' not in s:
+              if needle not in s: raise SystemExit('tracking handler marker not found')
+              s=s.replace(needle,replacement,1)
+          p.write_text(s)
+          PY
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/server.ts
+          git diff --cached --quiet || git commit -m "Implement WhatsApp order status replies"
+          git rm .github/workflows/fix-order-tracking.yml .github/workflows/patch-order-tracking.yml 2>/dev/null || true
+          git diff --cached --quiet || git commit --amend --no-edit
+          git push
