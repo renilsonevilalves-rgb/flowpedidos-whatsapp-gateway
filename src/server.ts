@@ -7,7 +7,9 @@ import pino from "pino";
 import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import {
+  Browsers,
   DisconnectReason,
+  fetchLatestWaWebVersion,
   makeWASocket,
   useMultiFileAuthState,
   type WASocket,
@@ -96,6 +98,24 @@ async function clearAuthState(id: string) {
   } catch (error) {
     logger.error({ error, sessionId: id }, "Failed to clear WhatsApp auth state");
   }
+}
+
+async function resolveWhatsAppWebVersion() {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const result = await fetchLatestWaWebVersion({ signal: controller.signal });
+    if (result?.version?.length === 3) {
+      logger.info({ version: result.version.join(".") }, "Using live WhatsApp Web version");
+      return result.version;
+    }
+    logger.warn({ result }, "Live WhatsApp Web version was not available; using Baileys default");
+  } catch (error) {
+    logger.warn({ error }, "Could not resolve live WhatsApp Web version; using Baileys default");
+  } finally {
+    clearTimeout(timer);
+  }
+  return undefined;
 }
 
 function scheduleReconnect(id: string, fresh = false, delayMs = 1500) {
@@ -247,8 +267,11 @@ async function connectSession(id: string, forceFresh = false): Promise<void> {
 
   session.starting = (async () => {
     const { state, saveCreds } = await useMultiFileAuthState(authPathFor(id));
+    const version = await resolveWhatsAppWebVersion();
     const sock = makeWASocket({
       auth: state,
+      ...(version ? { version } : {}),
+      browser: Browsers.ubuntu("Chrome"),
       printQRInTerminal: false,
       qrTimeout: 60000,
       logger: logger.child({ sessionId: id }),
