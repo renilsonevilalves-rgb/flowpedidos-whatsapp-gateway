@@ -17,6 +17,7 @@ import {
 
 const PORT = Number(process.env.PORT) || 3000;
 const API_KEY = process.env.API_KEY || "";
+const API_KEY_2 = process.env.API_KEY_2 || "";
 const FRONTEND_URL = process.env.FRONTEND_URL || "";
 const DATA_DIR = process.env.DATA_DIR || "/data/whatsapp-sessions";
 const VERCEL_API_URL = (process.env.VERCEL_API_URL || "").replace(/\/$/, "");
@@ -62,12 +63,12 @@ const replyInFlight = new Set<string>();
 const manualLogouts = new Set<string>();
 
 function authMiddleware(req: Request, res: Response, next: NextFunction) {
-  if (!API_KEY) {
+  if (!API_KEY && !API_KEY_2) {
     res.status(500).json({ error: "API_KEY is not configured on the gateway." });
     return;
   }
   const provided = req.header("X-API-Key");
-  if (!provided || provided !== API_KEY) {
+  if (!provided || (provided !== API_KEY && provided !== API_KEY_2)) {
     res.status(401).json({ error: "Unauthorized" });
     return;
   }
@@ -279,11 +280,11 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
 
         let replyText = storeInfo.autoReplyMessage;
         if (!replyText) {
-          replyText = `Olá! 👋 Seja bem-vindo a (*${storeInfo.storeName || "Nome da Loja"}*)\n\nConfira nosso cardápio e faça seu pedido por aqui: ${storeInfo.menuUrl}\n\nÉ só escolher os produtos e finalizar seu pedido. 😊\n\n_(Este é um atendimento automático)_`;
+          replyText = `Olá! 👋 Seja bem-vindo a (*${storeInfo.storeName || "Nome da Loja"}*)\\n\\nConfira nosso cardápio e faça seu pedido por aqui: ${storeInfo.menuUrl}\\n\\nÉ só escolher os produtos e finalizar seu pedido. 😊\\n\\n_(Este é um atendimento automático)_`;
         } else if (replyText.includes("{link}")) {
           replyText = replyText.replace(/\{link\}/g, storeInfo.menuUrl);
         } else if (!replyText.includes(storeInfo.menuUrl)) {
-          replyText = `${replyText}\n\n${storeInfo.menuUrl}`;
+          replyText = `${replyText}\\n\\n${storeInfo.menuUrl}`;
         }
 
         await sock.sendMessage(remoteJid, { text: replyText });
@@ -502,3 +503,4 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 app.listen(PORT, "0.0.0.0", () => {
   logger.info({ port: PORT, dataDir: DATA_DIR, frontendConfigured: Boolean(FRONTEND_URL) }, "FlowPedidos WhatsApp Gateway started");
 });
+
