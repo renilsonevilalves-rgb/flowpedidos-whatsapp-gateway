@@ -280,11 +280,11 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
 
         let replyText = storeInfo.autoReplyMessage;
         if (!replyText) {
-          replyText = `Olá! 👋 Seja bem-vindo a (*${storeInfo.storeName || "Nome da Loja"}*)\\n\\nConfira nosso cardápio e faça seu pedido por aqui: ${storeInfo.menuUrl}\\n\\nÉ só escolher os produtos e finalizar seu pedido. 😊\\n\\n_(Este é um atendimento automático)_`;
+          replyText = `Olá! 👋 Seja bem-vindo a (*${storeInfo.storeName || "Nome da Loja"}*)\n\nConfira nosso cardápio e faça seu pedido por aqui: ${storeInfo.menuUrl}\n\nÉ só escolher os produtos e finalizar seu pedido. 😊\n\n_(Este é um atendimento automático)_`;
         } else if (replyText.includes("{link}")) {
           replyText = replyText.replace(/\{link\}/g, storeInfo.menuUrl);
         } else if (!replyText.includes(storeInfo.menuUrl)) {
-          replyText = `${replyText}\\n\\n${storeInfo.menuUrl}`;
+          replyText = `${replyText}\n\n${storeInfo.menuUrl}`;
         }
 
         await sock.sendMessage(remoteJid, { text: replyText });
