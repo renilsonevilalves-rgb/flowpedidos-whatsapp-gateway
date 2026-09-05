@@ -1,6 +1,6 @@
 {
   "name": "flowpedidos-whatsapp-gateway",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -13,7 +13,7 @@
     "start": "node dist/server.js"
   },
   "dependencies": {
-    "@whiskeysockets/baileys": "6.7.24",
+    "@whiskeysockets/baileys": "git+https://github.com/doryani-ai/Baileys.git#4f263f0e365c2e74dd1b824031d1c5910f518c26",
     "@types/express": "^5.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
