@@ -142,19 +142,45 @@ async function waitForQrOrConnected(id: string, timeoutMs = 10000) {
 }
 
 async function fetchStoreInfo(sessionId: string) {
-  if (!VERCEL_API_URL) throw new Error("VERCEL_API_URL is not configured on the gateway");
+  const baseUrls = [VERCEL_API_URL, "https://flowoficial01.vercel.app"]
+    .map((value) => value.replace(/\/$/, ""))
+    .filter((value, index, all) => Boolean(value) && all.indexOf(value) === index);
+  const keys = [API_KEY, API_KEY_2]
+    .filter((value, index, all) => Boolean(value) && all.indexOf(value) === index);
+  if (!baseUrls.length) throw new Error("No Vercel API URL is configured on the gateway");
+  if (!keys.length) throw new Error("No gateway API key is configured");
+
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 7000);
   try {
-    const response = await fetch(`${VERCEL_API_URL}/api/webhook/whatsapp/store-info`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-API-Key": API_KEY },
-      body: JSON.stringify({ sessionId }),
-      signal: controller.signal,
-    });
-    const data = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(`Vercel store-info returned HTTP ${response.status}: ${data?.error || "unknown error"}`);
-    return data;
+    let lastError: Error | undefined;
+
+    for (const baseUrl of baseUrls) {
+      for (const key of keys) {
+        try {
+          const response = await fetch(`${baseUrl}/api/webhook/whatsapp/store-info`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-API-Key": key },
+            body: JSON.stringify({ sessionId }),
+            signal: controller.signal,
+          });
+          const data = await response.json().catch(() => ({}));
+
+          if (response.ok) return data;
+
+          lastError = new Error(`Vercel store-info returned HTTP ${response.status}: ${data?.error || "unknown error"}`);
+          logger.warn({ sessionId, status: response.status, keySlot: key === API_KEY ? "API_KEY" : "API_KEY_2", baseUrl }, "[Auto-Reply] store-info request failed");
+
+          if (response.status !== 401 && response.status < 500) break;
+        } catch (error: any) {
+          lastError = error instanceof Error ? error : new Error(String(error));
+        }
+      }
+
+      if (lastError?.message.includes("HTTP 400") || lastError?.message.includes("HTTP 404")) break;
+    }
+
+    throw lastError || new Error("Vercel store-info request failed");
   } finally {
     clearTimeout(timer);
   }
