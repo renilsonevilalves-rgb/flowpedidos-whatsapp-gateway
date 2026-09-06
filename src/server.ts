@@ -160,8 +160,51 @@ async function fetchStoreInfo(sessionId: string) {
   }
 }
 
+function unwrapMessage(message: any): any {
+  let current = message;
+  for (let i = 0; i < 6 && current; i += 1) {
+    if (current.ephemeralMessage?.message) {
+      current = current.ephemeralMessage.message;
+      continue;
+    }
+    if (current.viewOnceMessage?.message) {
+      current = current.viewOnceMessage.message;
+      continue;
+    }
+    if (current.viewOnceMessageV2?.message) {
+      current = current.viewOnceMessageV2.message;
+      continue;
+    }
+    if (current.documentWithCaptionMessage?.message) {
+      current = current.documentWithCaptionMessage.message;
+      continue;
+    }
+    break;
+  }
+  return current || {};
+}
+
 function extractMessageText(message: any) {
-  return message?.conversation || message?.extendedTextMessage?.text || message?.imageMessage?.caption || message?.videoMessage?.caption || "";
+  const unwrapped = unwrapMessage(message);
+  return unwrapped?.conversation ||
+    unwrapped?.extendedTextMessage?.text ||
+    unwrapped?.imageMessage?.caption ||
+    unwrapped?.videoMessage?.caption ||
+    unwrapped?.documentMessage?.caption ||
+    "";
+}
+
+function getCustomerJid(msg: any, remoteJid: string) {
+  return [
+    msg?.key?.remoteJidAlt,
+    msg?.key?.senderPn,
+    msg?.key?.participantPn,
+    remoteJid,
+  ].find((value: unknown) => typeof value === "string" && /@s\.whatsapp\.net$/.test(value)) ||
+    msg?.key?.remoteJidAlt ||
+    msg?.key?.senderPn ||
+    msg?.key?.participantPn ||
+    remoteJid;
 }
 
 function isTrackOrderTrigger(text: string) {
@@ -228,23 +271,15 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
       const isTrackingTrigger = isTrackOrderTrigger(text);
       if (isTrackingTrigger) {
         try {
-          const customerJid = [
-            msg.key.remoteJidAlt,
-            msg.key.senderPn,
-            msg.key.participantPn,
-            remoteJid,
-          ].find((value: unknown) => typeof value === "string" && /@s\.whatsapp\.net$/.test(value)) ||
-            msg.key.remoteJidAlt ||
-            msg.key.senderPn ||
-            msg.key.participantPn ||
-            remoteJid;
+          const customerJid = getCustomerJid(msg, remoteJid);
           const customerPhone = customerJid.split("@")[0].split(":")[0];
           const result = await fetchOrderStatus(id, customerPhone);
-          await sock.sendMessage(remoteJid, { text: result.message });
-          logger.info({ sessionId: id, remoteJid, orderId: result.orderId }, "[Order-Tracking] Status enviado com sucesso");
+          await sock.sendMessage(customerJid, { text: result.message });
+          logger.info({ sessionId: id, remoteJid: customerJid, orderId: result.orderId }, "[Order-Tracking] Status enviado com sucesso");
         } catch (error: any) {
           logger.error({ error: error?.message || error, sessionId: id, remoteJid }, "[Order-Tracking] Falha ao consultar/enviar status");
-          await sock.sendMessage(remoteJid, { text: "Não consegui localizar seu pedido agora. Verifique se o pedido foi feito com este mesmo número de WhatsApp e tente novamente. 🙏" }).catch(() => undefined);
+          const customerJid = getCustomerJid(msg, remoteJid);
+          await sock.sendMessage(customerJid, { text: "Não consegui localizar seu pedido agora. Verifique se o pedido foi feito com este mesmo número de WhatsApp e tente novamente. 🙏" }).catch(() => undefined);
         }
         continue;
       }
@@ -252,29 +287,27 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
       const isTrigger = isAutoReplyTrigger(text);
       if (!isTrigger) continue;
 
-      const userKey = `${id}-${remoteJid}`;
-      const now = Date.now();
-      const fourHours = 1000 * 60 * 60 * 4;
+      const customerJid = getCustomerJid(msg, remoteJid);
+      const userKey = `${id}-${customerJid}`;
       const lastReplyTime = userLastReply.get(userKey) || 0;
+      const fourHours = 1000 * 60 * 60 * 4;
 
-      if (now - lastReplyTime <= fourHours) {
-        logger.info({ sessionId: id, remoteJid }, "[Auto-Reply] 4-hour cooldown active; message ignored");
+      if (Date.now() - lastReplyTime <= fourHours) {
+        logger.info({ sessionId: id, remoteJid: customerJid }, "[Auto-Reply] 4-hour cooldown active; message ignored");
         continue;
       }
 
       if (replyInFlight.has(userKey)) {
-        logger.info({ sessionId: id, remoteJid }, "[Auto-Reply] Reply already reserved; duplicate event ignored");
+        logger.info({ sessionId: id, remoteJid: customerJid }, "[Auto-Reply] Reply already in flight; duplicate event ignored");
         continue;
       }
 
       replyInFlight.add(userKey);
-      userLastReply.set(userKey, now);
 
       try {
         const storeInfo = await fetchStoreInfo(id);
         if (!storeInfo?.menuUrl) {
-          userLastReply.delete(userKey);
-          logger.warn({ sessionId: id }, "[Auto-Reply] Store has no menuUrl");
+          logger.warn({ sessionId: id, remoteJid: customerJid, storeInfo }, "[Auto-Reply] Store has no menuUrl");
           continue;
         }
 
@@ -287,11 +320,11 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
           replyText = `${replyText}\n\n${storeInfo.menuUrl}`;
         }
 
-        await sock.sendMessage(remoteJid, { text: replyText });
-        logger.info({ sessionId: id, remoteJid }, "[Auto-Reply] Resposta enviada com sucesso");
-      } catch (error) {
-        userLastReply.delete(userKey);
-        throw error;
+        await sock.sendMessage(customerJid, { text: replyText });
+        userLastReply.set(userKey, Date.now());
+        logger.info({ sessionId: id, remoteJid: customerJid, menuUrl: storeInfo.menuUrl }, "[Auto-Reply] Resposta enviada com sucesso");
+      } catch (error: any) {
+        logger.error({ error: error?.message || error, sessionId: id, remoteJid: customerJid }, "[Auto-Reply] Falha ao buscar/enviar cardápio; retry liberado");
       } finally {
         replyInFlight.delete(userKey);
       }
@@ -503,4 +536,3 @@ app.use((err: Error, _req: Request, res: Response, _next: NextFunction) => {
 app.listen(PORT, "0.0.0.0", () => {
   logger.info({ port: PORT, dataDir: DATA_DIR, frontendConfigured: Boolean(FRONTEND_URL) }, "FlowPedidos WhatsApp Gateway started");
 });
-
