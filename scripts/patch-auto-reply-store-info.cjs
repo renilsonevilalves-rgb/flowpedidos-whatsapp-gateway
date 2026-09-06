@@ -24,7 +24,7 @@ const replacement = `async function fetchStoreInfo(sessionId: string) {
 
     for (const key of keys) {
       try {
-        const response = await fetch(\`${baseUrl}/api/webhook/whatsapp/store-info\`, {
+        const response = await fetch(\`\${baseUrl}/api/webhook/whatsapp/store-info\`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-API-Key': key },
           body: JSON.stringify({ sessionId }),
