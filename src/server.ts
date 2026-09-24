@@ -61,6 +61,7 @@ const processedMessages = new Set<string>();
 const userLastReply = new Map<string, number>();
 const replyInFlight = new Set<string>();
 const manualLogouts = new Set<string>();
+const pairingRequestsInFlight = new Set<string>();
 
 function authMiddleware(req: Request, res: Response, next: NextFunction) {
   if (!API_KEY && !API_KEY_2) {
@@ -383,6 +384,7 @@ async function connectSession(id: string, forceFresh = false): Promise<void> {
       logger: logger.child({ sessionId: id }),
       markOnlineOnConnect: false,
       syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false,
       shouldIgnoreJid: (jid) => jid === "status@broadcast",
     });
 
@@ -479,6 +481,14 @@ function normalizeRecipientPhone(value: unknown) {
   return null;
 }
 
+function normalizePairingPhone(value: unknown) {
+  const raw = String(value || "").replace(/\D/g, "");
+  if (!raw) return null;
+  if (raw.length === 10 || raw.length === 11) return `55${raw}`;
+  if (raw.length >= 11 && raw.length <= 15) return raw;
+  return null;
+}
+
 app.get("/health", (_req, res) => res.json({ ok: true, service: "flowpedidos-whatsapp-gateway", uptime: Math.round(process.uptime()), timestamp: new Date().toISOString() }));
 
 app.get("/session/:sessionId/status", authMiddleware, (req, res) => {
@@ -500,6 +510,54 @@ app.post("/session/:sessionId/start", authMiddleware, async (req, res) => {
     session.status = "error";
     logger.error({ error: error?.message || error, sessionId }, "Could not start session");
     res.status(500).json({ ok: false, error: "Could not start WhatsApp session" });
+  }
+});
+
+app.post("/session/:sessionId/pairing-code", authMiddleware, async (req, res) => {
+  const sessionId = req.params.sessionId as string;
+  if (!safeSessionId(sessionId)) { res.status(400).json({ ok: false, error: "Invalid sessionId" }); return; }
+
+  const phone = normalizePairingPhone(req.body?.phone);
+  if (!phone) {
+    res.status(400).json({ ok: false, error: "Informe um número de WhatsApp válido com DDD e, se necessário, código do país." });
+    return;
+  }
+
+  const session = getOrCreateSession(sessionId);
+  if (session.status === "connected" && session.sock) {
+    res.status(409).json({ ok: false, error: "O WhatsApp desta loja já está conectado." });
+    return;
+  }
+  if (pairingRequestsInFlight.has(sessionId)) {
+    res.status(409).json({ ok: false, error: "Já existe uma solicitação de código de pareamento em andamento." });
+    return;
+  }
+
+  pairingRequestsInFlight.add(sessionId);
+  try {
+    await startSessionWithRecovery(sessionId);
+    const activeSession = getOrCreateSession(sessionId);
+
+    if (activeSession.status === "connected" && activeSession.sock) {
+      res.status(409).json({ ok: false, error: "O WhatsApp desta loja já está conectado." });
+      return;
+    }
+    if (!activeSession.sock) {
+      res.status(503).json({ ok: false, error: "A sessão do WhatsApp ainda não está pronta para gerar o código." });
+      return;
+    }
+
+    const code = await activeSession.sock.requestPairingCode(phone);
+    const normalizedCode = String(code || "").replace(/\s+/g, "").trim();
+    if (!normalizedCode) throw new Error("WhatsApp did not return a pairing code");
+
+    logger.info({ sessionId, phoneSuffix: phone.slice(-4) }, "Pairing code generated");
+    res.json({ ok: true, code: normalizedCode, status: activeSession.status });
+  } catch (error: any) {
+    logger.error({ error: error?.message || error, sessionId }, "Failed to generate pairing code");
+    res.status(502).json({ ok: false, error: "Não foi possível gerar o código de pareamento agora. Tente novamente em alguns segundos." });
+  } finally {
+    pairingRequestsInFlight.delete(sessionId);
   }
 });
 
