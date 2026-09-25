@@ -6,7 +6,7 @@ let current = readFileSync(serverPath, "utf8");
 let changed = false;
 
 const fsImportOriginal = `import { rm } from "node:fs/promises";`;
-const fsImportPatched = `import { access, readdir, rm } from "node:fs/promises";`;
+const fsImportPatched = `import { readFile, readdir, rm } from "node:fs/promises";`;
 
 if (!current.includes(fsImportPatched)) {
   if (!current.includes(fsImportOriginal)) {
@@ -27,16 +27,23 @@ const listenPatched = `async function restorePersistedSessions() {
       .filter((entry) => entry.isDirectory() && safeSessionId(entry.name))
       .map((entry) => entry.name);
 
+    let registeredSessions = 0;
     let restored = 0;
     for (const sessionId of sessionIds) {
       try {
-        await access(join(authPathFor(sessionId), "creds.json"));
-      } catch {
+        const rawCreds = await readFile(join(authPathFor(sessionId), "creds.json"), "utf8");
+        const persistedCreds = JSON.parse(rawCreds);
+        if (!persistedCreds?.registered) continue;
+        registeredSessions += 1;
+      } catch (error: any) {
+        if (error?.code !== "ENOENT") {
+          logger.warn({ error: error?.message || error, sessionId }, "Skipping unreadable persisted WhatsApp credentials");
+        }
         continue;
       }
 
       const session = getOrCreateSession(sessionId);
-      if (session.starting || (session.status === "connected" && session.sock)) continue;
+      if (session.starting || session.sock) continue;
 
       try {
         await connectSession(sessionId, false);
@@ -46,7 +53,7 @@ const listenPatched = `async function restorePersistedSessions() {
       }
     }
 
-    logger.info({ persistedSessions: sessionIds.length, restoreAttempts: restored }, "Persisted WhatsApp session restore completed");
+    logger.info({ persistedSessions: sessionIds.length, registeredSessions, restoreAttempts: restored }, "Persisted WhatsApp session restore completed");
   } catch (error: any) {
     if (error?.code === "ENOENT") {
       logger.info({ dataDir: DATA_DIR }, "No persisted WhatsApp session directory found yet");
@@ -71,7 +78,7 @@ if (!current.includes(listenPatched)) {
 
 if (changed) {
   writeFileSync(serverPath, current, "utf8");
-  console.log("Patched automatic restoration of persisted WhatsApp sessions on gateway startup");
+  console.log("Patched restoration of registered persisted WhatsApp sessions on gateway startup");
 } else {
-  console.log("Automatic WhatsApp session restoration is already present in src/server.ts");
+  console.log("Registered WhatsApp session restoration is already present in src/server.ts");
 }
