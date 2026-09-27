@@ -1,0 +1,37 @@
+name: Temporary WhatsApp order intent validation
+
+on:
+  push:
+    branches:
+      - fix/order-self-service-natural-triggers
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '20'
+      - run: npm install --no-fund --no-audit
+      - run: npm run build
+      - name: Validate natural intent phrases
+        run: |
+          node --input-type=module <<'NODE'
+          import { isCancelOrderTrigger, isChangeOrderTrigger } from './dist/orderSelfService.js';
+          const requiredCancel = ['Cancelar', 'Quero cancelar', 'Queria fazer um cancelamento', 'Gostaria de cancelar meu pedido'];
+          const requiredChange = ['Alterar', 'Queria fazer uma alteração', 'Quero mudar meu pedido'];
+          for (const text of requiredCancel) {
+            if (!isCancelOrderTrigger(text)) throw new Error(`Cancel intent not recognized: ${text}`);
+          }
+          for (const text of requiredChange) {
+            if (!isChangeOrderTrigger(text)) throw new Error(`Change intent not recognized: ${text}`);
+          }
+          if (isCancelOrderTrigger('não quero cancelar')) throw new Error('Negative cancellation was recognized incorrectly');
+          NODE
