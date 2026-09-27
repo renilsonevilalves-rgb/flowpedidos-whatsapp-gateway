@@ -4,6 +4,9 @@ on:
   push:
     branches:
       - feat/order-self-service
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: read
