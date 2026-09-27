@@ -2,8 +2,11 @@ const { readFileSync, writeFileSync } = require("node:fs");
 const { resolve } = require("node:path");
 
 const serverPath = resolve(__dirname, "../src/server.ts");
+const selfServicePath = resolve(__dirname, "../src/orderSelfService.ts");
 let current = readFileSync(serverPath, "utf8");
+let selfService = readFileSync(selfServicePath, "utf8");
 let changed = false;
+let selfServiceChanged = false;
 
 function replaceOnce(original, replacement, label) {
   if (current.includes(replacement)) return;
@@ -13,6 +16,21 @@ function replaceOnce(original, replacement, label) {
   current = current.replace(original, replacement);
   changed = true;
 }
+
+function replaceSelfServiceOnce(original, replacement, label) {
+  if (selfService.includes(replacement)) return;
+  if (!selfService.includes(original)) {
+    throw new Error(`Could not locate ${label} in src/orderSelfService.ts`);
+  }
+  selfService = selfService.replace(original, replacement);
+  selfServiceChanged = true;
+}
+
+replaceSelfServiceOnce(
+  `function setState(key: string, state: Omit<ConversationState, "expiresAt">) {`,
+  `type ConversationStateInput<T> = T extends unknown ? Omit<T, "expiresAt"> : never;\n\nfunction setState(key: string, state: ConversationStateInput<ConversationState>) {`,
+  "distributive conversation state input type",
+);
 
 replaceOnce(
   `} from "@whiskeysockets/baileys";\n\nconst PORT`,
@@ -26,8 +44,14 @@ replaceOnce(
   "order self-service incoming-message hook",
 );
 
+if (selfServiceChanged) {
+  writeFileSync(selfServicePath, selfService, "utf8");
+}
 if (changed) {
   writeFileSync(serverPath, current, "utf8");
+}
+
+if (changed || selfServiceChanged) {
   console.log("Patched WhatsApp customer order self-service flow");
 } else {
   console.log("WhatsApp customer order self-service flow is already present in src/server.ts");
