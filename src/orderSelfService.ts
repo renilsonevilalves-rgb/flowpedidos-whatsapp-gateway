@@ -60,12 +60,14 @@ export function normalizeOrderSelfServiceText(value: string) {
 
 export function isCancelOrderTrigger(value: string) {
   const text = normalizeOrderSelfServiceText(value).replace(/[!,.?]+$/g, "").trim();
-  return /^(cancelar|cancelamento|quero cancelar|cancelar meu pedido|cancelar pedido|quero cancelar meu pedido|quero cancelar o pedido)$/.test(text);
+  if (/^(cancelar|cancelamento|cancelar(?:\s+(?:(?:meu|o)\s+)?pedido)?)$/.test(text)) return true;
+  return /^(?:quero|queria|preciso|desejo|gostaria de)\s+(?:fazer\s+(?:um\s+)?)?(?:cancelamento(?:\s+do\s+(?:meu\s+)?pedido)?|cancelar(?:\s+(?:(?:meu|o)\s+)?pedido)?)$/.test(text);
 }
 
 export function isChangeOrderTrigger(value: string) {
   const text = normalizeOrderSelfServiceText(value).replace(/[!,.?]+$/g, "").trim();
-  return /^(alterar|alteracao|mudar|editar|alterar meu pedido|alterar pedido|mudar meu pedido|mudar pedido|editar meu pedido|editar pedido|quero alterar|quero alterar meu pedido|quero mudar meu pedido)$/.test(text);
+  if (/^(alterar|alteracao|mudar|editar|alterar(?:\s+(?:(?:meu|o)\s+)?pedido)|mudar(?:\s+(?:(?:meu|o)\s+)?pedido)|editar(?:\s+(?:(?:meu|o)\s+)?pedido))$/.test(text)) return true;
+  return /^(?:quero|queria|preciso|desejo|gostaria de)\s+(?:fazer\s+(?:uma\s+)?)?(?:alteracao(?:\s+(?:no|do)\s+(?:meu\s+)?pedido)?|alterar(?:\s+(?:(?:meu|o)\s+)?pedido)?|mudar(?:\s+(?:(?:meu|o)\s+)?pedido)?|editar(?:\s+(?:(?:meu|o)\s+)?pedido)?)$/.test(text);
 }
 
 function getCustomerJid(msg: any, remoteJid: string) {
@@ -256,7 +258,7 @@ async function beginChangeFlow(params: HandleParams, customerJid: string, phone:
     const order = orders[0];
     setState(key, { kind: "change_text", order });
     await params.sendMessage(customerJid, {
-      text: `✏️ Pedido *#${order.orderNumber}*.\n\nEnvie em *uma única mensagem* a alteração desejada.\nEx.: “sem cebola no hambúrguer”.\n\nA solicitação será registrada no pedido. Alterações que envolvam itens, valores ou endereço de entrega dependem da confirmação da loja.\n\nDigite *SAIR* para desistir.`,
+      text: `✏️ Pedido *#${order.orderNumber}*.\n\nEnvie em *uma única mensagem* a alteração desejada.\nEx.: “Retirar 1 Hamburgão” ou “sem cebola no hambúrguer”.\n\nRemoções de itens identificadas com clareza são aplicadas automaticamente e atualizam o total. Outras alterações ficam registradas para confirmação da loja.\n\nDigite *SAIR* para desistir.`,
     });
   } catch (error: any) {
     clearState(key);
