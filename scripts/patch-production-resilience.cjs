@@ -5,8 +5,9 @@ const serverPath = resolve(__dirname, "../src/server.ts");
 let current = readFileSync(serverPath, "utf8");
 let changed = false;
 
-function replaceOnce(original, replacement, label) {
+function replaceOnce(original, replacement, label, previous) {
   if (current.includes(replacement)) return;
+  if (previous && current.includes(previous)) original = previous;
   if (!current.includes(original)) {
     throw new Error(`Could not locate ${label} in src/server.ts`);
   }
@@ -16,8 +17,9 @@ function replaceOnce(original, replacement, label) {
 
 replaceOnce(
   `  reconnectTimer?: ReturnType<typeof setTimeout>;\n};`,
-  `  reconnectTimer?: ReturnType<typeof setTimeout>;\n  reconnectAttempts?: number;\n};`,
+  `  reconnectTimer?: ReturnType<typeof setTimeout>;\n  pendingCredsSave?: Promise<void>;\n  pairingRestartPending?: boolean;\n  reconnectAttempts?: number;\n};`,
   "Session reconnect state",
+  `  reconnectTimer?: ReturnType<typeof setTimeout>;\n  reconnectAttempts?: number;\n};`,
 );
 
 replaceOnce(
@@ -71,8 +73,13 @@ replaceOnce(
   // One live socket per tenant. Creating a second socket for the same auth state
   // is a primary cause of WhatsApp connectionReplaced/conflict loops.
   if (session.sock) return;
-  if (forceFresh) await clearAuthState(id);`,
+  // Auth loading and credential persistence run inside the shared starting lock.`,
   "single-socket guard",
+`  if (session.starting) return session.starting;
+  // One live socket per tenant. Creating a second socket for the same auth state
+  // is a primary cause of WhatsApp connectionReplaced/conflict loops.
+  if (session.sock) return;
+  if (forceFresh) await clearAuthState(id);`,
 );
 
 replaceOnce(
@@ -94,8 +101,24 @@ replaceOnce(
           session.reconnectTimer = undefined;
         }
         logger.info({ sessionId: id, phone: session.phone }, "WhatsApp connected");
+        if (session.pairingRestartPending) {
+          session.pairingRestartPending = false;
+          logger.info({ sessionId: id }, "WhatsApp connected after pairing restart");
+        }
       }`,
   "connection-open reset",
+`      if (connection === "open") {
+        session.status = "connected";
+        session.qr = undefined;
+        session.qrDataUrl = undefined;
+        session.phone = sock.user?.id?.split(":")[0];
+        session.reconnectAttempts = 0;
+        if (session.reconnectTimer) {
+          clearTimeout(session.reconnectTimer);
+          session.reconnectTimer = undefined;
+        }
+        logger.info({ sessionId: id, phone: session.phone }, "WhatsApp connected");
+      }`,
 );
 
 replaceOnce(
@@ -122,6 +145,93 @@ replaceOnce(
         session.status = "disconnected";
         scheduleReconnect(id, false, 3000);
       }`,
+`      if (connection === "close") {
+        const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+        const loggedOut = statusCode === DisconnectReason.loggedOut;
+        const badSession = statusCode === DisconnectReason.badSession;
+        const connectionReplaced = statusCode === DisconnectReason.connectionReplaced;
+        const restartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
+        const manuallyLoggedOut = manualLogouts.has(id);
+        // Freeze the old socket's write queue before releasing its ownership.
+        sock.ev.off("creds.update", persistCreds);
+        if (session.reconnectTimer) {
+          clearTimeout(session.reconnectTimer);
+          session.reconnectTimer = undefined;
+        }
+        session.sock = undefined;
+        session.qr = undefined;
+        session.qrDataUrl = undefined;
+        session.phone = undefined;
+
+        if (manuallyLoggedOut) {
+          manualLogouts.delete(id);
+          session.status = "logged_out";
+          session.reconnectAttempts = 0;
+          return;
+        }
+
+        if (shuttingDown) {
+          session.status = "disconnected";
+          return;
+        }
+
+        // Only a confirmed logout invalidates the persisted credentials.
+        // Timeouts, network failures, server restarts and bad-session signals
+        // must never erase a tenant's auth state automatically.
+        if (loggedOut) {
+          session.status = "logged_out";
+          session.reconnectAttempts = 0;
+          session.pairingRestartPending = false;
+          // Block /start until pending writes and real logout cleanup finish.
+          const cleanup = Promise.resolve().then(async () => {
+            await session.pendingCredsSave?.catch(() => {});
+            await clearAuthState(id);
+            session.pendingCredsSave = undefined;
+          });
+          session.starting = cleanup;
+          try { await cleanup; } finally {
+            if (session.starting === cleanup) session.starting = undefined;
+          }
+          logger.warn({ sessionId: id, statusCode }, "WhatsApp session was explicitly logged out; re-pairing is required");
+          return;
+        }
+
+        // During rolling deployments a newer gateway instance can take over the
+        // same WhatsApp session. The replaced instance must not fight back and
+        // create an endless connection-replaced loop.
+        if (connectionReplaced) {
+          session.status = "disconnected";
+          logger.warn({ sessionId: id, statusCode }, "WhatsApp connection was replaced; reconnect suppressed on this socket");
+          return;
+        }
+
+        if (restartRequired) {
+          // Pairing requires a new socket even before registered becomes true.
+          // Use the normal single-flight scheduler and the same persisted auth path.
+          session.status = "starting";
+          session.pairingRestartPending = true;
+          session.reconnectAttempts = 0;
+          logger.info({ sessionId: id, statusCode }, "WhatsApp pairing completed; restart required");
+          try { sock.end(undefined); } catch {
+            logger.debug({ sessionId: id }, "Pairing socket was already closed");
+          }
+          scheduleReconnect(id, false);
+          return;
+        }
+
+        session.status = "disconnected";
+        if (badSession) {
+          logger.warn({ sessionId: id, statusCode }, "WhatsApp reported badSession; credentials preserved and recovery will be attempted");
+        }
+
+        if (state.creds.registered) {
+          scheduleReconnect(id, false, 3000);
+        } else {
+          session.reconnectAttempts = 0;
+          logger.info({ sessionId: id, statusCode }, "Unregistered WhatsApp session closed; waiting for explicit pairing instead of reconnect loop");
+        }
+      }`,
+  "connection-close recovery policy",
 `      if (connection === "close") {
         const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
         const loggedOut = statusCode === DisconnectReason.loggedOut;
@@ -177,7 +287,6 @@ replaceOnce(
           logger.info({ sessionId: id, statusCode }, "Unregistered WhatsApp session closed; waiting for explicit pairing instead of reconnect loop");
         }
       }`,
-  "connection-close recovery policy",
 );
 
 replaceOnce(
@@ -212,6 +321,63 @@ replaceOnce(
   if (status === "error") throw new Error("Could not initialize WhatsApp session");
 }`,
   "non-destructive session start recovery",
+);
+
+replaceOnce(
+`  session.starting = (async () => {
+    const { state, saveCreds } = await useMultiFileAuthState(authPathFor(id));`,
+`  session.starting = (async () => {
+    if (session.pairingRestartPending && session.pendingCredsSave) {
+      logger.info({ sessionId: id }, "Waiting for pending credential persistence before restart");
+    }
+    // The lock is assigned before this await, so /start and timers share it.
+    // A failed write aborts reconnect; never load fresh/partial credentials.
+    await session.pendingCredsSave;
+    if (shuttingDown || getOrCreateSession(id).status === "logged_out") return;
+    if (forceFresh) await clearAuthState(id);
+    const { state, saveCreds } = await useMultiFileAuthState(authPathFor(id));`,
+  "credential persistence barrier",
+);
+
+replaceOnce(
+`    const version = await resolveWhatsAppWebVersion();
+    const sock = makeWASocket({`,
+`    const version = await resolveWhatsAppWebVersion();
+    if (shuttingDown || getOrCreateSession(id).status === "logged_out") return;
+    if (session.pairingRestartPending) {
+      logger.info({ sessionId: id }, "Restarting WhatsApp socket after successful pairing");
+    }
+    const sock = makeWASocket({`,
+  "pairing socket restart",
+);
+
+replaceOnce(
+`    sock.ev.on("creds.update", saveCreds);`,
+`    const persistCreds = () => {
+      if (session.sock !== sock) return;
+      // Serialize full-state writes. A later update can retry a failed save.
+      const pending = (session.pendingCredsSave || Promise.resolve())
+        .catch(() => {})
+        .then(() => saveCreds());
+      session.pendingCredsSave = pending;
+      void pending.catch(() => {
+        logger.error({ sessionId: id }, "WhatsApp credential persistence failed; reconnect blocked until credentials are saved");
+      });
+    };
+    sock.ev.on("creds.update", persistCreds);`,
+  "serialized credential persistence",
+);
+
+replaceOnce(
+`  session.status = "logged_out";
+  await clearAuthState(id);`,
+`  session.status = "logged_out";
+  session.pairingRestartPending = false;
+  await session.starting?.catch(() => {});
+  await session.pendingCredsSave?.catch(() => {});
+  await clearAuthState(id);
+  session.pendingCredsSave = undefined;`,
+  "manual logout credential drain",
 );
 
 const listenBlock = `app.listen(PORT, "0.0.0.0", () => {
@@ -253,7 +419,19 @@ async function gracefulShutdown(signal: string) {
 process.once("SIGTERM", () => { void gracefulShutdown("SIGTERM"); });
 process.once("SIGINT", () => { void gracefulShutdown("SIGINT"); });`;
 
-replaceOnce(listenBlock, gracefulBlock, "graceful shutdown handler");
+if (!current.includes("// Drain queued credential writes before the process exits.")) {
+  replaceOnce(listenBlock, gracefulBlock, "graceful shutdown handler");
+}
+
+replaceOnce(
+`  // Give pending credential writes and socket close frames a brief chance to flush.
+  await new Promise((resolve) => setTimeout(resolve, 500));`,
+`  // Drain queued credential writes before the process exits.
+  await Promise.allSettled([...sessions.values()].map((session) => session.pendingCredsSave));
+  // Give socket close frames a brief chance to flush.
+  await new Promise((resolve) => setTimeout(resolve, 500));`,
+  "shutdown credential persistence",
+);
 
 if (changed) {
   writeFileSync(serverPath, current, "utf8");
