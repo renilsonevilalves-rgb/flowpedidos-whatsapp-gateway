@@ -27,14 +27,24 @@ const listenPatched = `async function restorePersistedSessions() {
       .filter((entry) => entry.isDirectory() && safeSessionId(entry.name))
       .map((entry) => entry.name);
 
-    let registeredSessions = 0;
+    let restorableSessions = 0;
     let restored = 0;
     for (const sessionId of sessionIds) {
       try {
         const rawCreds = await readFile(join(authPathFor(sessionId), "creds.json"), "utf8");
         const persistedCreds = JSON.parse(rawCreds);
-        if (!persistedCreds?.registered) continue;
-        registeredSessions += 1;
+        const registered = persistedCreds?.registered === true;
+        const hasPersistedIdentity = typeof persistedCreds?.me?.id === "string" && persistedCreds.me.id.length > 0;
+
+        // A completed WhatsApp pairing persists `me.id`. Some Baileys pairing-code
+        // flows can leave the boolean `registered` stale across a container restart.
+        // Recover that authenticated identity instead of forcing the tenant to pair again.
+        if (!registered && !hasPersistedIdentity) continue;
+        restorableSessions += 1;
+
+        if (!registered && hasPersistedIdentity) {
+          logger.warn({ sessionId }, "Recovering persisted WhatsApp identity with stale registered flag");
+        }
       } catch (error: any) {
         if (error?.code !== "ENOENT") {
           logger.warn({ error: error?.message || error, sessionId }, "Skipping unreadable persisted WhatsApp credentials");
@@ -53,7 +63,7 @@ const listenPatched = `async function restorePersistedSessions() {
       }
     }
 
-    logger.info({ persistedSessions: sessionIds.length, registeredSessions, restoreAttempts: restored }, "Persisted WhatsApp session restore completed");
+    logger.info({ persistedSessions: sessionIds.length, restorableSessions, restoreAttempts: restored }, "Persisted WhatsApp session restore completed");
   } catch (error: any) {
     if (error?.code === "ENOENT") {
       logger.info({ dataDir: DATA_DIR }, "No persisted WhatsApp session directory found yet");
@@ -78,7 +88,7 @@ if (!current.includes(listenPatched)) {
 
 if (changed) {
   writeFileSync(serverPath, current, "utf8");
-  console.log("Patched restoration of registered persisted WhatsApp sessions on gateway startup");
+  console.log("Patched restoration of recoverable persisted WhatsApp sessions on gateway startup");
 } else {
-  console.log("Registered WhatsApp session restoration is already present in src/server.ts");
+  console.log("Recoverable WhatsApp session restoration is already present in src/server.ts");
 }
