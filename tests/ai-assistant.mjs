@@ -182,22 +182,23 @@ test('payment change uses the secure payment endpoint only after confirmation', 
   }
 });
 
-test('assistant returns false on Gemini provider error so legacy fallback can run', async () => {
+test('assistant sends a safe menu fallback on Gemini provider error', async () => {
   const originalFetch = globalThis.fetch;
-  let sent = false;
+  let sent = null;
   globalThis.fetch = async () => response(429, { error: { status: 'RESOURCE_EXHAUSTED' } });
   try {
     const handled = await handleAiAssistantMessage({
       sessionId: 'tenant-provider-error',
       customerJid: '5511888888888@s.whatsapp.net',
       customerPhone: '5511888888888',
-      text: 'Olá',
+      text: 'Tem pastel de carne?',
       getStoreInfo: async () => ({ storeName: 'Loja Teste', menuUrl: 'https://example.test/cardapio' }),
-      sendMessage: async () => { sent = true; },
+      sendMessage: async (_jid, content) => { sent = content.text; },
       logger,
     });
-    assert.equal(handled, false);
-    assert.equal(sent, false);
+    assert.equal(handled, true);
+    assert.match(sent, /Não consegui confirmar isso agora/i);
+    assert.match(sent, /https:\/\/example\.test\/cardapio/);
   } finally {
     globalThis.fetch = originalFetch;
   }
