@@ -57,7 +57,7 @@ if (!current.includes("const GEMINI_FALLBACK_MODEL =")) {
 
 if (!current.includes("[AI-Assistant] Gemini unavailable; safe fallback reply sent")) {
   const noDecisionOriginal = `    if (!decision) return false;`;
-  const noDecisionPatched = `    if (!decision) {\n      const fallbackMenuUrl = clean(storeInfo?.menuUrl);\n      const fallbackReply = fallbackMenuUrl\n        ? \`Não consegui confirmar isso agora. Você pode conferir no nosso cardápio: \${fallbackMenuUrl}\`\n        : "Não consegui responder isso agora. Tente novamente em instantes ou fale com a loja.";\n      await sendText(params, fallbackReply);\n      params.logger.warn(\n        { sessionId: params.sessionId, remoteJid: params.customerJid },\n        "[AI-Assistant] Gemini unavailable; safe fallback reply sent",\n      );\n      return true;\n    }`;
+  const noDecisionPatched = `    if (!decision) {\n      const fallbackMenuUrl = clean(storeInfo?.menuUrl);\n      const fallbackReply = fallbackMenuUrl\n        ? \`Oi! 😊 Para confirmar se temos esse item disponível agora, dá uma olhadinha no nosso cardápio digital: \${fallbackMenuUrl}\`\n        : "Oi! 😊 Não consegui confirmar isso agora. Tente novamente em instantes ou fale com a loja.";\n      await sendText(params, fallbackReply);\n      params.logger.warn(\n        { sessionId: params.sessionId, remoteJid: params.customerJid },\n        "[AI-Assistant] Gemini unavailable; safe fallback reply sent",\n      );\n      return true;\n    }`;
 
   if (!current.includes(noDecisionOriginal)) {
     throw new Error("Could not locate Gemini no-decision fallback");
@@ -66,4 +66,4 @@ if (!current.includes("[AI-Assistant] Gemini unavailable; safe fallback reply se
 }
 
 writeFileSync(aiPath, current, "utf8");
-console.log("Patched Gemini low-latency model resilience and safe no-silence fallback");
+console.log("Patched Gemini low-latency model resilience and natural safe fallback");
