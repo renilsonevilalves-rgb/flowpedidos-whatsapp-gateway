@@ -36,8 +36,8 @@ const listenPatched = `async function restorePersistedSessions() {
         const registered = persistedCreds?.registered === true;
         const hasPersistedIdentity = typeof persistedCreds?.me?.id === "string" && persistedCreds.me.id.length > 0;
 
-        // A completed WhatsApp pairing persists `me.id`. Some Baileys pairing-code
-        // flows can leave the boolean `registered` stale across a container restart.
+        // A completed WhatsApp pairing persists me.id. Some Baileys pairing-code
+        // flows can leave the boolean registered stale across a container restart.
         // Recover that authenticated identity instead of forcing the tenant to pair again.
         if (!registered && !hasPersistedIdentity) continue;
         restorableSessions += 1;
