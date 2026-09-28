@@ -15,14 +15,14 @@ function replaceOnce(original, replacement, label) {
 }
 
 replaceOnce(
-  `import { handleOrderSelfServiceMessage } from "./orderSelfService.js";\n\nconst PORT`,
-  `import { handleOrderSelfServiceMessage } from "./orderSelfService.js";\nimport { handleAiAssistantMessage } from "./aiAssistant.js";\n\nconst PORT`,
+  `} from "@whiskeysockets/baileys";\n\nconst PORT`,
+  `} from "@whiskeysockets/baileys";\nimport { handleAiAssistantMessage } from "./aiAssistant.js";\n\nconst PORT`,
   "AI assistant import",
 );
 
 replaceOnce(
   `      const isTrigger = isAutoReplyTrigger(text);`,
-  `      const aiCustomerJid = getCustomerJid(msg, remoteJid);\n      const aiHandled = await handleAiAssistantMessage({\n        sessionId: id,\n        customerJid: aiCustomerJid,\n        text,\n        getStoreInfo: async () => fetchStoreInfo(id),\n        sendMessage: async (jid, content) => { await sock.sendMessage(jid, content); },\n        logger,\n      });\n      if (aiHandled) continue;\n\n      const isTrigger = isAutoReplyTrigger(text);`,
+  `      const aiCustomerJid = getCustomerJid(msg, remoteJid);\n      const aiCustomerPhone = await resolveCustomerPhone(sock, msg, remoteJid);\n      const aiHandled = await handleAiAssistantMessage({\n        sessionId: id,\n        customerJid: aiCustomerJid,\n        customerPhone: aiCustomerPhone,\n        text,\n        getStoreInfo: async () => fetchStoreInfo(id),\n        sendMessage: async (jid, content) => { await sock.sendMessage(jid, content); },\n        logger,\n      });\n      if (aiHandled) continue;\n\n      const isTrigger = isAutoReplyTrigger(text);`,
   "AI assistant incoming-message hook",
 );
 
