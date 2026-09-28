@@ -61,7 +61,7 @@ if (!source.includes(helperMarker)) {
   return text;
 }
 
-function buildMenuGreetingBizNode() {
+function buildMenuGreetingBizNode(): any {
   return {
     tag: "biz",
     attrs: {
