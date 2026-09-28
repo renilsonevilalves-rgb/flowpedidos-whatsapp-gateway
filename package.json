@@ -8,8 +8,9 @@
   },
   "scripts": {
     "dev": "tsx watch src/server.ts",
-    "prebuild": "node scripts/patch-lid-tracking.cjs && node scripts/patch-whatsapp-send.cjs && node scripts/patch-auto-reply-store-info.cjs && node scripts/patch-disable-history-sync.cjs && node scripts/patch-session-stability.cjs && node scripts/patch-session-restore.cjs && node scripts/patch-production-resilience.cjs && node scripts/patch-order-self-service.cjs",
+    "prebuild": "node scripts/patch-lid-tracking.cjs && node scripts/patch-whatsapp-send.cjs && node scripts/patch-auto-reply-store-info.cjs && node scripts/patch-disable-history-sync.cjs && node scripts/patch-session-stability.cjs && node scripts/patch-session-restore.cjs && node scripts/patch-production-resilience.cjs && node scripts/patch-order-self-service.cjs && node scripts/patch-ai-assistant.cjs",
     "build": "tsc",
+    "postbuild": "node --test tests/ai-assistant.mjs",
     "start": "node dist/server.js"
   },
   "dependencies": {
