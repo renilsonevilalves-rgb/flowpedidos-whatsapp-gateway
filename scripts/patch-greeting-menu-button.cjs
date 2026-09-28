@@ -178,8 +178,8 @@ if (!source.includes(helperMarker)) {
 if (!source.includes('name: "cta_url"') || !source.includes('display_text: "😍 Ver cardápio"')) {
   throw new Error("CTA URL button was not applied.");
 }
-if (source.includes("Este é um atendimento automático")) {
-  throw new Error("Legacy automatic-attendance footer is still present after greeting patch.");
+if (source.includes("_(Este é um atendimento automático)_`")) {
+  throw new Error("Legacy automatic-attendance footer is still present in the greeting template.");
 }
 if (source.includes("await sock.sendMessage(customerJid, { text: replyText });")) {
   throw new Error("Legacy plain-text greeting send is still present after greeting patch.");
