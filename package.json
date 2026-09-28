@@ -16,7 +16,7 @@
   "dependencies": {
     "@whiskeysockets/baileys": "git+https://github.com/doryani-ai/Baileys.git#4f263f0e365c2e74dd1b824031d1c5910f518c26",
     "@types/express": "^5.0.0",
-    "cors": "^5.0.0",
+    "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
     "link-preview-js": "3.2.0",
@@ -26,7 +26,7 @@
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/node": "^24.0.10",
-    "@types/qrcode": "^1.5.5",
+    "@types/qrcode": "^2.0.0",
     "tsx": "^4.20.3",
     "typescript": "^5.8.3"
   }
