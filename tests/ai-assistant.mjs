@@ -197,7 +197,7 @@ test('assistant sends a safe menu fallback on Gemini provider error', async () =
       logger,
     });
     assert.equal(handled, true);
-    assert.match(sent, /Não consegui confirmar isso agora/i);
+    assert.match(sent, /Para confirmar se temos esse item disponível agora/i);
     assert.match(sent, /https:\/\/example\.test\/cardapio/);
   } finally {
     globalThis.fetch = originalFetch;
