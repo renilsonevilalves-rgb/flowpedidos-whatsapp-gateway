@@ -203,3 +203,66 @@ test('assistant sends a safe menu fallback on Gemini provider error', async () =
     globalThis.fetch = originalFetch;
   }
 });
+
+test('store closing-time question is answered from configured hours without Gemini', async () => {
+  const originalFetch = globalThis.fetch;
+  let sent = null;
+  globalThis.fetch = async () => { throw new Error('Gemini must not be called for configured store-hours questions'); };
+  try {
+    const handled = await handleAiAssistantMessage({
+      sessionId: 'tenant-hours-configured',
+      customerJid: '5511777777777@s.whatsapp.net',
+      customerPhone: '5511777777777',
+      text: 'Que horas a loja fecha na segunda?',
+      getStoreInfo: async () => ({
+        storeName: 'Loja Teste',
+        menuUrl: 'https://example.test/cardapio',
+        timezone: 'America/Sao_Paulo',
+        isOpen: true,
+        openingHours: {
+          monday: { enabled: true, open: '08:00', close: '20:59' },
+        },
+      }),
+      sendMessage: async (_jid, content) => { sent = content.text; },
+      logger,
+    });
+    assert.equal(handled, true);
+    assert.match(sent, /fechamos às 20:59/i);
+    assert.doesNotMatch(sent, /cardápio/i);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test('store closing-time question does not invent disabled schedule or send menu', async () => {
+  const originalFetch = globalThis.fetch;
+  let sent = null;
+  globalThis.fetch = async () => { throw new Error('Gemini must not be called for store-hours questions'); };
+  try {
+    const handled = await handleAiAssistantMessage({
+      sessionId: 'tenant-hours-manual-open',
+      customerJid: '5511666666666@s.whatsapp.net',
+      customerPhone: '5511666666666',
+      text: 'Que horas a loja fecha?',
+      getStoreInfo: async () => ({
+        storeName: 'Loja Teste',
+        menuUrl: 'https://example.test/cardapio',
+        timezone: 'America/Sao_Paulo',
+        isOpen: true,
+        openingHours: {
+          monday: { enabled: false, open: '08:00', close: '20:59' },
+          tuesday: { enabled: false, open: '08:00', close: '23:50' },
+        },
+      }),
+      sendMessage: async (_jid, content) => { sent = content.text; },
+      logger,
+    });
+    assert.equal(handled, true);
+    assert.match(sent, /aberta no momento/i);
+    assert.match(sent, /horário de fechamento.*não está configurado/i);
+    assert.doesNotMatch(sent, /cardápio/i);
+    assert.doesNotMatch(sent, /20:59|23:50/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
