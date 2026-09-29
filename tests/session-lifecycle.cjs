@@ -9,7 +9,7 @@ const ts = require('typescript');
 // Exercise the actual prebuild output without opening a real WhatsApp socket.
 const source = readFileSync(join(__dirname, '../src/server.ts'), 'utf8');
 const names = ['getOrCreateSession', 'authPathFor', 'clearAuthState', 'scheduleReconnect',
-  'connectSession', 'startSessionWithRecovery', 'logoutSession', 'restorePersistedSessions'];
+  'getPublicSessionState', 'connectSession', 'startSessionWithRecovery', 'logoutSession', 'restorePersistedSessions'];
 const parsed = ts.createSourceFile('server.ts', source, ts.ScriptTarget.Latest, true);
 const functions = parsed.statements.filter(node => ts.isFunctionDeclaration(node) && names.includes(node.name?.text));
 assert.equal(functions.length, names.length);
@@ -238,4 +238,39 @@ test('gateway startup restores registered persisted credentials', async () => {
   assert.equal(h.sockets.length, 1);
   assert.equal(h.sockets[0].auth.creds.pairing, 'persisted');
   assert.equal(h.deleted.length, 0);
+});
+
+test('public session state never reports connected without a live socket', () => {
+  const h = harness();
+  const session = h.context.getOrCreateSession('tenant');
+  session.status = 'connected';
+  session.phone = '5511999999999';
+  session.sock = undefined;
+
+  const state = h.context.getPublicSessionState(session);
+  assert.equal(state.status, 'disconnected');
+  assert.equal(state.phone, null);
+  assert.equal(state.requiresPairing, false);
+  assert.equal(state.reason, null);
+});
+
+test('401 logged_out state is explicit and requires a new pairing', async () => {
+  const h = harness({ registered: true });
+  await h.start();
+  await h.close(h.sockets[0], 401);
+
+  const state = h.context.getPublicSessionState(h.session());
+  assert.equal(state.status, 'logged_out');
+  assert.equal(state.requiresPairing, true);
+  assert.equal(state.reason, 'pairing_required');
+  assert.equal(state.phone, null);
+});
+
+test('production logging is privacy hardened for WhatsApp payloads and Signal session dumps', () => {
+  assert.match(source, /BAILEYS_LOG_LEVEL \|\| "warn"/);
+  assert.match(source, /"remoteJid"/);
+  assert.match(source, /"text"/);
+  assert.match(source, /isSensitiveSignalSessionDump/);
+  assert.match(source, /Closing \(\?:stale open \|open \)\?session/);
+  assert.match(source, /baileysLogger\.child\(\{ sessionId: id \}\)/);
 });
