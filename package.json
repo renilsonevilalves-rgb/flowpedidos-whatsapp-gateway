@@ -19,7 +19,6 @@
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
-    "link-preview-js": "4.0.4",
     "pino": "^9.7.0",
     "qrcode": "^1.5.4"
   },
