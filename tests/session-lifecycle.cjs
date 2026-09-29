@@ -31,7 +31,7 @@ function harness({ registered = false, saveGates = [] } = {}) {
   const logger = Object.fromEntries(['info', 'warn', 'error', 'debug'].map(level => [level, (_data, message) => logs.push(message)]));
   logger.child = () => logger;
   const context = vm.createContext({
-    sessions: new Map(), manualLogouts: new Set(), shuttingDown: false, logger,
+    sessions: new Map(), manualLogouts: new Set(), shuttingDown: false, logger, baileysLogger: logger,
     DATA_DIR: '/data/whatsapp-sessions', join,
     DisconnectReason: { loggedOut: 401, badSession: 500, connectionReplaced: 440, restartRequired: 515 },
     Browsers: { ubuntu: () => ['test'] },
