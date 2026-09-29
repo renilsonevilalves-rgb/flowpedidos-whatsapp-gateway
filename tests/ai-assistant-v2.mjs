@@ -111,7 +111,7 @@ test('combined replacement is understood as a structured plan, can be revised na
   try {
     assert.equal(await handleAiAssistantMessage(baseParams('customer-a', 'Tem como tirar o hambúrguer e adicionar uma coca cola 2l no lugar?', sent)), true);
     assert.match(sent.at(-1), /Tirar \*1x Hambúrguer\* e colocar \*1x Coca Cola 2L\*\./);
-    assert.match(sent.at(-1), /Total: \*R\$ 36,50\*/);
+    assert.match(sent.at(-1), /\*Total: R\$ 36,50\*/);
     assert.match(sent.at(-1), /Responda \*SIM\* para confirmar ou \*NÃO\* para cancelar\./);
 
     const callsAfterPreview = backendBodies.length;
@@ -121,7 +121,7 @@ test('combined replacement is understood as a structured plan, can be revised na
 
     assert.equal(await handleAiAssistantMessage(baseParams('customer-a', 'Na verdade deixa o hambúrguer e coloca 2 cocas', sent)), true);
     assert.match(sent.at(-1), /Colocar \*2x Coca Cola 2L\*\./);
-    assert.match(sent.at(-1), /Total: \*R\$ 73,00\*/);
+    assert.match(sent.at(-1), /\*Total: R\$ 73,00\*/);
 
     assert.equal(await handleAiAssistantMessage(baseParams('customer-a', 'Sim', sent)), true);
     const commit = backendBodies.findLast((entry) => entry.action === 'change' && !entry.previewOnly && entry.changePlan);
@@ -169,7 +169,7 @@ test('customer can abandon an expensive draft in natural language without sendin
   try {
     await handleAiAssistantMessage(baseParams('customer-b', 'Quero adicionar 3 pudim no pedido', sent));
     assert.match(sent.at(-1), /Colocar \*3x Pudim\*\./);
-    assert.match(sent.at(-1), /Total: \*R\$ 119,69\*/);
+    assert.match(sent.at(-1), /\*Total: R\$ 119,69\*/);
     assert.match(sent.at(-1), /Responda \*SIM\* para confirmar ou \*NÃO\* para cancelar\./);
 
     await handleAiAssistantMessage(baseParams('customer-b', 'Achei caro, deixa como estava mesmo', sent));
