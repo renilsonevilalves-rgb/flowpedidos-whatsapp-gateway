@@ -10,7 +10,7 @@
     "dev": "tsx watch src/server.ts",
     "prebuild": "node scripts/patch-lid-tracking.cjs && node scripts/patch-whatsapp-send.cjs && node scripts/patch-auto-reply-store-info.cjs && node scripts/patch-disable-history-sync.cjs && node scripts/patch-session-stability.cjs && node scripts/patch-session-restore.cjs && node scripts/patch-production-resilience.cjs && node scripts/patch-ai-assistant.cjs && node scripts/patch-gemini-runtime-resilience.cjs && node scripts/patch-greeting-menu-button.cjs && node scripts/patch-change-customer-confirmation.cjs && node scripts/patch-ai-assistant-v2.cjs && node scripts/patch-session-state-privacy.cjs",
     "build": "tsc",
-    "postbuild": "node --test tests/*.mjs",
+    "postbuild": "node --test tests/*.mjs tests/*.cjs",
     "start": "node dist/server.js"
   },
   "dependencies": {
