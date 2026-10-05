@@ -67,6 +67,12 @@ replaceOnce(
     const reconnectGeneration = session.generation;
     void reconnect.catch((error) => {
       if (session.generation !== reconnectGeneration || session.loggingOut) return;
+      if (session.pairingRestartPending) {
+        session.pairingRestartPending = false;
+        session.status = "error";
+        logger.error({ sessionId: id }, "Pairing restart failed; waiting for explicit retry");
+        return;
+      }
       session.status = "disconnected";
       logger.error({ error, sessionId: id }, "Reconnect failed; retry will be scheduled");
       scheduleReconnect(id, false);
@@ -240,7 +246,7 @@ replaceOnce(
           // Pairing requires a new socket even before registered becomes true.
           // Use the normal single-flight scheduler and the same persisted auth path.
           session.status = "starting";
-          session.pairingRestartPending = true;
+          session.pairingRestartPending = !previouslyConnected;
           session.reconnectAttempts = 0;
           logger.info({ sessionId: id, statusCode }, "WhatsApp pairing completed; restart required");
           try { sock.end(undefined); } catch {
@@ -376,7 +382,7 @@ replaceOnce(
     if (!isCurrent()) return;
     const { state, saveCreds } = await useMultiFileAuthState(authPathFor(id));
     if (!isCurrent()) return;
-    let previouslyConnected = Boolean(state.creds.registered || state.creds.me?.id);
+    let previouslyConnected = !session.pairingRestartPending && Boolean(state.creds.registered || state.creds.me?.id);
     // Baileys also persists Signal keys outside creds.update. Drain both queues
     // before deleting auth, and reject writes from a superseded socket.
     const setKeys = state.keys.set.bind(state.keys);

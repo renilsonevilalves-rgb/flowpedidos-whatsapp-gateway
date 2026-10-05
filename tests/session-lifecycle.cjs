@@ -202,6 +202,8 @@ test('failed credential write blocks fresh auth loading and preserves files', as
   assert.equal(h.sockets.length, 1);
   assert.equal(h.deleted.length, 0);
   assert.ok(h.logs.some(line => line.includes('credential persistence failed')));
+  assert.equal(h.timers.size, 0, 'failed pairing initialization must not retry indefinitely');
+  assert.equal(h.session().status, 'error');
 });
 
 test('connectionReplaced suppresses reconnect and preserves auth', async () => {
@@ -522,4 +524,15 @@ test('an old start does not wait on a generation created by logout', async () =>
   await Promise.all([start, logout]);
   assert.equal(waits, 0);
   assert.equal(h.session().status, 'logged_out');
+});
+
+test('credentials written during pairing are not mistaken for a previously connected session', async () => {
+  const h = harness();
+  await h.start();
+  h.update(h.sockets[0], { registered: true, me: { id: 'paired:1' } });
+  await h.close(h.sockets[0], 515);
+  await h.tick();
+  await h.close(h.sockets[1], 408);
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.session().status, 'error');
 });
