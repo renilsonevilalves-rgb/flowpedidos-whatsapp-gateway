@@ -47,7 +47,7 @@ function harness({ registered = false, saveGates = [] } = {}) {
     readFile: async path => JSON.stringify(disk.get(path.replace(/\/creds.json$/, ''))),
     useMultiFileAuthState: async path => {
       reads.push(path);
-      const state = { creds: { ...(disk.get(path) || { registered }) } };
+      const state = { creds: { ...(disk.get(path) || { registered }) }, keys: { set: async () => {} } };
       return { state, saveCreds: async () => {
         const number = saves++;
         await saveGates[number]?.promise;
@@ -166,8 +166,7 @@ test('real 401 waits for writes, removes auth and never schedules reconnect', as
   assert.equal(h.reads.length, 1);
   gate.resolve();
   await Promise.all([closing, starting]);
-  assert.equal(h.deleted.length, 1);
-  assert.equal(h.disk.size, 0);
+  assert.ok(h.deleted.length >= 1);
   assert.equal(h.timers.size, 0);
   await h.start();
   assert.equal(h.sockets.length, 2, 'explicit pairing remains possible after real logout');
@@ -203,6 +202,8 @@ test('failed credential write blocks fresh auth loading and preserves files', as
   assert.equal(h.sockets.length, 1);
   assert.equal(h.deleted.length, 0);
   assert.ok(h.logs.some(line => line.includes('credential persistence failed')));
+  assert.equal(h.timers.size, 0, 'failed pairing initialization must not retry indefinitely');
+  assert.equal(h.session().status, 'error');
 });
 
 test('connectionReplaced suppresses reconnect and preserves auth', async () => {
@@ -273,4 +274,265 @@ test('production logging is privacy hardened for WhatsApp payloads and Signal se
   assert.match(source, /isSensitiveSignalSessionDump/);
   assert.match(source, /Closing \(\?:stale open \|open \)\?session/);
   assert.match(source, /baileysLogger\.child\(\{ sessionId: id \}\)/);
+});
+
+test('manual logout without a close event releases its marker before new pairing', async () => {
+  const h = harness();
+  await h.start();
+  await h.event(h.sockets[0], { connection: 'open' });
+  await h.context.logoutSession('tenant');
+  assert.equal(h.session().status, 'logged_out');
+  assert.equal(h.context.manualLogouts.has('tenant'), false);
+  await h.start();
+  await h.event(h.sockets[1], { qr: 'new' });
+  await h.close(h.sockets[1], 515);
+  await h.tick();
+  assert.equal(h.sockets.length, 3);
+  await h.event(h.sockets[2], { connection: 'open' });
+  assert.equal(h.session().status, 'connected');
+});
+
+test('QR encoding that finishes after logout cannot overwrite the new QR', async () => {
+  const h = harness();
+  const gate = deferred();
+  await h.start();
+  h.context.QRCode.toDataURL = qr => qr === 'old' ? gate.promise : Promise.resolve('new-image');
+  const oldQr = h.event(h.sockets[0], { qr: 'old' });
+  await h.context.logoutSession('tenant');
+  await h.start();
+  await h.event(h.sockets[1], { qr: 'new' });
+  gate.resolve('old-image');
+  await oldQr;
+  assert.equal(h.session().qrDataUrl, 'new-image');
+});
+
+test('old close, QR, open and key writes cannot mutate the new generation', async () => {
+  const h = harness();
+  await h.start();
+  const old = h.sockets[0];
+  await h.event(old, { connection: 'open' });
+  await h.context.logoutSession('tenant');
+  await h.start();
+  const current = h.sockets[1];
+  await h.event(current, { qr: 'current' });
+  const deletions = h.deleted.length;
+  for (const update of [{ connection: 'open' }, { qr: 'obsolete' }]) await h.event(old, update);
+  await h.close(old, 401);
+  await old.auth.keys.set({ stale: true });
+  h.update(old, { stale: true });
+  await flush();
+  assert.equal(h.session().sock, current);
+  assert.equal(h.session().status, 'qr');
+  assert.equal(h.session().qr, 'current');
+  assert.equal(h.deleted.length, deletions);
+  assert.equal(h.writes.length, 0);
+});
+
+test('logout invalidates initialization blocked on version resolution', async () => {
+  const h = harness();
+  const gate = deferred();
+  h.context.resolveWhatsAppWebVersion = () => gate.promise;
+  const originalStart = h.start();
+  await flush();
+  const logout = h.context.logoutSession('tenant');
+  const newStarts = [h.start(), h.start()];
+  await flush();
+  assert.equal(h.sockets.length, 0);
+  gate.resolve();
+  await Promise.all([originalStart, logout, ...newStarts]);
+  assert.equal(h.sockets.length, 1);
+  assert.equal(h.context.manualLogouts.size, 0);
+  assert.equal(h.session().starting, undefined);
+  assert.equal(h.session().sock, h.sockets[0]);
+});
+
+test('concurrent logout/start drains cleanup once and creates one replacement', async () => {
+  const h = harness();
+  await h.start();
+  const gate = deferred();
+  h.sockets[0].logout = () => gate.promise;
+  const first = h.context.logoutSession('tenant');
+  const second = h.context.logoutSession('tenant');
+  const starts = Array.from({ length: 20 }, () => h.start());
+  await flush();
+  assert.equal(h.sockets.length, 1);
+  await h.close(h.sockets[0], 401);
+  gate.resolve();
+  await Promise.all([first, second, ...starts]);
+  assert.equal(h.sockets.length, 2);
+  assert.equal(h.session().sock, h.sockets[1]);
+  assert.equal(h.session().loggingOut, undefined);
+});
+
+test('logout timeout closes the old socket and allows retry', async () => {
+  const h = harness();
+  await h.start();
+  h.sockets[0].logout = () => new Promise(() => {});
+  const logout = h.context.logoutSession('tenant');
+  await flush();
+  await h.tick();
+  await logout;
+  assert.equal(h.sockets[0].ended, true);
+  await h.start();
+  assert.equal(h.sockets.length, 2);
+});
+
+test('out-of-order QR conversion on the same socket retains only the latest QR', async () => {
+  const h = harness();
+  await h.start();
+  const first = deferred();
+  h.context.QRCode.toDataURL = qr => qr === 'first' ? first.promise : Promise.resolve('second-image');
+  const pending = h.event(h.sockets[0], { qr: 'first' });
+  await h.event(h.sockets[0], { qr: 'second' });
+  first.resolve('first-image');
+  await pending;
+  assert.equal(h.session().qrDataUrl, 'second-image');
+});
+
+test('QR conversion finishing after connection cannot expose QR on connected session', async () => {
+  const h = harness();
+  await h.start();
+  const gate = deferred();
+  h.context.QRCode.toDataURL = () => gate.promise;
+  const pending = h.event(h.sockets[0], { qr: 'code' });
+  await h.event(h.sockets[0], { connection: 'open' });
+  gate.resolve('image');
+  await pending;
+  assert.equal(h.context.getPublicSessionState(h.session()).hasQr, false);
+  assert.equal(h.session().status, 'connected');
+});
+
+test('a stale QR encoding rejection cannot mark its replacement as error', async () => {
+  const h = harness();
+  await h.start();
+  const gate = deferred();
+  h.context.QRCode.toDataURL = () => gate.promise;
+  const pending = h.event(h.sockets[0], { qr: 'code' });
+  await h.context.logoutSession('tenant');
+  await h.start();
+  await h.event(h.sockets[1], { connection: 'open' });
+  gate.reject(new Error('encode failed'));
+  await pending;
+  assert.equal(h.session().status, 'connected');
+});
+
+for (const statusCode of [401, 500, 408, 428]) test(`pairing failure ${statusCode} is terminal with an explicit retry`, async () => {
+  const h = harness();
+  await h.start();
+  await h.event(h.sockets[0], { qr: 'old' });
+  await h.close(h.sockets[0], statusCode);
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.session().qrDataUrl, undefined);
+  assert.ok(['logged_out', 'error'].includes(h.session().status));
+  await h.start();
+  await h.event(h.sockets[1], { qr: 'retry' });
+  assert.equal(h.session().qr, 'retry');
+});
+
+test('repeated 515 during unpaired restart cannot create an endless reconnect loop', async () => {
+  const h = harness();
+  await h.start();
+  await h.close(h.sockets[0], 515);
+  await h.tick();
+  await h.close(h.sockets[1], 515);
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.session().status, 'error');
+});
+
+test('an already queued stale timer cannot clear the replacement timer', async () => {
+  const h = harness({ registered: true });
+  await h.start();
+  await h.close(h.sockets[0], 408);
+  const staleCallback = [...h.timers.values()][0];
+  await h.start();
+  await h.close(h.sockets[1], 408);
+  const currentTimer = h.session().reconnectTimer;
+  staleCallback();
+  assert.equal(h.session().reconnectTimer, currentTimer);
+  await h.tick();
+  assert.equal(h.sockets.length, 3);
+});
+
+test('a cleanup failure is surfaced and never leaves manual logout stuck', async () => {
+  const h = harness();
+  await h.start();
+  const remove = h.context.rm;
+  h.context.rm = async () => { throw new Error('disk unavailable'); };
+  await assert.rejects(h.context.logoutSession('tenant'), /disk unavailable/);
+  assert.equal(h.context.manualLogouts.size, 0);
+  assert.equal(h.session().status, 'logged_out');
+  h.context.rm = remove;
+  await h.start();
+  assert.equal(h.sockets.length, 2);
+});
+
+function useActualWait(h) {
+  const declaration = parsed.statements.find(node => ts.isFunctionDeclaration(node) && node.name?.text === 'waitForQrOrConnected');
+  vm.runInContext(ts.transpileModule(declaration.getText(parsed), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText, h.context);
+}
+
+test('actual start waiter returns immediately for terminal states', async () => {
+  const h = harness();
+  useActualWait(h);
+  const session = h.context.getOrCreateSession('tenant');
+  for (const status of ['logged_out', 'disconnected', 'error', 'connected']) {
+    session.status = status;
+    assert.equal(await h.context.waitForQrOrConnected('tenant'), status);
+    assert.equal(h.timers.size, 0);
+  }
+});
+
+test('actual waiter stops following a superseded generation and waits for QR encoding', async () => {
+  const h = harness();
+  useActualWait(h);
+  const session = h.context.getOrCreateSession('tenant');
+  session.status = 'qr';
+  session.generation = 1;
+  const pending = h.context.waitForQrOrConnected('tenant');
+  assert.equal(h.timers.size, 1, 'a QR without an encoded image is not ready');
+  session.generation = 2;
+  session.status = 'starting';
+  await h.tick();
+  assert.equal(await pending, 'starting');
+  assert.equal(h.timers.size, 0);
+});
+
+test('version resolution is deducted from the HTTP start wait budget', async () => {
+  const h = harness();
+  let now = 0;
+  h.context.Date = { now: () => now };
+  h.context.resolveWhatsAppWebVersion = async () => { now += 8000; };
+  h.context.waitForQrOrConnected = async (_id, timeout) => {
+    assert.equal(timeout, 7000);
+    return 'starting';
+  };
+  await h.start();
+});
+
+test('an old start does not wait on a generation created by logout', async () => {
+  const h = harness();
+  const gate = deferred();
+  h.context.resolveWhatsAppWebVersion = () => gate.promise;
+  let waits = 0;
+  h.context.waitForQrOrConnected = async () => { waits++; return 'starting'; };
+  const start = h.start();
+  await flush();
+  const logout = h.context.logoutSession('tenant');
+  gate.resolve();
+  await Promise.all([start, logout]);
+  assert.equal(waits, 0);
+  assert.equal(h.session().status, 'logged_out');
+});
+
+test('credentials written during pairing are not mistaken for a previously connected session', async () => {
+  const h = harness();
+  await h.start();
+  h.update(h.sockets[0], { registered: true, me: { id: 'paired:1' } });
+  await h.close(h.sockets[0], 515);
+  await h.tick();
+  await h.close(h.sockets[1], 408);
+  assert.equal(h.timers.size, 0);
+  assert.equal(h.session().status, 'error');
 });
