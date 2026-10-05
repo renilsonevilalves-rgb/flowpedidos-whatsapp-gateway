@@ -5,6 +5,12 @@ const serverPath = resolve(__dirname, "../src/server.ts");
 let current = readFileSync(serverPath, "utf8");
 let changed = false;
 
+// Later prebuild steps preserve these lifecycle guards on repeated builds.
+if (current.includes("// Generation-owned WhatsApp lifecycle v1")) {
+  console.log("WhatsApp lifecycle generation guards are already present");
+  return;
+}
+
 function replaceOnce(original, replacement, label, previous) {
   if (current.includes(replacement)) return;
   if (previous && current.includes(previous)) original = previous;
@@ -17,7 +23,7 @@ function replaceOnce(original, replacement, label, previous) {
 
 replaceOnce(
   `  reconnectTimer?: ReturnType<typeof setTimeout>;\n};`,
-  `  reconnectTimer?: ReturnType<typeof setTimeout>;\n  pendingCredsSave?: Promise<void>;\n  pairingRestartPending?: boolean;\n  reconnectAttempts?: number;\n};`,
+  `  reconnectTimer?: ReturnType<typeof setTimeout>;\n  generation?: number;\n  loggingOut?: Promise<void>;\n  pendingCredsSave?: Promise<void>;\n  pairingRestartPending?: boolean;\n  reconnectAttempts?: number;\n};`,
   "Session reconnect state",
   `  reconnectTimer?: ReturnType<typeof setTimeout>;\n  reconnectAttempts?: number;\n};`,
 );
@@ -42,7 +48,8 @@ replaceOnce(
 }`,
 `function scheduleReconnect(id: string, _fresh = false, delayMs?: number) {
   const session = getOrCreateSession(id);
-  if (shuttingDown || manualLogouts.has(id) || session.reconnectTimer) return;
+  if (shuttingDown || manualLogouts.has(id) || session.loggingOut || session.reconnectTimer) return;
+  const generation = session.generation;
 
   const attempt = session.reconnectAttempts || 0;
   const exponentialDelay = Math.min(30000, 1500 * (2 ** Math.min(attempt, 5)));
@@ -51,11 +58,15 @@ replaceOnce(
   session.reconnectAttempts = attempt + 1;
 
   logger.info({ sessionId: id, reconnectAttempt: session.reconnectAttempts, delayMs: finalDelay }, "Scheduling WhatsApp reconnect");
-  session.reconnectTimer = setTimeout(() => {
+  const timer = session.reconnectTimer = setTimeout(() => {
+    if (session.reconnectTimer !== timer || session.generation !== generation) return;
     session.reconnectTimer = undefined;
     if (shuttingDown || manualLogouts.has(id)) return;
 
-    void connectSession(id, false).catch((error) => {
+    const reconnect = connectSession(id, false);
+    const reconnectGeneration = session.generation;
+    void reconnect.catch((error) => {
+      if (session.generation !== reconnectGeneration || session.loggingOut) return;
       session.status = "disconnected";
       logger.error({ error, sessionId: id }, "Reconnect failed; retry will be scheduled");
       scheduleReconnect(id, false);
@@ -69,10 +80,19 @@ replaceOnce(
 `  if (session.starting) return session.starting;
   if (session.status === "connected" && session.sock) return;
   if (forceFresh) await clearAuthState(id);`,
-`  if (session.starting) return session.starting;
+`  if (session.loggingOut) {
+    await session.loggingOut;
+    return connectSession(id, forceFresh);
+  }
+  if (session.starting) return session.starting;
   // One live socket per tenant. Creating a second socket for the same auth state
   // is a primary cause of WhatsApp connectionReplaced/conflict loops.
   if (session.sock) return;
+  // Generation-owned WhatsApp lifecycle v1
+  const generation = (session.generation || 0) + 1;
+  session.generation = generation;
+  const isCurrent = () => session.generation === generation && !manualLogouts.has(id) && !shuttingDown;
+  forceFresh = forceFresh || session.status === "logged_out";
   // Auth loading and credential persistence run inside the shared starting lock.`,
   "single-socket guard",
 `  if (session.starting) return session.starting;
@@ -95,6 +115,7 @@ replaceOnce(
         session.qr = undefined;
         session.qrDataUrl = undefined;
         session.phone = sock.user?.id?.split(":")[0];
+        previouslyConnected = true;
         session.reconnectAttempts = 0;
         if (session.reconnectTimer) {
           clearTimeout(session.reconnectTimer);
@@ -152,6 +173,7 @@ replaceOnce(
         const connectionReplaced = statusCode === DisconnectReason.connectionReplaced;
         const restartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
         const manuallyLoggedOut = manualLogouts.has(id);
+        logger.info({ sessionId: id, generation, statusCode }, "WhatsApp connection closed");
         // Freeze the old socket's write queue before releasing its ownership.
         sock.ev.off("creds.update", persistCreds);
         if (session.reconnectTimer) {
@@ -188,9 +210,11 @@ replaceOnce(
             await clearAuthState(id);
             session.pendingCredsSave = undefined;
           });
-          session.starting = cleanup;
-          try { await cleanup; } finally {
-            if (session.starting === cleanup) session.starting = undefined;
+          session.loggingOut = cleanup;
+          try { await cleanup; } catch {
+            logger.error({ sessionId: id }, "WhatsApp logout cleanup failed; explicit retry required");
+          } finally {
+            if (session.loggingOut === cleanup) session.loggingOut = undefined;
           }
           logger.warn({ sessionId: id, statusCode }, "WhatsApp session was explicitly logged out; re-pairing is required");
           return;
@@ -202,6 +226,13 @@ replaceOnce(
         if (connectionReplaced) {
           session.status = "disconnected";
           logger.warn({ sessionId: id, statusCode }, "WhatsApp connection was replaced; reconnect suppressed on this socket");
+          return;
+        }
+
+        if (restartRequired && session.pairingRestartPending && !previouslyConnected) {
+          session.status = "error";
+          session.pairingRestartPending = false;
+          logger.warn({ sessionId: id, statusCode }, "Repeated pairing restart blocked; explicit retry required");
           return;
         }
 
@@ -224,9 +255,11 @@ replaceOnce(
           logger.warn({ sessionId: id, statusCode }, "WhatsApp reported badSession; credentials preserved and recovery will be attempted");
         }
 
-        if (state.creds.registered) {
+        if (previouslyConnected) {
           scheduleReconnect(id, false, 3000);
         } else {
+          session.status = "error";
+          session.pairingRestartPending = false;
           session.reconnectAttempts = 0;
           logger.info({ sessionId: id, statusCode }, "Unregistered WhatsApp session closed; waiting for explicit pairing instead of reconnect loop");
         }
@@ -316,8 +349,12 @@ replaceOnce(
     session.reconnectTimer = undefined;
   }
 
-  await connectSession(id, false);
-  const status = await waitForQrOrConnected(id, 15000);
+  const deadline = Date.now() + 15000;
+  const connecting = connectSession(id, false);
+  const generation = session.generation;
+  await connecting;
+  if (session.generation !== generation) return;
+  const status = await waitForQrOrConnected(id, Math.max(0, deadline - Date.now()));
   if (status === "error") throw new Error("Could not initialize WhatsApp session");
 }`,
   "non-destructive session start recovery",
@@ -326,16 +363,30 @@ replaceOnce(
 replaceOnce(
 `  session.starting = (async () => {
     const { state, saveCreds } = await useMultiFileAuthState(authPathFor(id));`,
-`  session.starting = (async () => {
+`  const starting = session.starting = (async () => {
     if (session.pairingRestartPending && session.pendingCredsSave) {
       logger.info({ sessionId: id }, "Waiting for pending credential persistence before restart");
     }
     // The lock is assigned before this await, so /start and timers share it.
     // A failed write aborts reconnect; never load fresh/partial credentials.
-    await session.pendingCredsSave;
-    if (shuttingDown || getOrCreateSession(id).status === "logged_out") return;
+    if (forceFresh) await session.pendingCredsSave?.catch(() => {});
+    else await session.pendingCredsSave;
+    if (!isCurrent()) return;
     if (forceFresh) await clearAuthState(id);
-    const { state, saveCreds } = await useMultiFileAuthState(authPathFor(id));`,
+    if (!isCurrent()) return;
+    const { state, saveCreds } = await useMultiFileAuthState(authPathFor(id));
+    if (!isCurrent()) return;
+    let previouslyConnected = Boolean(state.creds.registered || state.creds.me?.id);
+    // Baileys also persists Signal keys outside creds.update. Drain both queues
+    // before deleting auth, and reject writes from a superseded socket.
+    const setKeys = state.keys.set.bind(state.keys);
+    state.keys.set = (data) => {
+      if (!isCurrent() || !session.sock) return Promise.resolve();
+      const pending = (session.pendingCredsSave || Promise.resolve())
+        .catch(() => {}).then(() => setKeys(data));
+      session.pendingCredsSave = pending;
+      return pending;
+    };`,
   "credential persistence barrier",
 );
 
@@ -343,7 +394,7 @@ replaceOnce(
 `    const version = await resolveWhatsAppWebVersion();
     const sock = makeWASocket({`,
 `    const version = await resolveWhatsAppWebVersion();
-    if (shuttingDown || getOrCreateSession(id).status === "logged_out") return;
+    if (!isCurrent()) return;
     if (session.pairingRestartPending) {
       logger.info({ sessionId: id }, "Restarting WhatsApp socket after successful pairing");
     }
@@ -353,7 +404,8 @@ replaceOnce(
 
 replaceOnce(
 `    sock.ev.on("creds.update", saveCreds);`,
-`    const persistCreds = () => {
+`    logger.info({ sessionId: id, generation }, "WhatsApp socket created");
+    const persistCreds = () => {
       if (session.sock !== sock) return;
       // Serialize full-state writes. A later update can retry a failed save.
       const pending = (session.pendingCredsSave || Promise.resolve())
@@ -369,15 +421,64 @@ replaceOnce(
 );
 
 replaceOnce(
-`  session.status = "logged_out";
-  await clearAuthState(id);`,
-`  session.status = "logged_out";
-  session.pairingRestartPending = false;
-  await session.starting?.catch(() => {});
-  await session.pendingCredsSave?.catch(() => {});
+`async function logoutSession(id: string) {
+  const session = sessions.get(id);
+  if (!session) { await clearAuthState(id); return; }
+  manualLogouts.add(id);
+  if (session.reconnectTimer) { clearTimeout(session.reconnectTimer); session.reconnectTimer = undefined; }
+  try { await session.sock?.logout(); } catch (error) { logger.warn({ error, sessionId: id }, "WhatsApp logout returned an error"); }
+  session.sock = undefined;
+  session.qr = undefined;
+  session.qrDataUrl = undefined;
+  session.phone = undefined;
+  session.status = "logged_out";
   await clearAuthState(id);
-  session.pendingCredsSave = undefined;`,
-  "manual logout credential drain",
+}`,
+`async function logoutSession(id: string) {
+  const session = getOrCreateSession(id);
+  if (session.loggingOut) return session.loggingOut;
+  const sock = session.sock;
+  const starting = session.starting;
+  session.generation = (session.generation || 0) + 1;
+  manualLogouts.add(id);
+  if (session.reconnectTimer) { clearTimeout(session.reconnectTimer); session.reconnectTimer = undefined; }
+  session.sock = undefined;
+  session.starting = undefined;
+  session.qr = undefined;
+  session.qrDataUrl = undefined;
+  session.phone = undefined;
+  session.status = "logged_out";
+  session.pairingRestartPending = false;
+  session.reconnectAttempts = 0;
+  logger.info({ sessionId: id, generation: session.generation }, "WhatsApp logout started");
+  const cleanup = session.loggingOut = Promise.resolve().then(async () => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      if (sock) await Promise.race([
+        sock.logout(),
+        new Promise<void>((resolve) => { timer = setTimeout(resolve, 3000); }),
+      ]);
+    } catch {
+      logger.warn({ sessionId: id }, "WhatsApp logout returned an error");
+    } finally {
+      if (timer) clearTimeout(timer);
+      try { sock?.end(undefined); } catch {}
+    }
+    // These are captured old-generation operations. New starts await loggingOut.
+    await starting?.catch(() => {});
+    await session.pendingCredsSave?.catch(() => {});
+    await clearAuthState(id);
+    session.pendingCredsSave = undefined;
+    logger.info({ sessionId: id, generation: session.generation }, "WhatsApp logout completed");
+  });
+  try { await cleanup; } finally {
+    if (session.loggingOut === cleanup) {
+      session.loggingOut = undefined;
+      manualLogouts.delete(id);
+    }
+  }
+}`,
+  "generation-owned manual logout",
 );
 
 const listenBlock = `app.listen(PORT, "0.0.0.0", () => {
@@ -431,6 +532,64 @@ replaceOnce(
   // Give socket close frames a brief chance to flush.
   await new Promise((resolve) => setTimeout(resolve, 500));`,
   "shutdown credential persistence",
+);
+
+replaceOnce(
+  `  try { await session.starting; } finally { session.starting = undefined; }`,
+  `  try { await starting; } catch (error) {
+    if (isCurrent()) session.status = "error";
+    throw error;
+  } finally {
+    if (session.starting === starting) session.starting = undefined;
+  }`,
+  "generation-owned initialization completion",
+);
+
+replaceOnce(
+  `          session.qrDataUrl = await QRCode.toDataURL(qr, { errorCorrectionLevel: "M", margin: 2, width: 420 });`,
+  `          session.qrDataUrl = undefined;
+          const dataUrl = await QRCode.toDataURL(qr, { errorCorrectionLevel: "M", margin: 2, width: 420 });
+          if (!isCurrent() || session.sock !== sock || session.qr !== qr || session.status !== "qr") return;
+          session.qrDataUrl = dataUrl;`,
+  "QR encoding ownership",
+);
+replaceOnce(
+  `        } catch (error) {
+          session.status = "error";
+          logger.error({ error, sessionId: id }, "Failed to generate QR data URL");`,
+  `        } catch (error) {
+          if (!isCurrent() || session.sock !== sock || session.qr !== qr || session.status !== "qr") return;
+          session.status = "error";
+          session.qr = undefined;
+          session.qrDataUrl = undefined;
+          session.sock = undefined;
+          try { sock.end(undefined); } catch {}
+          logger.error({ sessionId: id }, "Failed to generate QR data URL");`,
+  "QR encoding error ownership",
+);
+replaceOnce(
+  `  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (session.status === "qr" || session.status === "connected" || session.status === "error") return session.status;`,
+  `  const generation = session.generation;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (session.generation !== generation) return session.status;
+    if ((session.status === "qr" && session.qrDataUrl) || session.status === "connected" || session.status === "error" || session.status === "logged_out" || session.status === "disconnected") return session.status;`,
+  "generation-owned start wait",
+);
+replaceOnce(
+  `    session.status = "error";
+    logger.error({ error: error?.message || error, sessionId }, "Could not start session");`,
+  `    // The operation owns its state changes; a stale HTTP request does not.
+    logger.error({ error: error?.message || error, sessionId }, "Could not start session");`,
+  "stale HTTP error ownership",
+);
+replaceOnce(
+  `    logger.error({ error, sessionId: id }, "Failed to clear WhatsApp auth state");`,
+  `    logger.error({ sessionId: id }, "Failed to clear WhatsApp auth state");
+    throw error;`,
+  "auth cleanup error propagation",
 );
 
 if (changed) {
