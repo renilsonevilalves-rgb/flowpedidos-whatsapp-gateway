@@ -23,7 +23,7 @@ function replaceOnce(original, replacement, label, previous) {
 
 replaceOnce(
   `  reconnectTimer?: ReturnType<typeof setTimeout>;\n};`,
-  `  reconnectTimer?: ReturnType<typeof setTimeout>;\n  generation?: number;\n  loggingOut?: Promise<void>;\n  pendingCredsSave?: Promise<void>;\n  pairingRestartPending?: boolean;\n  reconnectAttempts?: number;\n};`,
+  `  reconnectTimer?: ReturnType<typeof setTimeout>;\n  generation?: number;\n  loggingOut?: Promise<void>;\n  pendingCredsSave?: Promise<void>;\n  pairingRestartPending?: boolean;\n  reconnectAttempts?: number;\n  connectedAt?: number;\n};`,
   "Session reconnect state",
   `  reconnectTimer?: ReturnType<typeof setTimeout>;\n  reconnectAttempts?: number;\n};`,
 );
@@ -46,15 +46,20 @@ replaceOnce(
     });
   }, delayMs);
 }`,
-`function scheduleReconnect(id: string, _fresh = false, delayMs?: number) {
+`function scheduleReconnect(id: string, _fresh = false, delayMs?: number, fastTransient = false) {
   const session = getOrCreateSession(id);
   if (shuttingDown || manualLogouts.has(id) || session.loggingOut || session.reconnectTimer) return;
   const generation = session.generation;
 
   const attempt = session.reconnectAttempts || 0;
   const exponentialDelay = Math.min(30000, 1500 * (2 ** Math.min(attempt, 5)));
-  const baseDelay = typeof delayMs === "number" ? Math.max(delayMs, exponentialDelay) : exponentialDelay;
-  const finalDelay = baseDelay + Math.floor(Math.random() * 500);
+  // A known upstream Baileys Stream Errored (ack) / 500 can terminate an
+  // otherwise healthy socket around the 50-60 minute mark. Recover that exact
+  // transient quickly, while every other failure keeps the conservative backoff.
+  const baseDelay = fastTransient
+    ? Math.max(250, delayMs ?? 250)
+    : (typeof delayMs === "number" ? Math.max(delayMs, exponentialDelay) : exponentialDelay);
+  const finalDelay = baseDelay + Math.floor(Math.random() * (fastTransient ? 150 : 500));
   session.reconnectAttempts = attempt + 1;
 
   logger.info({ sessionId: id, reconnectAttempt: session.reconnectAttempts, delayMs: finalDelay }, "Scheduling WhatsApp reconnect");
@@ -122,6 +127,7 @@ replaceOnce(
         session.qrDataUrl = undefined;
         session.phone = sock.user?.id?.split(":")[0];
         previouslyConnected = true;
+        session.connectedAt = Date.now();
         session.reconnectAttempts = 0;
         if (session.reconnectTimer) {
           clearTimeout(session.reconnectTimer);
@@ -173,13 +179,22 @@ replaceOnce(
         scheduleReconnect(id, false, 3000);
       }`,
 `      if (connection === "close") {
-        const statusCode = (lastDisconnect?.error as any)?.output?.statusCode;
+        const disconnectError = lastDisconnect?.error as any;
+        const statusCode = disconnectError?.output?.statusCode;
         const loggedOut = statusCode === DisconnectReason.loggedOut;
         const badSession = statusCode === DisconnectReason.badSession;
         const connectionReplaced = statusCode === DisconnectReason.connectionReplaced;
         const restartRequired = statusCode === DisconnectReason.restartRequired || statusCode === 515;
         const manuallyLoggedOut = manualLogouts.has(id);
-        logger.info({ sessionId: id, generation, statusCode }, "WhatsApp connection closed");
+        const reasonNode = disconnectError?.data;
+        const connectedDurationMs = session.connectedAt ? Date.now() - session.connectedAt : 0;
+        const transientAckStreamError =
+          statusCode === 500 &&
+          typeof disconnectError?.message === "string" &&
+          disconnectError.message.includes("Stream Errored (ack)") &&
+          reasonNode?.tag === "ack" &&
+          connectedDurationMs >= 15000;
+        logger.info({ sessionId: id, generation, statusCode, connectedDurationMs }, "WhatsApp connection closed");
         // Freeze the old socket's write queue before releasing its ownership.
         sock.ev.off("creds.update", persistCreds);
         if (session.reconnectTimer) {
@@ -190,6 +205,7 @@ replaceOnce(
         session.qr = undefined;
         session.qrDataUrl = undefined;
         session.phone = undefined;
+        session.connectedAt = undefined;
 
         if (manuallyLoggedOut) {
           manualLogouts.delete(id);
@@ -232,6 +248,20 @@ replaceOnce(
         if (connectionReplaced) {
           session.status = "disconnected";
           logger.warn({ sessionId: id, statusCode }, "WhatsApp connection was replaced; reconnect suppressed on this socket");
+          return;
+        }
+
+        if (transientAckStreamError) {
+          session.status = "disconnected";
+          session.reconnectAttempts = 0;
+          logger.warn({
+            sessionId: id,
+            statusCode,
+            connectedDurationMs,
+            ackClass: reasonNode?.attrs?.class,
+            ackType: reasonNode?.attrs?.type,
+          }, "Transient WhatsApp ACK stream error detected; scheduling fast safe reconnect");
+          scheduleReconnect(id, false, 250, true);
           return;
         }
 
@@ -437,6 +467,7 @@ replaceOnce(
   session.qr = undefined;
   session.qrDataUrl = undefined;
   session.phone = undefined;
+  session.connectedAt = undefined;
   session.status = "logged_out";
   await clearAuthState(id);
 }`,
