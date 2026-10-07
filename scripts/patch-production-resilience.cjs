@@ -467,7 +467,6 @@ replaceOnce(
   session.qr = undefined;
   session.qrDataUrl = undefined;
   session.phone = undefined;
-  session.connectedAt = undefined;
   session.status = "logged_out";
   await clearAuthState(id);
 }`,
@@ -484,6 +483,7 @@ replaceOnce(
   session.qr = undefined;
   session.qrDataUrl = undefined;
   session.phone = undefined;
+  session.connectedAt = undefined;
   session.status = "logged_out";
   session.pairingRestartPending = false;
   session.reconnectAttempts = 0;
