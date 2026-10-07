@@ -232,6 +232,58 @@ test('registered transient disconnect still reconnects with preserved auth', asy
   assert.equal(h.deleted.length, 0);
 });
 
+test('known ACK stream 500 on a healthy session uses fast safe recovery without deleting auth', async () => {
+  const h = harness({ registered: true });
+  await h.start();
+  const sock = h.sockets[0];
+  await h.event(sock, { connection: 'open' });
+  h.session().connectedAt = Date.now() - 60_000;
+  h.session().reconnectAttempts = 4;
+
+  await h.event(sock, {
+    connection: 'close',
+    lastDisconnect: {
+      error: {
+        message: 'Stream Errored (ack)',
+        output: { statusCode: 500 },
+        data: { tag: 'ack', attrs: { class: 'status', type: 'media' } },
+      },
+    },
+  });
+
+  assert.equal(h.deleted.length, 0);
+  assert.equal(h.timers.size, 1);
+  assert.equal(h.session().reconnectAttempts, 1, 'known transient resets prior backoff before scheduling');
+  assert.ok(h.logs.includes('Transient WhatsApp ACK stream error detected; scheduling fast safe reconnect'));
+  await h.tick();
+  assert.equal(h.sockets.length, 2);
+});
+
+test('other status 500 failures keep the conservative recovery path', async () => {
+  const h = harness({ registered: true });
+  await h.start();
+  const sock = h.sockets[0];
+  await h.event(sock, { connection: 'open' });
+  h.session().connectedAt = Date.now() - 60_000;
+  h.session().reconnectAttempts = 4;
+
+  await h.event(sock, {
+    connection: 'close',
+    lastDisconnect: {
+      error: {
+        message: 'Connection Failure',
+        output: { statusCode: 500 },
+        data: { tag: 'failure', attrs: {} },
+      },
+    },
+  });
+
+  assert.equal(h.deleted.length, 0);
+  assert.equal(h.timers.size, 1);
+  assert.equal(h.session().reconnectAttempts, 5, 'unrecognized 500 must retain normal backoff');
+  assert.equal(h.logs.includes('Transient WhatsApp ACK stream error detected; scheduling fast safe reconnect'), false);
+});
+
 test('gateway startup restores registered persisted credentials', async () => {
   const h = harness();
   h.disk.set('/data/whatsapp-sessions/tenant', { registered: true, pairing: 'persisted' });
