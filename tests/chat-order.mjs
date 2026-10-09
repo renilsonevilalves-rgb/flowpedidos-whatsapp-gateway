@@ -215,7 +215,7 @@ test("ambiguous brand with two sizes cannot be silently selected without Gemini"
   try {
     await handleChatOrderMessage(params("5531999923111","Quero uma coca cola",messages));
     assert.equal(backendCalls.includes("preview"),false);
-    assert.match(messages.at(-1),/produtos e quantidades/i);
+    assert.match(messages.at(-1),/tamanho ou sabor exato/i);
   }finally{globalThis.fetch=originalFetch;}
 });
 
@@ -336,4 +336,160 @@ test("never infer Turbo automatically from an unspecified bacon variant", async 
     assert.equal(calls.filter(x=>x.action==="preview").length,0);
     assert.doesNotMatch(messages.at(-1),/Anotei seu pedido:\n1x X- Tudo Turbo/);
   } finally {globalThis.fetch=originalFetch;}
+});
+
+
+test("offline fallback understands one-letter typo only for a uniquely specified product", async () => {
+  const old = globalThis.fetch, messages = [], calls = [];
+  const turbo = "9354a916-e4e0-4c85-aaf4-7a5106191952";
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({ error: "unavailable" }, 503);
+    const body = JSON.parse(options.body); calls.push(body);
+    return response({ ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood", products: [
+      { id: turbo, name: "X Tudo Turbo", price: 34.90, optionGroups: [] },
+      { id: "254c9acd-6471-4978-a409-ad475e985552", name: "X Egg Bacon", price: 25, optionGroups: [] },
+    ] });
+  };
+  try {
+    await handleChatOrderMessage(params("5531999900001", "Quero 2 X Tudo Turbu", messages));
+    assert.match(messages.at(-1), /2x X Tudo Turbo/);
+    assert.equal(calls.filter(x => x.action === "commit").length, 0);
+    assert.equal(calls.length, 1, "simple typo must not need Gemini or create an order");
+  } finally { globalThis.fetch = old; }
+});
+
+test("one long natural message retains product, name, delivery, street, bairro and payment on Gemini outage", async () => {
+  const old = globalThis.fetch, messages = [], calls = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({ error: "outage" }, 503);
+    const body = JSON.parse(options.body); calls.push(body);
+    if (body.action === "catalog") return response({ ok: true, menuUrl: "https://menu.test",
+      deliveryMode: "neighborhood", neighborhoods: ["Centro", "Santa Luzia"],
+      products: [{ id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] }] });
+    if (body.action === "preview") return response({ ok: true, quoteToken: "signed", expires: Date.now() + 60000,
+      items: [{ name: "X Tudo", quantity: 1, total: 25 }], subtotal: 25, deliveryFee: 4, total: 29 });
+    if (body.action === "commit") return response({ ok: true, orderNumber: "6052", total: 29, message: "Registrado" });
+    throw Error("unexpected backend action " + body.action);
+  };
+  try {
+    const phone = "5531999900002";
+    await handleChatOrderMessage(params(phone, "Quero um X Tudo, me chamo Joana, pra entregar Rua Tereza Cristina 122, bairro Centro, pix na entrega", messages));
+    const preview = calls.find(x => x.action === "preview");
+    assert.ok(preview, "must retain all fields instead of silently skipping mixed intents");
+    assert.equal(preview.name, "Joana");
+    assert.equal(preview.deliveryType, "delivery");
+    assert.equal(preview.number, "122");
+    assert.equal(preview.neighborhood, "Centro");
+    assert.equal(preview.paymentMethod, "pix");
+    assert.match(messages.at(-1), /Confira seu pedido/);
+    assert.equal(calls.filter(x => x.action === "commit").length, 0);
+    await handleChatOrderMessage(params(phone, "Tá certinho", messages));
+    assert.equal(calls.filter(x => x.action === "commit").length, 1);
+  } finally { globalThis.fetch = old; }
+});
+
+test("bare Pix asks ONLY online vs delivery and understands a one-word answer offline", async () => {
+  const old = globalThis.fetch, messages = [], calls = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({ error: "outage" }, 503);
+    const body = JSON.parse(options.body); calls.push(body);
+    if (body.action === "catalog") return response({ ok: true, menuUrl: "https://menu.test",
+      deliveryMode: "neighborhood", products: [{ id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] }] });
+    if (body.action === "preview") return response({ ok: true, quoteToken: "signed", expires: Date.now() + 60000,
+      items: [{ name: "X Tudo", quantity: 1, total: 25 }], subtotal: 25, deliveryFee: 0, total: 25 });
+    throw Error("unexpected backend action " + body.action);
+  };
+  try {
+    const phone = "5531999900003";
+    await handleChatOrderMessage(params(phone, "Quero um X Tudo", messages));
+    await handleChatOrderMessage(params(phone, "retirada", messages));
+    await handleChatOrderMessage(params(phone, "Maria", messages));
+    await handleChatOrderMessage(params(phone, "pix", messages));
+    assert.match(messages.at(-1), /Pix.*online.*na entrega/i);
+    assert.equal(calls.filter(x => x.action === "preview").length, 0);
+    await handleChatOrderMessage(params(phone, "online", messages));
+    assert.equal(calls.find(x => x.action === "preview")?.paymentMethod, "online_pix");
+    assert.match(messages.at(-1), /Confira seu pedido/);
+  } finally { globalThis.fetch = old; }
+});
+
+test("mixed cart changes + payment use Gemini WITH prior conversation context", async () => {
+  const old = globalThis.fetch, messages = [], calls = [], geminiPrompts = [];
+  const dessert = "33333333-3333-4333-8333-333333333333";
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      const prompt = body.contents[0].parts[0].text; geminiPrompts.push(prompt);
+      return response({ candidates: [{ content: { parts: [{ text: JSON.stringify({ draft: {
+        items: [
+          { productId: PRODUCT, quantity: 1, selectedOptions: [] },
+          { productId: dessert, quantity: 1, selectedOptions: [] },
+        ], name: "", deliveryType: "", address: "", number: "", neighborhood: "",
+        complement: "", reference: "", paymentMethod: "online_pix",
+      } }) }] } }] });
+    }
+    calls.push(body);
+    if (body.action === "catalog") return response({ ok: true, menuUrl: "https://menu.test",
+      deliveryMode: "neighborhood", products: [
+        { id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] },
+        { id: dessert, name: "Pudim", price: 10, optionGroups: [] },
+      ] });
+    throw Error("unexpected backend action " + body.action);
+  };
+  try {
+    const phone = "5531999900004";
+    await handleChatOrderMessage(params(phone, "Quero um X Tudo", messages));
+    await handleChatOrderMessage(params(phone, "Acrescenta um pudim e pagar pix online", messages));
+    assert.ok(geminiPrompts.length > 0);
+    assert.match(geminiPrompts.at(-1), /Conversa recente/);
+    assert.match(geminiPrompts.at(-1), /Quero um X Tudo/);
+    assert.match(messages.at(-1), /nome.*entrega.*retirada/i);
+    assert.equal(calls.filter(x => x.action === "commit").length, 0);
+  } finally { globalThis.fetch = old; }
+});
+
+test("Gemini cannot guess between similar sizes or sneak in invalid catalog options", async () => {
+  const old = globalThis.fetch, messages = [], calls = [];
+  const first = "44444444-4444-4444-8444-444444444444";
+  const second = "55555555-5555-4555-8555-555555555555";
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({
+      candidates: [{ content: { parts: [{ text: JSON.stringify({ draft: {
+        items: [{ productId: first, quantity: 1, selectedOptions: [] }],
+        name: "Joana", deliveryType: "pickup", address: "", number: "", neighborhood: "",
+        complement: "", reference: "", paymentMethod: "money",
+      } }) }] } }],
+    });
+    calls.push(body);
+    return response({ ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [
+        { id: first, name: "Coca Cola 350ml", price: 5, optionGroups: [] },
+        { id: second, name: "Coca Cola 2L", price: 15, optionGroups: [] },
+      ] });
+  };
+  try {
+    await handleChatOrderMessage(params("5531999900005", "Quero uma Coca Cola", messages));
+    assert.match(messages.at(-1), /tamanho ou sabor exato/i);
+    assert.equal(calls.filter(x => x.action === "preview" || x.action === "commit").length, 0);
+  } finally { globalThis.fetch = old; }
+});
+
+
+test("after asking for a name, a short name response works even if Gemini is down", async () => {
+  const old = globalThis.fetch, messages = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({ error: "outage" }, 503);
+    return response({ ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [{ id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] }] });
+  };
+  try {
+    const phone = "5531999900006";
+    await handleChatOrderMessage(params(phone, "Quero um X Tudo", messages));
+    await handleChatOrderMessage(params(phone, "Maria", messages));
+    assert.match(messages.at(-1), /Maria.*entrega.*retirada/i);
+    await handleChatOrderMessage(params(phone, "retirada", messages));
+    assert.match(messages.at(-1), /Como prefere \*pagar\*/i);
+    assert.doesNotMatch(messages.at(-1), /nome/i);
+  } finally { globalThis.fetch = old; }
 });
