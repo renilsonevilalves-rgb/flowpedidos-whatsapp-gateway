@@ -24,10 +24,11 @@ Não exponha a `API_KEY` no navegador. O frontend deverá chamar um backend segu
 
 
 ## Pedidos por conversa Gemini (opt-in)
-- \`WHATSAPP_CHAT_ORDERS_ENABLED=true\` no Railway **e** no Vercel. Padrão: desativado.
-- \`GEMINI_API_KEY\`, \`GEMINI_MODEL\` e \`VERCEL_API_URL\` configurados apenas no servidor.
-- \`API_KEY\` do gateway deve corresponder a \`WHATSAPP_GATEWAY_API_KEY\` no Vercel.
-- Requer loja com capacidades \`ai_assistant\` e \`whatsapp_advanced\`.
+- `WHATSAPP_CHAT_ORDERS_ENABLED=true` no Railway **e** no Vercel. Padrão: desativado.
+- `GEMINI_API_KEY`, `GEMINI_MODEL` e `VERCEL_API_URL` configurados apenas no servidor.
+- `WHATSAPP_CHAT_ORDER_ALLOWED_TENANTS` no Vercel deve conter UUIDs das lojas-piloto separados por vírgula. Lista vazia bloqueia todos os pedidos conversacionais.
+- `API_KEY` do gateway deve corresponder a `WHATSAPP_GATEWAY_API_KEY` no Vercel.
+- Requer loja com capacidades `ai_assistant` e `whatsapp_advanced`.
 - Cliente pode pedir diretamente no WhatsApp, confirmar carrinho, endereço, pagamento e total.
 - Dados, valores, adicionais e taxa de entrega são validados pelo backend e RPC PostgreSQL; Gemini nunca grava pedido diretamente.
 - Pagamentos Pix/cartão online reutilizam a página de pagamento da loja. Aprovação ocorre pelo provedor; não aceite "já paguei" por mensagem.
