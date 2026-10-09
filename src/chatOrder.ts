@@ -128,7 +128,7 @@ function safeCatalogItems(input: string, catalog: Catalog): Item[] {
     }
     const preceding = original.filter(t => t.end <= words[i].start);
     const before = preceding.at(-1)?.word || "";
-    const amount = /^\d{1,2}$/.test(before) ? Number(before)
+    const amount = /^\d{1,2}x?$/.test(before) ? Number(before.replace(/x$/, ""))
       : ({um:1,uma:1,dois:2,duas:2,tres:3,quatro:4,cinco:5} as Record<string,number>)[before] || 1;
     if (amount < 1 || amount > 100) return [];
     found.push({product:best.product,from:words[i].start,to:words[i+best.length-1].end,quantity:amount});
@@ -136,6 +136,9 @@ function safeCatalogItems(input: string, catalog: Catalog): Item[] {
   }
   if (!found.length || found.length > 40) return [];
   const message = norm(input);
+  // Never pretend an order is complete if another item after "e um..." was not identified.
+  const unrecognizedTail = message.slice(found[found.length - 1].to);
+  if (/\b(?:e|mais|tambem)\s+(?:um|uma|dois|duas|\d+x?)?\s*[a-z]{3,}/.test(unrecognizedTail)) return [];
   const items: Item[] = [];
   for (let j=0;j<found.length;j++) {
     const hit=found[j];
