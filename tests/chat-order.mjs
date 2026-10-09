@@ -52,6 +52,7 @@ test("collects items, asks for missing fields and commits only after explicit co
     const id = "5531999988877";
     assert.equal(await handleChatOrderMessage(params(id, "quero 2 X Tudo sem cebola", messages)), true);
     assert.match(messages.at(-1), /entrega.*retirada/i);
+    assert.match(messages.at(-1), /Anotei seu pedido:\n2x X Tudo \(Sem cebola\)/);
     assert.equal(calls.filter((c) => c.action === "commit").length, 0);
     await handleChatOrderMessage(params(id, "retirada", messages));
     assert.match(messages.at(-1), /nome/i);
@@ -59,6 +60,8 @@ test("collects items, asks for missing fields and commits only after explicit co
     assert.match(messages.at(-1), /pagar/i);
     await handleChatOrderMessage(params(id, "Pix online", messages));
     assert.match(messages.at(-1), /Confira seu pedido/i);
+    assert.match(messages.at(-1), /\nSubtotal:/);
+    assert.match(messages.at(-1), /\nTotal:/);
     assert.equal(calls.filter((c) => c.action === "commit").length, 0);
     assert.equal(calls.find((c) => c.action === "preview").items[0].notes, "Sem cebola");
     await handleChatOrderMessage(params(id, "SIM", messages));
@@ -109,5 +112,29 @@ test("new-order checkout defers existing-order cancellation while the draft rema
     assert.equal(sent.length, before);
     assert.equal(await handleChatOrderMessage(params(id, "retirada", sent)), true);
     assert.match(sent.at(-1), /nome/i);
+  } finally { globalThis.fetch = originalFetch; }
+});
+
+
+test("accepts natural request to start an order without forcing a menu", async () => {
+  const messages = [];
+  const originalFetch = globalThis.fetch;
+  const calls = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com"))
+      return response({ candidates: [{ content: { parts: [{ text: JSON.stringify({
+        draft: { items: [], name: "", deliveryType: "", address: "", number: "", neighborhood: "",
+          complement: "", reference: "", paymentMethod: "" },
+      }) }] } }] });
+    const body = JSON.parse(options.body);
+    calls.push(body.action);
+    return response({ ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [{ id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] }] });
+  };
+  try {
+    assert.equal(await handleChatOrderMessage(params("5531999911122", "Oi, quero fazer um pedido", messages)), true);
+    assert.deepEqual(calls, ["catalog"]);
+    assert.match(messages.at(-1), /produtos e quantidades/i);
+    assert.equal(messages.at(-1).includes("\n"), false);
   } finally { globalThis.fetch = originalFetch; }
 });
