@@ -10,7 +10,8 @@ type Catalog = { menuUrl: string; deliveryMode: string; neighborhoods?: string[]
   id: string; name: string; price: number;
   optionGroups?: Array<{ id: string; name: string; min: number; max: number; options: Array<{ id: string; name: string; price: number }> }>;
 }> };
-type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number };
+type ConversationTurn = { role: "user" | "assistant"; text: string };
+type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit" };
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
   sendMessage: (jid: string, data: { text: string }) => Promise<unknown>;
@@ -26,7 +27,7 @@ const serialized = new Map<string, Promise<boolean>>();
 const clean = (v: unknown, max = 240) => String(v || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max);
 const norm = (v: unknown) => clean(v, 2000).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
 const currency = (n: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(n);
-const yes = (t: string) => /^(sim|confirmo|pode confirmar|isso mesmo|ok|fechado)[.!?\s]*$/i.test(norm(t));
+const yes = (t: string) => /^(sim|simm+|confirmo|confirmado|pode confirmar|pode fechar|pode mandar|isso mesmo|ta certinho|tudo certo|tudo certinho|ok|fechado)[.!?\s]*$/i.test(norm(t));
 const no = (t: string) => /^(nao|quero mudar|alterar|corrigir)[.!?\s]*$/i.test(norm(t));
 const cancel = (t: string) => /^(cancelar rascunho|desistir|esquece|deixa pra la|cancelar esse pedido)[.!?\s]*$/i.test(norm(t));
 function concernsExistingOrder(text: string) {
@@ -45,6 +46,8 @@ async function send(p: Params, message: string) {
   // Keep WhatsApp summary lines readable: clean() is only for input fields.
   const text = String(message || "").replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ").trim().slice(0, 4000);
   await p.sendMessage(p.customerJid, { text });
+  const state = drafts.get(p.sessionId + ":" + p.customerJid);
+  if (state) state.history = [...(state.history || []), { role: "assistant", text: clean(text, 500) }].slice(-10);
   p.logger.info?.({ sessionId: p.sessionId }, "[Chat-Order] WhatsApp response sent");
 }
 async function requestBackend(p: Params, action: string, data: Record<string, unknown>): Promise<any> {
@@ -94,6 +97,42 @@ function keywordTokens(input: string) {
 function significant(tokens: ReturnType<typeof keywordTokens>) {
   return tokens.filter(t => !fillerWords.has(t.word));
 }
+// One-character typing mistakes require other exact tokens in the same product.
+function oneEditAway(a: string, b: string): boolean {
+  if (a === b || Math.min(a.length, b.length) < 4 || Math.abs(a.length - b.length) > 1) return false;
+  let i = 0, j = 0, edits = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i++; j++; continue; }
+    if (++edits > 1) return false;
+    if (a.length > b.length) i++;
+    else if (b.length > a.length) j++;
+    else { i++; j++; }
+  }
+  return edits + Number(i < a.length || j < b.length) === 1;
+}
+// Products with the same base name need the customer to choose a size/variant.
+function isClearlySpecifiedVariant(input: string, products: Catalog["products"]): boolean {
+  const message = significant(keywordTokens(input)).map(t => t.word);
+  const matches = products.filter(p => {
+    const words = significant(keywordTokens(p.name)).map(t => t.word);
+    return words.length >= 3 && message.some((w, i) => w === words[0] && message[i + 1] === words[1]);
+  });
+  if (matches.length < 2) return true;
+  const groups = new Map<string, typeof matches>();
+  for (const product of matches) {
+    const words = significant(keywordTokens(product.name)).map(t => t.word);
+    const key = words.slice(0, 2).join(":");
+    groups.set(key, [...(groups.get(key) || []), product]);
+  }
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    if (!group.some(p => {
+      const words = significant(keywordTokens(p.name)).map(t => t.word);
+      return words.slice(2).some(w => message.includes(w));
+    })) return false;
+  }
+  return true;
+}
 function variants(name: string): string[][] {
   const words = significant(keywordTokens(name)).map(t => t.word);
   if (!words.length) return [];
@@ -114,8 +153,13 @@ function safeCatalogItems(input: string, catalog: Catalog): Item[] {
     const matches: Array<{product: Catalog["products"][number]; length: number; score: number}> = [];
     for (const product of catalog.products) {
       for (const v of variants(product.name)) {
-        if (v.every((w, j) => words[i + j]?.word === w)) {
-          matches.push({product, length: v.length, score: v.length * 10 + (v.length === variants(product.name)[0].length ? 2 : 0)});
+        const matched = v.map((w, j) => words[i + j]?.word || "");
+        const differences = v.flatMap((w, j) => w === matched[j] ? [] : [{ expected: w, actual: matched[j] }]);
+        const typo = differences.length === 1 && v.length >= 2 &&
+          oneEditAway(differences[0].expected, differences[0].actual);
+        if (!differences.length || (typo && v.length === variants(product.name)[0].length)) {
+          matches.push({product, length: v.length,
+            score: v.length * 10 + (v.length === variants(product.name)[0].length ? 2 : 0) - (typo ? 3 : 0)});
         }
       }
     }
@@ -134,7 +178,7 @@ function safeCatalogItems(input: string, catalog: Catalog): Item[] {
     found.push({product:best.product,from:words[i].start,to:words[i+best.length-1].end,quantity:amount});
     i += best.length;
   }
-  if (!found.length || found.length > 40) return [];
+  if (!found.length || found.length > 40 || !isClearlySpecifiedVariant(input, catalog.products)) return [];
   const message = norm(input);
   // Never pretend an order is complete if another item after "e um..." was not identified.
   const unrecognizedTail = message.slice(found[found.length - 1].to);
@@ -178,6 +222,16 @@ function safeFieldUpdate(message: string, state: State): Draft | null {
     }
   }
 
+  // Customers naturally mix delivery, address, payment and name in one message.
+  if (!deliveryReply && /\b(?:pra|para|prefiro|quero|pode|vai ser)\s+(?:entregar|entrega|delivery|retirar|retirada)\b/.test(t)) {
+    const pickup = /\b(?:pra|para|prefiro|quero|pode|vai ser)\s+(?:retirar|retirada)\b/.test(t);
+    const type = pickup ? "pickup" : "delivery";
+    if (next.deliveryType !== type) { next.deliveryType = type; changed = true; }
+  }
+  if (!next.name) {
+    const named = raw.match(/\b(?:me chamo|meu nome (?:é|e|eh)|pode colocar (?:no nome de|pra)|em nome de)\s+([a-zA-ZÀ-ÿ]{2,}(?:\s+(?!e\b|mas\b|quero\b|prefiro\b|vou\b|pra\b|para\b|pix\b|cartao\b)[a-zA-ZÀ-ÿ]{2,}){0,2})/i);
+    if (named) { next.name = clean(named[1], 120); changed = true; }
+  }
   if (!next.name) {
     const combined = t.match(/^(?:(?:meu nome (?:e|é)|sou)\s+)?([a-z ]{2,65}?)\s+(?:prefiro|quero|vai ser|pode ser)\s+(?:entrega|delivery|retirada)$/);
     const proposed = combined?.[1] || (deliveryReply && pieces.length >= 2 ? norm(pieces[0]).replace(/^(?:meu nome e|sou)\s+/, "") : "");
@@ -191,7 +245,8 @@ function safeFieldUpdate(message: string, state: State): Draft | null {
   else if (/\b(?:cartao\s+online|credito\s+online)\b/.test(t)) { next.paymentMethod = "online_credit"; changed = true; }
   else if (/\b(?:pix\s+na\s+entrega|pix\s+na\s+retirada)\b/.test(t)) { next.paymentMethod = "pix"; changed = true; }
   else if (/\b(?:cartao\s+na\s+entrega|cartao\s+na\s+retirada)\b/.test(t)) { next.paymentMethod = "credit"; changed = true; }
-  else if (/^(?:dinheiro|em dinheiro|pago em dinheiro)$/.test(t)) { next.paymentMethod = "money"; changed = true; }
+  else if (/\b(?:em dinheiro|pago (?:em |no )?dinheiro|vou pagar dinheiro|pagamento dinheiro)\b/.test(t) ||
+           /^(?:dinheiro|em dinheiro|pago em dinheiro)$/.test(t)) { next.paymentMethod = "money"; changed = true; }
 
   // Accept plain names only in the name step, never mistake a neighborhood for a name.
   if (!next.name && prev.deliveryType && !changed && /^[a-z]+(?:\s+[a-z]+){0,3}$/.test(t) &&
