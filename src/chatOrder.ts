@@ -342,10 +342,11 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     await send(p, currentQuestion || "Não consegui identificar essa alteração com segurança. Pode me explicar de outro jeito?");
     return true;
   }
+  const wasEmpty = !state.draft.items.length;
   state.draft = interpreted;
   const ask = question(interpreted, state.catalog);
   if (ask) {
-    await send(p, (firstTurn && interpreted.items.length ? recap(interpreted, state.catalog) + "\n\n" : "") + ask);
+    await send(p, ((firstTurn || wasEmpty) && interpreted.items.length ? recap(interpreted, state.catalog) + "\n\n" : "") + ask);
     return true;
   }
   if (interpreted.deliveryType === "delivery" && norm(state.catalog.deliveryMode) !== "neighborhood") {
