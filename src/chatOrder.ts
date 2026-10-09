@@ -248,10 +248,14 @@ function safeFieldUpdate(message: string, state: State): Draft | null {
   else if (/\b(?:em dinheiro|pago (?:em |no )?dinheiro|vou pagar dinheiro|pagamento dinheiro)\b/.test(t) ||
            /^(?:dinheiro|em dinheiro|pago em dinheiro)$/.test(t)) { next.paymentMethod = "money"; changed = true; }
 
-  // Accept plain names only in the name step, never mistake a neighborhood for a name.
-  if (!next.name && prev.deliveryType && !changed && /^[a-z]+(?:\s+[a-z]+){0,3}$/.test(t) &&
-      !/\b(?:pedido|entrega|retirada|online|credito|cartao|pix|dinheiro|rua|av|bairro)\b/.test(t) &&
-      !(state.catalog.neighborhoods || []).some(n => norm(n) === t)) {
+  // A one-word answer ("Maria") belongs to the last assistant question.
+  const lastPrompt = [...(state.history || [])].reverse().find(turn => turn.role === "assistant")?.text || "";
+  const expectingName = /\bnome\b/.test(norm(lastPrompt));
+  if (!next.name && (prev.deliveryType || expectingName) && !changed &&
+      /^[a-z]{2,}(?:\s+[a-z]{2,}){0,3}$/.test(t) &&
+      !/\b(?:pedido|entrega|retirada|online|credito|cartao|pix|dinheiro|rua|av|bairro|quero|pedir)\b/.test(t) &&
+      !(state.catalog.neighborhoods || []).some(n => norm(n) === t) &&
+      !state.catalog.products.some(product => norm(product.name) === t)) {
     next.name = clean(raw, 120); changed = true;
   }
 
