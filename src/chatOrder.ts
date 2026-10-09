@@ -29,9 +29,12 @@ const currency = (n: number) => new Intl.NumberFormat("pt-BR", { style: "currenc
 const yes = (t: string) => /^(sim|confirmo|pode confirmar|isso mesmo|ok|fechado)[.!?\s]*$/i.test(norm(t));
 const no = (t: string) => /^(nao|quero mudar|alterar|corrigir)[.!?\s]*$/i.test(norm(t));
 const cancel = (t: string) => /^(cancelar rascunho|desistir|esquece|deixa pra la|cancelar esse pedido)[.!?\s]*$/i.test(norm(t));
+function concernsExistingOrder(text: string) {
+  return /(meu pedido|pedido anterior|pedido que fiz|alterar pedido|cancelar pedido|rastrear|acompanhar|trocar pagamento|mudar pagamento|pedido antigo|pedido pronto)/.test(norm(text));
+}
 function startsOrder(text: string) {
   const t = norm(text);
-  if (/(meu pedido|pedido anterior|pedido que fiz|alterar pedido|cancelar pedido|rastrear|acompanhar|trocar pagamento)/.test(t)) return false;
+  if (concernsExistingOrder(t)) return false;
   return /(pelo whatsapp|por aqui mesmo|aqui no chat|sem cardapio|quero pedir aqui|pedido pelo chat|me ve\b|vou querer\b|quero\s+(?:\d+|um|uma|dois|duas|tres|três)\s|queria\s+(?:\d+|um|uma|dois|duas)\s|gostaria de pedir\s)/.test(t);
 }
 function fresh(): Draft {
@@ -168,6 +171,8 @@ function summary(d: Draft, response: any) {
   ].filter(Boolean).join("\n");
 }
 async function processMessage(p: Params, key: string): Promise<boolean> {
+  // This flow never intercepts existing-order actions, even with a pending cart.
+  if (concernsExistingOrder(p.text)) return false;
   let state = drafts.get(key);
   if (state && Date.now() - state.updatedAt > 20 * 60_000) { drafts.delete(key); state = undefined; }
   if (!state && !startsOrder(p.text)) return false;
