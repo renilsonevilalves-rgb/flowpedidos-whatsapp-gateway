@@ -218,3 +218,24 @@ test("ambiguous brand with two sizes cannot be silently selected without Gemini"
     assert.match(messages.at(-1),/produtos e quantidades/i);
   }finally{globalThis.fetch=originalFetch;}
 });
+
+
+test("handles 2x quantities while refusing an unknown extra product", async () => {
+  const prev=globalThis.fetch, messages=[];
+  const x="9354a916-e4e0-4c85-aaf4-7a5106191952", actions=[];
+  globalThis.fetch=async (url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"unavailable"},503);
+    const body=JSON.parse(opts.body);
+    actions.push(body.action);
+    return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+      products:[{id:x,name:"X- Tudo Turbo",price:34.9,optionGroups:[]}]});
+  };
+  try{
+    await handleChatOrderMessage(params("5531999933001","Quero 2x X Tudo Turbo",messages));
+    assert.match(messages.at(-1),/2x X- Tudo Turbo/);
+    const other="5531999933002";
+    await handleChatOrderMessage(params(other,"Quero um X Tudo Turbo e uma pizza",messages));
+    assert.equal(actions.includes("preview"),false);
+    assert.match(messages.at(-1),/produtos e quantidades/i);
+  }finally{globalThis.fetch=prev;}
+});
