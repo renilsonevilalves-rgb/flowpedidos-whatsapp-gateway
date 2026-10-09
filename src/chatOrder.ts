@@ -32,7 +32,7 @@ const cancel = (t: string) => /^(cancelar rascunho|desistir|esquece|deixa pra la
 function startsOrder(text: string) {
   const t = norm(text);
   if (/(meu pedido|pedido anterior|pedido que fiz|alterar pedido|cancelar pedido|rastrear|acompanhar|trocar pagamento)/.test(t)) return false;
-  return /(pelo whatsapp|por aqui mesmo|aqui no chat|sem cardapio|quero pedir aqui|pedido pelo chat|me ve\b|vou querer\b|quero\s+\d+\s|queria\s+\d+\s)/.test(t);
+  return /(pelo whatsapp|por aqui mesmo|aqui no chat|sem cardapio|quero pedir aqui|pedido pelo chat|me ve\b|vou querer\b|quero\s+(?:\d+|um|uma|dois|duas|tres|três)\s|queria\s+(?:\d+|um|uma|dois|duas)\s|gostaria de pedir\s)/.test(t);
 }
 function fresh(): Draft {
   return { draftId: randomUUID(), items: [], name: "", deliveryType: "", address: "", number: "",
@@ -132,8 +132,17 @@ async function interpret(p: Params, state: State): Promise<Draft | null> {
     try { return validatedDraft(JSON.parse(raw), state); } catch { return null; }
   } catch { return null; } finally { clearTimeout(timer); }
 }
-function question(d: Draft) {
+function question(d: Draft, catalog: Catalog) {
   if (!d.items.length) return "Quais produtos e quantidades gostaria de pedir? 😊";
+  for (const item of d.items) {
+    const product = catalog.products.find((p) => p.id === item.productId);
+    for (const group of product?.optionGroups || []) {
+      const count = (item.selectedOptions || []).filter((o) => o.groupId === group.id).reduce((sum, o) => sum + o.quantity, 0);
+      if (count < (Number(group.min) || 0)) {
+        return "Para *" + product?.name + "*, escolha uma opção de *" + group.name + "*: " + group.options.map((o) => o.name).join(", ") + ".";
+      }
+    }
+  }
   if (!d.deliveryType) return "Prefere *entrega* ou *retirada*?";
   if (d.deliveryType === "delivery" && (!d.address || !d.number)) return "Qual sua *rua e número* para entrega?";
   if (d.deliveryType === "delivery" && !d.neighborhood) return "Qual seu *bairro*?";
@@ -185,7 +194,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
       drafts.delete(key);
       await send(p, "✅ Pedido #" + result.orderNumber + " — " + currency(result.total) + "\n" + result.message +
         (result.paymentUrl ? "\n\n🔒 Link para pagamento seguro:\n" + result.paymentUrl + "\n\nA loja recebe após a aprovação do pagamento." : ""));
-    } catch (e: any) { state.quote = undefined; await send(p, clean(e?.message, 300) + "\nDiga *revisar* para conferir novamente."); }
+    } catch (e: any) { state.quote = undefined; await send(p, "Não consegui confirmar se o pedido foi registrado. Para evitar duplicidade, diga *revisar* e confirme o mesmo carrinho novamente. Se houver dúvida, consulte a loja.\n" + clean(e?.message, 200)); }
     return true;
   }
   if (state.quote && no(p.text)) { state.quote = undefined; await send(p, "Certo, não confirmei. O que quer mudar?"); return true; }
@@ -194,7 +203,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   const interpreted = review ? state.draft : await interpret(p, state);
   if (!interpreted) { await send(p, "Não consegui entender. Pode repetir o que deseja pedir ou mudar?"); return true; }
   state.draft = interpreted;
-  const ask = question(interpreted);
+  const ask = question(interpreted, state.catalog);
   if (ask) { await send(p, ask); return true; }
   if (interpreted.deliveryType === "delivery" && norm(state.catalog.deliveryMode) !== "neighborhood") {
     await send(p, "Esta loja calcula a entrega por distância/iFood. Finalize pelo cardápio para cotar o frete: " + state.catalog.menuUrl);
