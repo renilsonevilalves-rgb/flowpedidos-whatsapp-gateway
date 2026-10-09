@@ -14,7 +14,7 @@ type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
   sendMessage: (jid: string, data: { text: string }) => Promise<unknown>;
-  logger: { warn: (fields: Record<string, unknown>, message: string) => void };
+  logger: { warn: (fields: Record<string, unknown>, message: string) => void; info?: (fields: Record<string, unknown>, message: string) => void };
 };
 const enabled = process.env.WHATSAPP_CHAT_ORDERS_ENABLED === "true";
 const endpoint = String(process.env.VERCEL_API_URL || "").replace(/\/$/, "") + "/api/webhook/whatsapp/chat-order";
@@ -35,14 +35,17 @@ function concernsExistingOrder(text: string) {
 function startsOrder(text: string) {
   const t = norm(text);
   if (concernsExistingOrder(t)) return false;
-  return /(pelo whatsapp|por aqui mesmo|aqui no chat|sem cardapio|quero pedir aqui|pedido pelo chat|me ve\b|vou querer\b|quero\s+(?:\d+|um|uma|dois|duas|tres|três)\s|queria\s+(?:\d+|um|uma|dois|duas)\s|gostaria de pedir\s)/.test(t);
+  return /(pelo whatsapp|por aqui mesmo|aqui no chat|sem cardapio|pedido pelo chat|me ve\b|vou querer\b|(?:quero|queria|gostaria(?: de)?|poderia)\s+(?:fazer\s+)?(?:um\s+|uma\s+)?(?:pedido|pedidinho|pedir)\b|(?:quero|queria|vou querer)\s+(?:\d+|um|uma|dois|duas|tres)\s)/.test(t);
 }
 function fresh(): Draft {
   return { draftId: randomUUID(), items: [], name: "", deliveryType: "", address: "", number: "",
     neighborhood: "", complement: "", reference: "", paymentMethod: "" };
 }
 async function send(p: Params, message: string) {
-  await p.sendMessage(p.customerJid, { text: clean(message, 4000) });
+  // Keep WhatsApp summary lines readable: clean() is only for input fields.
+  const text = String(message || "").replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ").trim().slice(0, 4000);
+  await p.sendMessage(p.customerJid, { text });
+  p.logger.info?.({ sessionId: p.sessionId }, "[Chat-Order] WhatsApp response sent");
 }
 async function requestBackend(p: Params, action: string, data: Record<string, unknown>): Promise<any> {
   let lastError = "Sistema temporariamente indisponível.";
@@ -129,29 +132,48 @@ async function interpret(p: Params, state: State): Promise<Draft | null> {
         generationConfig: { responseMimeType: "application/json", temperature: 0.1, maxOutputTokens: 2600 },
       }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) {
+      p.logger.warn({ sessionId: p.sessionId, status: res.status }, "[Chat-Order] Gemini response unavailable");
+      return null;
+    }
     const payload = await res.json().catch(() => ({}));
     const raw = payload?.candidates?.[0]?.content?.parts?.map((x: any) => x.text || "").join("") || "";
-    try { return validatedDraft(JSON.parse(raw), state); } catch { return null; }
-  } catch { return null; } finally { clearTimeout(timer); }
+    try { return validatedDraft(JSON.parse(raw), state); }
+    catch {
+      p.logger.warn({ sessionId: p.sessionId }, "[Chat-Order] Gemini returned invalid order data");
+      return null;
+    }
+  } catch (error: any) {
+    p.logger.warn({ sessionId: p.sessionId, reason: error?.name === "AbortError" ? "timeout" : "request" }, "[Chat-Order] Gemini request failed");
+    return null;
+  } finally { clearTimeout(timer); }
 }
 function question(d: Draft, catalog: Catalog) {
-  if (!d.items.length) return "Quais produtos e quantidades gostaria de pedir? 😊";
+  if (!d.items.length) return "Claro! O que você gostaria de pedir? Pode mandar os produtos e quantidades juntos 😊";
   for (const item of d.items) {
     const product = catalog.products.find((p) => p.id === item.productId);
     for (const group of product?.optionGroups || []) {
       const count = (item.selectedOptions || []).filter((o) => o.groupId === group.id).reduce((sum, o) => sum + o.quantity, 0);
       if (count < (Number(group.min) || 0)) {
-        return "Para *" + product?.name + "*, escolha uma opção de *" + group.name + "*: " + group.options.map((o) => o.name).join(", ") + ".";
+        return "Só falta escolher *" + group.name + "* para o *" + product?.name + "*: " + group.options.map((o) => o.name).join(", ") + ".";
       }
     }
   }
-  if (!d.deliveryType) return "Prefere *entrega* ou *retirada*?";
-  if (d.deliveryType === "delivery" && (!d.address || !d.number)) return "Qual sua *rua e número* para entrega?";
-  if (d.deliveryType === "delivery" && !d.neighborhood) return "Qual seu *bairro*?";
-  if (!d.name) return "Qual o seu *nome*?";
-  if (!d.paymentMethod) return "Como prefere pagar: *Pix online*, *cartão online*, *Pix na entrega*, *cartão na entrega* ou *dinheiro*?";
+  if (!d.deliveryType) return d.name
+    ? "Perfeito, " + d.name + "! Vai ser para *entrega* ou *retirada*?"
+    : "Perfeito! Me diz seu *nome* e se prefere *entrega ou retirada* 😊";
+  if (d.deliveryType === "delivery" && (!d.address || !d.number || !d.neighborhood))
+    return "Me passa a *rua, número e bairro* para a entrega. Pode mandar tudo numa mensagem só.";
+  if (!d.name) return "E qual é o seu *nome* para identificar o pedido?";
+  if (!d.paymentMethod) return "Como prefere *pagar*: *Pix ou cartão online*, *Pix ou cartão na entrega*, ou *dinheiro*?";
   return "";
+}
+function recap(d: Draft, catalog: Catalog): string {
+  const lines = d.items.slice(0, 8).map(item => {
+    const product = catalog.products.find(p => p.id === item.productId);
+    return item.quantity + "x " + (product?.name || "Produto") + (item.notes ? " (" + item.notes + ")" : "");
+  });
+  return "Anotei seu pedido:\n" + lines.join("\n") + (d.items.length > 8 ? "\nE mais " + (d.items.length - 8) + " item(ns)." : "");
 }
 function summary(d: Draft, response: any) {
   const labels: Record<string, string> = { pix: "Pix na entrega", credit: "Cartão na entrega", money: "Dinheiro", online_pix: "Pix online", online_credit: "Cartão online", online_debit: "Débito online" };
@@ -175,6 +197,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   if (concernsExistingOrder(p.text)) return false;
   let state = drafts.get(key);
   if (state && Date.now() - state.updatedAt > 20 * 60_000) { drafts.delete(key); state = undefined; }
+  const firstTurn = !state;
   if (!state && !startsOrder(p.text)) return false;
   if (!/^55[1-9]{2}\d{8,9}$/.test(String(p.customerPhone || ""))) {
     if (state) { await send(p, "Não consegui identificar seu telefone. Fale com a loja."); return true; }
@@ -206,10 +229,16 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   state.quote = undefined;
   const review = /^(revisar|conferir|resumo)[.!?\s]*$/i.test(norm(p.text));
   const interpreted = review ? state.draft : await interpret(p, state);
-  if (!interpreted) { await send(p, "Não consegui entender. Pode repetir o que deseja pedir ou mudar?"); return true; }
+  if (!interpreted) {
+    await send(p, "Desculpa, não consegui processar essa mensagem. Pode me falar de novo o que deseja? Se preferir, veja os produtos aqui: " + state.catalog.menuUrl);
+    return true;
+  }
   state.draft = interpreted;
   const ask = question(interpreted, state.catalog);
-  if (ask) { await send(p, ask); return true; }
+  if (ask) {
+    await send(p, (firstTurn && interpreted.items.length ? recap(interpreted, state.catalog) + "\n\n" : "") + ask);
+    return true;
+  }
   if (interpreted.deliveryType === "delivery" && norm(state.catalog.deliveryMode) !== "neighborhood") {
     await send(p, "Esta loja calcula a entrega por distância/iFood. Finalize pelo cardápio para cotar o frete: " + state.catalog.menuUrl);
     return true;
