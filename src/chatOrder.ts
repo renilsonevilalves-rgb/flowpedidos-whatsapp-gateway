@@ -330,7 +330,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   const review = /^(revisar|conferir|resumo)[.!?\s]*$/i.test(norm(p.text));
   // Fast and reliable for simple catalog orders: no unnecessary AI network wait.
   // Advanced modifiers and ambiguous products are still delegated to Gemini.
-  const catalogItems = firstTurn ? safeCatalogItems(p.text, state.catalog) : [];
+  const catalogItems = (firstTurn || !state.draft.items.length) ? safeCatalogItems(p.text, state.catalog) : [];
   const fastDraft = catalogItems.length ? { ...state.draft, items: catalogItems } : null;
   const fieldDraft = !firstTurn ? safeFieldUpdate(p.text, state) : null;
   const interpreted = review ? state.draft : (fastDraft || fieldDraft || await interpret(p, state));
