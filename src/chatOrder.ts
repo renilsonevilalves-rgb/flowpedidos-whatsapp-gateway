@@ -47,7 +47,7 @@ async function send(p: Params, message: string) {
   const text = String(message || "").replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ").trim().slice(0, 4000);
   await p.sendMessage(p.customerJid, { text });
   const state = drafts.get(p.sessionId + ":" + p.customerJid);
-  if (state) state.history = [...(state.history || []), { role: "assistant", text: clean(text, 500) }].slice(-10);
+  if (state) state.history = [...(state.history || []), { role: "assistant" as const, text: clean(text, 500) }].slice(-10);
   p.logger.info?.({ sessionId: p.sessionId }, "[Chat-Order] WhatsApp response sent");
 }
 async function requestBackend(p: Params, action: string, data: Record<string, unknown>): Promise<any> {
@@ -444,7 +444,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     drafts.set(key, state);
   }
   state.updatedAt = Date.now();
-  state.history = [...(state.history || []), { role: "user", text: clean(p.text, 800) }].slice(-10);
+  state.history = [...(state.history || []), { role: "user" as const, text: clean(p.text, 800) }].slice(-10);
   if (cancel(p.text)) { drafts.delete(key); await send(p, "Carrinho descartado. Nenhum pedido foi feito."); return true; }
   if (state.quote && state.quoteExpiry && Date.now() > state.quoteExpiry) state.quote = undefined;
   if (state.quote && yes(p.text)) {
