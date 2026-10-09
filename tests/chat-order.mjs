@@ -215,7 +215,7 @@ test("ambiguous brand with two sizes cannot be silently selected without Gemini"
   try {
     await handleChatOrderMessage(params("5531999923111","Quero uma coca cola",messages));
     assert.equal(backendCalls.includes("preview"),false);
-    assert.match(messages.at(-1),/produtos e quantidades/i);
+    assert.match(messages.at(-1),/tamanho ou sabor exato/i);
   }finally{globalThis.fetch=originalFetch;}
 });
 
