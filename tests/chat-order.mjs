@@ -83,3 +83,29 @@ test("feature respects backend deny-by-default and leaves legacy AI available", 
     assert.equal(messages.length, 0);
   } finally { globalThis.fetch = old; }
 });
+
+
+test("new-order checkout defers existing-order cancellation while the draft remains open", async () => {
+  const sent = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      return response({ candidates: [{ content: { parts: [{ text: JSON.stringify({
+        draft: { items: [{ productId: PRODUCT, quantity: 1, notes: "", selectedOptions: [] }],
+          name: "", deliveryType: "", address: "", number: "", neighborhood: "", complement: "", reference: "", paymentMethod: "" },
+      }) }] } }] });
+    }
+    return response({ ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [{ id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] }] });
+  };
+  try {
+    const id = "5531999944433";
+    assert.equal(await handleChatOrderMessage(params(id, "quero um X Tudo", sent)), true);
+    assert.match(sent.at(-1), /entrega.*retirada/i);
+    const before = sent.length;
+    assert.equal(await handleChatOrderMessage(params(id, "quero cancelar meu pedido antigo", sent)), false);
+    assert.equal(sent.length, before);
+    assert.equal(await handleChatOrderMessage(params(id, "retirada", sent)), true);
+    assert.match(sent.at(-1), /nome/i);
+  } finally { globalThis.fetch = originalFetch; }
+});
