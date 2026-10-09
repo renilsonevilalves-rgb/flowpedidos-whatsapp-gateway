@@ -474,3 +474,22 @@ test("Gemini cannot guess between similar sizes or sneak in invalid catalog opti
     assert.equal(calls.filter(x => x.action === "preview" || x.action === "commit").length, 0);
   } finally { globalThis.fetch = old; }
 });
+
+
+test("after asking for a name, a short name response works even if Gemini is down", async () => {
+  const old = globalThis.fetch, messages = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({ error: "outage" }, 503);
+    return response({ ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [{ id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] }] });
+  };
+  try {
+    const phone = "5531999900006";
+    await handleChatOrderMessage(params(phone, "Quero um X Tudo", messages));
+    await handleChatOrderMessage(params(phone, "Maria", messages));
+    assert.match(messages.at(-1), /Maria.*entrega.*retirada/i);
+    await handleChatOrderMessage(params(phone, "retirada", messages));
+    assert.match(messages.at(-1), /Como prefere \*pagar\*/i);
+    assert.doesNotMatch(messages.at(-1), /nome/i);
+  } finally { globalThis.fetch = old; }
+});
