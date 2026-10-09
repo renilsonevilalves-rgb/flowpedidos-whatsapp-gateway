@@ -172,7 +172,7 @@ test("real WhatsApp screenshot: X-Tudo Turbo and Dell Valle Uva are recognized w
     const preview=calls.find(v=>v.action==="preview");
     assert.ok(preview,"must prepare a server-validated quote");
     assert.deepEqual(preview.items.map(i=>[i.productId,i.quantity]),[[TURBO,1],[UVA,1]]);
-    assert.match(messages.at(-1),/Total: \*R\$ 48,90\*/);
+    assert.match(messages.at(-1),/Total: \*R\$\s+48,90\*/);
     assert.equal(calls.some(v=>v.action==="commit"),false,"no order before explicit confirmation");
     await handleChatOrderMessage(params(id,"SIM",messages));
     assert.equal(calls.filter(v=>v.action==="commit").length,1);
