@@ -138,3 +138,104 @@ test("accepts natural request to start an order without forcing a menu", async (
     assert.equal(messages.at(-1).includes("\n"), false);
   } finally { globalThis.fetch = originalFetch; }
 });
+
+
+test("real WhatsApp screenshot: X-Tudo Turbo and Dell Valle Uva are recognized without Gemini timeout", async () => {
+  const messages = [], calls = [];
+  const originalFetch = globalThis.fetch;
+  const TURBO = "9354a916-e4e0-4c85-aaf4-7a5106191952";
+  const UVA = "88b0de4e-b457-4cc0-be66-f31aff3d6985";
+  const products = [
+    {id: TURBO, name:"X- Tudo Turbo", price:34.90, optionGroups:[]},
+    {id: UVA, name:"Dell Vale Uva 1L", price:14.00, optionGroups:[]},
+  ];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) throw Error("Gemini unavailable");
+    const body = JSON.parse(options.body);
+    calls.push(body);
+    if (body.action === "catalog") return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",products});
+    if (body.action === "preview") return response({ok:true,quoteToken:"signed.test",expires:Date.now()+300000,
+      items:body.items.map(item=>({quantity:item.quantity,name:products.find(p=>p.id===item.productId).name,total:products.find(p=>p.id===item.productId).price})),
+      total:48.90,subtotal:48.90,deliveryFee:0});
+    if (body.action === "commit") return response({ok:true,orderNumber:"9012",total:48.90,message:"Pedido confirmado",paymentUrl:null});
+    throw Error("Unexpected request "+body.action);
+  };
+  try {
+    const id="5531999912020";
+    assert.equal(await handleChatOrderMessage(params(id,"Olá quero pedir um X tudo turbo e um Dell vale de uva",messages)),true);
+    assert.match(messages.at(-1),/1x X- Tudo Turbo\n1x Dell Vale Uva 1L/);
+    assert.match(messages.at(-1),/nome.*entrega.*retirada/i);
+    assert.equal(calls.length,1,"a first message must only fetch catalog");
+    await handleChatOrderMessage(params(id,"retirada",messages));
+    await handleChatOrderMessage(params(id,"Maria",messages));
+    await handleChatOrderMessage(params(id,"Pix na entrega",messages));
+    const preview=calls.find(v=>v.action==="preview");
+    assert.ok(preview,"must prepare a server-validated quote");
+    assert.deepEqual(preview.items.map(i=>[i.productId,i.quantity]),[[TURBO,1],[UVA,1]]);
+    assert.match(messages.at(-1),/Total: \*R\$\s+48,90\*/);
+    assert.equal(calls.some(v=>v.action==="commit"),false,"no order before explicit confirmation");
+    await handleChatOrderMessage(params(id,"SIM",messages));
+    assert.equal(calls.filter(v=>v.action==="commit").length,1);
+    assert.match(messages.at(-1),/Pedido #9012/);
+  } finally {globalThis.fetch=originalFetch;}
+});
+
+test("follow-up product text recovers an empty draft after a Gemini timeout", async () => {
+  const old=globalThis.fetch, messages=[];
+  const products=[
+    {id:"9354a916-e4e0-4c85-aaf4-7a5106191952",name:"X- Tudo Turbo",price:34.9,optionGroups:[]},
+    {id:"88b0de4e-b457-4cc0-be66-f31aff3d6985",name:"Dell Vale Uva 1L",price:14,optionGroups:[]},
+  ];
+  globalThis.fetch=async(url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"provider unavailable"},503);
+    const body=JSON.parse(opts.body);
+    if(body.action==="catalog") return response({ok:true,products,menuUrl:"https://menu.test",deliveryMode:"neighborhood"});
+    throw Error("unexpected");
+  };
+  try {
+    const id="5531999922122";
+    await handleChatOrderMessage(params(id,"Quero fazer um pedido pelo chat",messages));
+    assert.match(messages.at(-1),/produtos e quantidades/i);
+    await handleChatOrderMessage(params(id,"Um X tudo e um suco Dell vale",messages));
+    assert.match(messages.at(-1),/1x X- Tudo Turbo\n1x Dell Vale Uva 1L/);
+  }finally{globalThis.fetch=old;}
+});
+
+test("ambiguous brand with two sizes cannot be silently selected without Gemini", async () => {
+  const originalFetch=globalThis.fetch, messages=[], backendCalls=[];
+  globalThis.fetch=async(url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"unavailable"},503);
+    const body=JSON.parse(opts.body);
+    backendCalls.push(body.action);
+    return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",products:[
+      {id:"11111111-1111-4111-8111-111111111111",name:"Coca Cola 350ml",price:5,optionGroups:[]},
+      {id:"22222222-2222-4222-8222-222222222222",name:"Coca Cola 2L",price:15,optionGroups:[]},
+    ]});
+  };
+  try {
+    await handleChatOrderMessage(params("5531999923111","Quero uma coca cola",messages));
+    assert.equal(backendCalls.includes("preview"),false);
+    assert.match(messages.at(-1),/produtos e quantidades/i);
+  }finally{globalThis.fetch=originalFetch;}
+});
+
+
+test("handles 2x quantities while refusing an unknown extra product", async () => {
+  const prev=globalThis.fetch, messages=[];
+  const x="9354a916-e4e0-4c85-aaf4-7a5106191952", actions=[];
+  globalThis.fetch=async (url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"unavailable"},503);
+    const body=JSON.parse(opts.body);
+    actions.push(body.action);
+    return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+      products:[{id:x,name:"X- Tudo Turbo",price:34.9,optionGroups:[]}]});
+  };
+  try{
+    await handleChatOrderMessage(params("5531999933001","Quero 2x X Tudo Turbo",messages));
+    assert.match(messages.at(-1),/2x X- Tudo Turbo/);
+    const other="5531999933002";
+    await handleChatOrderMessage(params(other,"Quero um X Tudo Turbo e uma pizza",messages));
+    assert.equal(actions.includes("preview"),false);
+    assert.match(messages.at(-1),/produtos e quantidades/i);
+  }finally{globalThis.fetch=prev;}
+});
