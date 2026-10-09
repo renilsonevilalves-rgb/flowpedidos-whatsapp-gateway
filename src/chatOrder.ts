@@ -467,7 +467,8 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
       : (/online|internet/.test(incoming) ? "online_credit" : "credit")) : "";
   // When cart edits and payment/name/address occur together, always let Gemini
   // examine the ENTIRE message; parsing one field must not discard cart edits.
-  const cartEdit = /\b(?:adiciona|adicionar|acrescenta|acrescentar|inclui|incluir|tira|tirar|retira|retirar|remove|remover|troca|trocar|substitui|substituir|muda|mudar|mais um|mais uma|coloca|colocar|sem)\b/.test(incoming);
+  const cartEdit = !firstTurn && state.draft.items.length > 0 &&
+    /\b(?:quero|queria|tambem|outro|outra|adiciona|adicionar|acrescenta|acrescentar|inclui|incluir|tira|tirar|retira|retirar|remove|remover|troca|trocar|substitui|substituir|muda|mudar|mais um|mais uma|coloca|colocar|sem)\b/.test(incoming);
   // Fast and reliable for simple catalog orders: no unnecessary AI network wait.
   // Advanced modifiers and ambiguous products are still delegated to Gemini.
   const catalogItems = (firstTurn || !state.draft.items.length) ? safeCatalogItems(p.text, state.catalog) : [];
