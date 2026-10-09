@@ -239,3 +239,101 @@ test("handles 2x quantities while refusing an unknown extra product", async () =
     assert.match(messages.at(-1),/produtos e quantidades/i);
   }finally{globalThis.fetch=prev;}
 });
+
+
+test("photo reproduction: name + delivery and bairro BEFORE street on separate WhatsApp lines", async () => {
+  const originalFetch=globalThis.fetch, messages=[], calls=[];
+  const turbo="9354a916-e4e0-4c85-aaf4-7a5106191952", pudim="bce9773d-9d45-4cda-ba1c-f3fc48dfaf48";
+  const products=[
+    {id:turbo,name:"X- Tudo Turbo",price:34.90,optionGroups:[]},
+    {id:pudim,name:"Pudim",price:27.89,optionGroups:[]},
+  ];
+  globalThis.fetch=async (url, opts) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({error:"Gemini timeout"},503);
+    const body=JSON.parse(opts.body);calls.push(body);
+    if(body.action==="catalog") return response({ok:true,products,neighborhoods:["Bernardo monteiro","Fonte grande"],deliveryMode:"neighborhood",menuUrl:"https://menu.test"});
+    if(body.action==="preview") return response({ok:true,quoteToken:"signed.draft",expires:Date.now()+300000,
+      subtotal:62.79,deliveryFee:2,total:64.79,
+      items:[{name:"X- Tudo Turbo",quantity:1,total:34.90},{name:"Pudim",quantity:1,total:27.89}]});
+    if(body.action==="commit") return response({ok:true,orderNumber:"9044",total:64.79,message:"Registrado",paymentUrl:"https://menu.test/payment"});
+    throw Error("Unexpected call: "+body.action);
+  };
+  try {
+    const id="5531999913344";
+    await handleChatOrderMessage(params(id,"Olá queria um X tudo turbo e um pudim",messages));
+    assert.match(messages.at(-1),/1x X- Tudo Turbo\n1x Pudim/);
+    await handleChatOrderMessage(params(id,"Renilson\nPrefiro entrega",messages));
+    assert.match(messages.at(-1),/rua, número e bairro/i);
+    await handleChatOrderMessage(params(id,"Bernardo monteiro\nRua Tereza Cristina 122",messages));
+    assert.match(messages.at(-1),/Como prefere \*pagar\*/);
+    await handleChatOrderMessage(params(id,"Pix online",messages));
+    const preview=calls.find(c=>c.action==="preview");
+    assert.ok(preview,"must reach backend preview after complete address");
+    assert.equal(preview.name,"renilson");
+    assert.equal(preview.deliveryType,"delivery");
+    assert.match(preview.address,/Rua Tereza Cristina/i);
+    assert.equal(preview.number,"122");
+    assert.equal(preview.neighborhood,"Bernardo monteiro");
+    assert.equal(preview.paymentMethod,"online_pix");
+    assert.equal(calls.filter(c=>c.action==="commit").length,0);
+    await handleChatOrderMessage(params(id,"SIM",messages));
+    assert.equal(calls.filter(c=>c.action==="commit").length,1);
+  } finally {globalThis.fetch=originalFetch;}
+});
+
+test("address with street first and bairro last is recognized without Gemini", async () => {
+  const originalFetch=globalThis.fetch,messages=[],calls=[];
+  globalThis.fetch=async (url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"unavailable"},503);
+    const body=JSON.parse(opts.body);calls.push(body);
+    return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+      neighborhoods:["Bernardo monteiro","Santo antonio"],
+      products:[{id:PRODUCT,name:"X Tudo",price:25,optionGroups:[]}]});
+  };
+  try {
+    const id="5531999913355";
+    await handleChatOrderMessage(params(id,"Quero um X Tudo",messages));
+    await handleChatOrderMessage(params(id,"Maria prefiro entrega",messages));
+    await handleChatOrderMessage(params(id,"Rua Tereza Cristina, 122 - Bairro Bernardo monteiro",messages));
+    assert.match(messages.at(-1),/Como prefere \*pagar\*/);
+    assert.equal(calls.filter(c=>c.action==="preview").length,0);
+  } finally {globalThis.fetch=originalFetch;}
+});
+
+test("partial address asks only for the missing parts, not the same full address again", async () => {
+  const originalFetch=globalThis.fetch,messages=[];
+  globalThis.fetch=async (url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"unavailable"},503);
+    return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+      neighborhoods:["Bernardo monteiro"],
+      products:[{id:PRODUCT,name:"X Tudo",price:25,optionGroups:[]}]});
+  };
+  try {
+    const id="5531999913366";
+    await handleChatOrderMessage(params(id,"Quero um X Tudo",messages));
+    await handleChatOrderMessage(params(id,"Renilson prefiro entrega",messages));
+    await handleChatOrderMessage(params(id,"Bairro Bernardo monteiro",messages));
+    assert.match(messages.at(-1),/Bairro anotado/);
+    await handleChatOrderMessage(params(id,"Rua Tereza Cristina, 122",messages));
+    assert.match(messages.at(-1),/Como prefere \*pagar\*/);
+  } finally {globalThis.fetch=originalFetch;}
+});
+
+test("never infer Turbo automatically from an unspecified bacon variant", async () => {
+  const originalFetch=globalThis.fetch,messages=[],calls=[];
+  globalThis.fetch=async(url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"unavailable"},503);
+    const body=JSON.parse(opts.body);calls.push(body);
+    return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+      products:[
+        {id:"9354a916-e4e0-4c85-aaf4-7a5106191952",name:"X- Tudo Turbo",price:34.9,optionGroups:[]},
+        {id:"254c9acd-6471-4978-a409-ad475e985552",name:"X-Egg Bacon",price:25,optionGroups:[]},
+        {id:"bce9773d-9d45-4cda-ba1c-f3fc48dfaf48",name:"Pudim",price:27.89,optionGroups:[]},
+      ]});
+  };
+  try {
+    await handleChatOrderMessage(params("5531999913377","Olá queria um X tudo de bacon e um pudim",messages));
+    assert.equal(calls.filter(x=>x.action==="preview").length,0);
+    assert.doesNotMatch(messages.at(-1),/Anotei seu pedido:\n1x X- Tudo Turbo/);
+  } finally {globalThis.fetch=originalFetch;}
+});
