@@ -90,9 +90,11 @@ test("new-order checkout defers existing-order cancellation while the draft rema
   const originalFetch = globalThis.fetch;
   globalThis.fetch = async (url, options) => {
     if (String(url).includes("generativelanguage.googleapis.com")) {
+      const input = JSON.parse(options.body).contents[0].parts[0].text;
+      const deliveryType = input.endsWith("retirada") ? "pickup" : "";
       return response({ candidates: [{ content: { parts: [{ text: JSON.stringify({
         draft: { items: [{ productId: PRODUCT, quantity: 1, notes: "", selectedOptions: [] }],
-          name: "", deliveryType: "", address: "", number: "", neighborhood: "", complement: "", reference: "", paymentMethod: "" },
+          name: "", deliveryType, address: "", number: "", neighborhood: "", complement: "", reference: "", paymentMethod: "" },
       }) }] } }] });
     }
     return response({ ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
