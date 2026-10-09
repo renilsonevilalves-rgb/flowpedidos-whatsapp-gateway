@@ -1,0 +1,23 @@
+# .github/workflows/chat-order-ci.yml
+name: WhatsApp AI Gateway CI
+on:
+  pull_request:
+    paths:
+      - "src/chatOrder.ts"
+      - "scripts/patch-chat-order.cjs"
+      - "package.json"
+      - "tests/chat-order.mjs"
+      - ".github/workflows/chat-order-ci.yml"
+  workflow_dispatch:
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install
+      - run: npm run build
