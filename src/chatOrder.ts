@@ -35,7 +35,7 @@ function concernsExistingOrder(text: string) {
 function startsOrder(text: string) {
   const t = norm(text);
   if (concernsExistingOrder(t)) return false;
-  return /(pelo whatsapp|por aqui mesmo|aqui no chat|sem cardapio|pedido pelo chat|me ve\b|vou querer\b|(?:quero|queria|gostaria(?: de)?|poderia)\s+(?:fazer\s+)?(?:um\s+|uma\s+)?(?:pedido|pedidinho|pedir)\b|(?:quero|queria|vou querer)\s+(?:\d+|um|uma|dois|duas|tres)\s)/.test(t);
+  return /(pelo whatsapp|por aqui mesmo|aqui no chat|sem cardapio|pedido pelo chat|me ve\b|vou querer\b|(?:quero|queria|gostaria(?: de)?|poderia)\s+(?:fazer\s+)?(?:um\s+|uma\s+)?(?:pedido|pedidinho|pedir)\b|(?:quero|queria|vou querer)\s+(?:\d+x?|um|uma|dois|duas|tres)\s)/.test(t);
 }
 function fresh(): Draft {
   return { draftId: randomUUID(), items: [], name: "", deliveryType: "", address: "", number: "",
