@@ -6,7 +6,7 @@ type Draft = {
   draftId: string; items: Item[]; name: string; deliveryType: string;
   address: string; number: string; neighborhood: string; complement: string; reference: string; paymentMethod: string;
 };
-type Catalog = { menuUrl: string; deliveryMode: string; products: Array<{
+type Catalog = { menuUrl: string; deliveryMode: string; neighborhoods?: string[]; products: Array<{
   id: string; name: string; price: number;
   optionGroups?: Array<{ id: string; name: string; min: number; max: number; options: Array<{ id: string; name: string; price: number }> }>;
 }> };
@@ -146,36 +146,88 @@ function safeCatalogItems(input: string, catalog: Catalog): Item[] {
     const instruction=trailing.match(/\bsem\s+(cebola|tomate|alface|picles|maionese|ketchup|mostarda|sal|molho)\b/);
     const notes=instruction ? "Sem " + instruction[1] : "";
     // Complex customization must go through Gemini; never guess priced additions.
-    if (/\b(?:adicional|acrescente|extra|trocar|substituir|tirar)\b/.test(trailing)) return [];
+    if (/\b(?:adicional|acrescente|extra|trocar|substituir|tirar)\b/.test(trailing) ||
+        /\b(?:de|com)\s+(?:bacon|carne|queijo|frango|calabresa|catupiry|ovo)\b/.test(trailing)) return [];
     items.push({productId:hit.product.id,quantity:hit.quantity,notes,selectedOptions:[]});
   }
   return items;
 }
 function safeFieldUpdate(message: string, state: State): Draft | null {
-  const t=norm(message);
-  const prev=state.draft;
+  const raw = String(message || "").slice(0, 600);
+  const t = norm(raw);
+  const pieces = raw.split(/[\r\n;,]+/).map(v => v.trim()).filter(Boolean);
+  const normalizedPieces = pieces.map(v => norm(v));
+  const prev = state.draft;
   if (!prev.items.length) return null;
-  const next: Draft = {...prev, items:prev.items.map(i=>({...i,selectedOptions:i.selectedOptions?.map(o=>({...o}))}))};
-  let changed=false;
-  if (/^(?:retirada|retirar|vou buscar|buscar no local|para retirar)\b/.test(t)) {next.deliveryType="pickup";changed=true;}
-  else if (/^(?:entrega|delivery|para entregar|quero receber|entregar)\b/.test(t)) {next.deliveryType="delivery";changed=true;}
-  if (/\b(?:pix\s+online|pagar\s+online\s+com\s+pix)\b/.test(t)) {next.paymentMethod="online_pix";changed=true;}
-  else if (/\b(?:cartao\s+online|credito\s+online)\b/.test(t)) {next.paymentMethod="online_credit";changed=true;}
-  else if (/\b(?:pix\s+na\s+entrega|pix\s+na\s+retirada)\b/.test(t)) {next.paymentMethod="pix";changed=true;}
-  else if (/\b(?:cartao\s+na\s+entrega|cartao\s+na\s+retirada)\b/.test(t)) {next.paymentMethod="credit";changed=true;}
-  else if (/^(?:dinheiro|em dinheiro|pago em dinheiro)$/.test(t)) {next.paymentMethod="money";changed=true;}
-  // A short reply to the explicit name question, not an arbitrary product phrase.
-  if (!next.name && prev.deliveryType && !changed && /^[a-z]+(?:\s+[a-z]+){0,3}$/.test(t) &&
-    !/\b(?:pedido|entrega|retirada|online|credito|cartao|pix|dinheiro|rua|av|bairro)\b/.test(t)) {
-    next.name=clean(message,120); changed=true;
+  const next: Draft = { ...prev, items: prev.items.map(i => ({ ...i, selectedOptions: i.selectedOptions?.map(o => ({ ...o })) })) };
+  let changed = false;
+
+  // A customer can answer both questions together, e.g. "Renilson\nPrefiro entrega".
+  const deliveryReply = normalizedPieces.some(line =>
+    /^(?:(?:prefiro|quero|pode ser|vai ser|para|pra)\s+)?(?:entrega|delivery|retirada|retirar|vou buscar|buscar no local)\b/.test(line));
+  const isPickup = normalizedPieces.some(line =>
+    /^(?:(?:prefiro|quero|pode ser|vai ser|para|pra)\s+)?(?:retirada|retirar|vou buscar|buscar no local)\b/.test(line));
+  if (deliveryReply) {
+    const type = isPickup ? "pickup" : "delivery";
+    if (next.deliveryType !== type) { next.deliveryType = type; changed = true; }
+  } else {
+    const combined = t.match(/^(?:(?:meu nome (?:e|é)|sou)\s+)?([a-z ]{2,65}?)\s+(?:prefiro|quero|vai ser|pode ser)\s+(entrega|delivery|retirada)$/);
+    if (combined) {
+      const type = combined[2] === "retirada" ? "pickup" : "delivery";
+      if (next.deliveryType !== type) { next.deliveryType = type; changed = true; }
+    }
   }
-  // Structured address is only accepted when number AND street are explicit.
-  if (next.deliveryType==="delivery" && (!next.address || !next.number || !next.neighborhood)) {
-    const m=t.match(/\b(rua|avenida|av|travessa|alameda)\s+([^,]+?),?\s+(?:n(?:umero)?\s*)?(\d{1,6})(?:\s*,\s*(?:bairro\s+)?(.+))?$/);
-    if (m) {
-      next.address=m[1]+" "+m[2].trim();next.number=m[3];if(m[4])next.neighborhood=m[4].trim();changed=true;
-    } else if (!next.neighborhood && /^(?:bairro\s+)?[a-z\s]{4,70}$/.test(t) && next.address && next.number &&
-      !/\b(?:pix|cartao|dinheiro|online)\b/.test(t)) {next.neighborhood=t.replace(/^bairro\s+/,"");changed=true;}
+
+  if (!next.name) {
+    const combined = t.match(/^(?:(?:meu nome (?:e|é)|sou)\s+)?([a-z ]{2,65}?)\s+(?:prefiro|quero|vai ser|pode ser)\s+(?:entrega|delivery|retirada)$/);
+    const proposed = combined?.[1] || (deliveryReply && pieces.length >= 2 ? norm(pieces[0]).replace(/^(?:meu nome e|sou)\s+/, "") : "");
+    const isName = (v: string) => /^[a-z]{2,}(?:\s+[a-z]{2,}){0,3}$/.test(v) &&
+      !/\b(?:pedido|entrega|retirada|online|credito|cartao|pix|dinheiro|rua|avenida|bairro|prefiro|quero)\b/.test(v) &&
+      !(state.catalog.neighborhoods || []).some(n => norm(n) === v);
+    if (proposed && isName(proposed)) { next.name = clean(proposed, 120); changed = true; }
+  }
+
+  if (/\b(?:pix\s+online|pagar\s+online\s+com\s+pix)\b/.test(t)) { next.paymentMethod = "online_pix"; changed = true; }
+  else if (/\b(?:cartao\s+online|credito\s+online)\b/.test(t)) { next.paymentMethod = "online_credit"; changed = true; }
+  else if (/\b(?:pix\s+na\s+entrega|pix\s+na\s+retirada)\b/.test(t)) { next.paymentMethod = "pix"; changed = true; }
+  else if (/\b(?:cartao\s+na\s+entrega|cartao\s+na\s+retirada)\b/.test(t)) { next.paymentMethod = "credit"; changed = true; }
+  else if (/^(?:dinheiro|em dinheiro|pago em dinheiro)$/.test(t)) { next.paymentMethod = "money"; changed = true; }
+
+  // Accept plain names only in the name step, never mistake a neighborhood for a name.
+  if (!next.name && prev.deliveryType && !changed && /^[a-z]+(?:\s+[a-z]+){0,3}$/.test(t) &&
+      !/\b(?:pedido|entrega|retirada|online|credito|cartao|pix|dinheiro|rua|av|bairro)\b/.test(t) &&
+      !(state.catalog.neighborhoods || []).some(n => norm(n) === t)) {
+    next.name = clean(raw, 120); changed = true;
+  }
+
+  if (next.deliveryType === "delivery") {
+    // Different legitimate WhatsApp formats:
+    // "Bairro Bernardo monteiro\nRua Tereza Cristina 122"
+    // "Rua Tereza Cristina, 122 - Bairro Bernardo monteiro"
+    // "Bernardo monteiro, rua Tereza Cristina 122"
+    const street = raw.match(/\b(rua|avenida|av\.?|travessa|alameda|praca|praça|estrada|rodovia)\s+([a-zA-ZÀ-ÿ0-9.'\- ]{2,100}?)\s*,?\s*(?:n(?:[úu]mero)?\.?\s*|n[º°]\s*|#\s*)?(\d{1,6})(?=\b|$)/i);
+    if (street && street[2].trim()) {
+      const address = clean(street[1] + " " + street[2].trim(), 250);
+      if (next.address !== address || next.number !== street[3]) {
+        next.address = address; next.number = street[3]; changed = true;
+      }
+    }
+
+    const known = (state.catalog.neighborhoods || []).filter(Boolean);
+    const matching = known.filter(n => {
+      const ntext = norm(n);
+      if (!ntext) return false;
+      return normalizedPieces.some(line => line === ntext || line === "bairro " + ntext) ||
+        t.startsWith(ntext + " ") || t.endsWith(" " + ntext) ||
+        t.includes(" bairro " + ntext + " ") || t.endsWith(" bairro " + ntext);
+    });
+    if (matching.length === 1 && next.neighborhood !== matching[0]) {
+      next.neighborhood = matching[0]; changed = true;
+    } else if (!known.length && !next.neighborhood) {
+      // Only if explicitly labeled, never infer an arbitrary word as a neighborhood.
+      const neighborhoodLine = normalizedPieces.find(line => /^bairro\s+[a-z ]{3,70}$/.test(line));
+      if (neighborhoodLine) { next.neighborhood = clean(neighborhoodLine.replace(/^bairro\s+/, ""), 100); changed = true; }
+    }
   }
   return changed ? next : null;
 }
@@ -265,8 +317,13 @@ function question(d: Draft, catalog: Catalog) {
   if (!d.deliveryType) return d.name
     ? "Perfeito, " + d.name + "! Vai ser para *entrega* ou *retirada*?"
     : "Perfeito! Me diz seu *nome* e se prefere *entrega ou retirada* 😊";
-  if (d.deliveryType === "delivery" && (!d.address || !d.number || !d.neighborhood))
+  if (d.deliveryType === "delivery" && (!d.address || !d.number || !d.neighborhood)) {
+    if (d.address && d.number && !d.neighborhood)
+      return "Anotei a rua e o número! Qual é o *bairro* da entrega?";
+    if (d.neighborhood && (!d.address || !d.number))
+      return "Bairro anotado! Agora só preciso da *rua e número*.";
     return "Me passa a *rua, número e bairro* para a entrega. Pode mandar tudo numa mensagem só.";
+  }
   if (!d.name) return "E qual é o seu *nome* para identificar o pedido?";
   if (!d.paymentMethod) return "Como prefere *pagar*: *Pix ou cartão online*, *Pix ou cartão na entrega*, ou *dinheiro*?";
   return "";
