@@ -693,3 +693,164 @@ test("unknown products are not invented and existing checkout fields stay intact
     assert.equal(calls.filter(c => c.action === "commit").length, 0);
   } finally { globalThis.fetch = old; }
 });
+
+
+test("real screenshot: 'tem pudim também' and 'não tem?' keep product context and add only when confirmed", async () => {
+  const old = globalThis.fetch, messages = [], actions = [];
+  const turbo = "9354a916-e4e0-4c85-aaf4-7a5106191952";
+  const dessert = "bce9773d-9d45-4cda-ba1c-f3fc48dfaf48";
+  const catalog = [
+    {id:turbo,name:"X- Tudo Turbo",price:34.90,optionGroups:[]},
+    {id:dessert,name:"Pudim",price:12.50,optionGroups:[]},
+  ];
+  globalThis.fetch = async (url,opts) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({error:"unavailable"},503);
+    const req = JSON.parse(opts.body); actions.push(req);
+    if(req.action==="catalog") return response({ok:true,menuUrl:"https://menu.test",
+      deliveryMode:"neighborhood",products:catalog});
+    throw Error("Unexpected backend request " + req.action);
+  };
+  try {
+    const phone="5531999903001";
+    await handleChatOrderMessage(params(phone,"Queria pedir um X Tudo Turbo",messages));
+    assert.match(messages.at(-1),/1x X- Tudo Turbo/);
+    await handleChatOrderMessage(params(phone,"Tem pudim também ?",messages));
+    assert.match(messages.at(-1),/Temos sim.*Pudim/i);
+    assert.match(messages.at(-1),/adicionar 1 ao pedido/i);
+    assert.doesNotMatch(messages.at(-1),/me diz seu.*nome/i);
+    assert.doesNotMatch(messages.at(-1),/cardapio.*https/i);
+    await handleChatOrderMessage(params(phone,"Não tem ?",messages));
+    assert.match(messages.at(-1),/Temos sim.*Pudim/i);
+    assert.doesNotMatch(messages.at(-1),/nome.*entrega.*retirada/i);
+    assert.equal(actions.filter(x=>x.action==="commit").length,0);
+    await handleChatOrderMessage(params(phone,"sim",messages));
+    assert.match(messages.at(-1),/1x X- Tudo Turbo/);
+    assert.match(messages.at(-1),/1x Pudim/);
+    assert.equal(actions.filter(x=>x.action==="commit").length,0);
+    assert.equal(actions.filter(x=>x.action==="preview").length,0);
+    await handleChatOrderMessage(params(phone,"revisar",messages));
+    assert.match(messages.at(-1),/nome.*entrega.*retirada/i);
+  } finally {globalThis.fetch=old;}
+});
+
+test("customer can add a known product directly to an existing cart without resetting checkout", async () => {
+  const old=globalThis.fetch, sent=[],actions=[];
+  const dessert="bce9773d-9d45-4cda-ba1c-f3fc48dfaf48";
+  globalThis.fetch=async(url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"provider timeout"},503);
+    const req=JSON.parse(opts.body);actions.push(req);
+    if(req.action==="catalog") return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+      products:[{id:PRODUCT,name:"X Tudo",price:25,optionGroups:[]},
+        {id:dessert,name:"Pudim",price:10,optionGroups:[]}]});
+    throw Error("Unexpected action "+req.action);
+  };
+  try {
+    const phone="5531999903002";
+    await handleChatOrderMessage(params(phone,"quero um X Tudo",sent));
+    await handleChatOrderMessage(params(phone,"Quero um pudim também",sent));
+    assert.match(sent.at(-1),/1x X Tudo/);
+    assert.match(sent.at(-1),/1x Pudim/);
+    assert.doesNotMatch(sent.at(-1),/que deseja pedir/i);
+    await handleChatOrderMessage(params(phone,"Acrescenta mais um pudim",sent));
+    assert.match(sent.at(-1),/2x Pudim/);
+    assert.equal(actions.filter(x=>x.action==="commit").length,0);
+  }finally{globalThis.fetch=old;}
+});
+
+test("question at start of WhatsApp chat gets catalog answer instead of generic menu link",async()=>{
+  const old=globalThis.fetch, sent=[],calls=[];
+  globalThis.fetch=async(url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")) throw Error("Gemini offline");
+    const request=JSON.parse(opts.body);calls.push(request);
+    return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+      products:[{id:PRODUCT,name:"Pudim",price:13,optionGroups:[]}]});
+  };
+  try{
+    const phone="5531999903003";
+    assert.equal(await handleChatOrderMessage(params(phone,"Tem pudim também?",sent)),true);
+    assert.match(sent.at(-1),/Temos sim.*Pudim/i);
+    assert.doesNotMatch(sent.at(-1),/cardapio.*https/i);
+    await handleChatOrderMessage(params(phone,"sim",sent));
+    assert.match(sent.at(-1),/1x Pudim/);
+    assert.equal(calls.filter(x=>x.action==="commit").length,0);
+  }finally{globalThis.fetch=old;}
+});
+
+test("multiple product sizes cannot be selected merely by asking whether they exist",async()=>{
+  const old=globalThis.fetch, sent=[],calls=[];
+  globalThis.fetch=async(url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"timeout"},503);
+    const request=JSON.parse(opts.body);calls.push(request);
+    return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+      products:[{id:"99999999-9999-4999-8999-999999999991",name:"Coca cola 350ml",price:6,optionGroups:[]},
+        {id:"99999999-9999-4999-8999-999999999992",name:"Coca cola 2L",price:15,optionGroups:[]}]});
+  };
+  try{
+    const phone="5531999903004";
+    await handleChatOrderMessage(params(phone,"Tem coca cola?",sent));
+    assert.match(sent.at(-1),/Coca cola 350ml/);
+    assert.match(sent.at(-1),/Coca cola 2L/);
+    await handleChatOrderMessage(params(phone,"sim",sent));
+    assert.equal(calls.filter(x=>x.action==="commit").length,0);
+    assert.doesNotMatch(sent.at(-1),/confirmado.*pedido/i);
+  }finally{globalThis.fetch=old;}
+});
+
+test("catalog price question does not alter an existing cart or pretend to quote total", async()=>{
+  const old=globalThis.fetch, sent=[], calls=[];
+  globalThis.fetch=async(url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"offline"},503);
+    const request=JSON.parse(opts.body);calls.push(request);
+    return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+      products:[{id:PRODUCT,name:"Pudim",price:12.50,optionGroups:[]}]});
+  };
+  try{
+    const phone="5531999903005";
+    await handleChatOrderMessage(params(phone,"Qual o valor do pudim?",sent));
+    assert.match(sent.at(-1),/Pudim.*R\$\s*12,50/);
+    assert.equal(calls.filter(x=>["preview","commit"].includes(x.action)).length,0);
+  }finally{globalThis.fetch=old;}
+});
+
+
+test("Gemini can interpret broad human category queries but returns only grounded catalog products",async()=>{
+ const old=globalThis.fetch,sent=[],backend=[];
+ const pudding="bce9773d-9d45-4cda-ba1c-f3fc48dfaf48";
+ const mousse="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+ globalThis.fetch=async(url,opts)=>{
+  const req=JSON.parse(opts.body);
+  if(String(url).includes("generativelanguage.googleapis.com")) return response({
+   candidates:[{content:{parts:[{text:JSON.stringify({
+    type:"availability",query:"sobremesa",productIds:[pudding,mousse,"made-up-id"]})}]}}]});
+  backend.push(req);
+  return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+   products:[{id:pudding,name:"Pudim",price:12,optionGroups:[]},
+             {id:mousse,name:"Mousse de Morango",price:14,optionGroups:[]}]});
+ };
+ try{
+  await handleChatOrderMessage(params("5531999903006","Tem alguma sobremesa aí?",sent));
+  assert.match(sent.at(-1),/Pudim/);
+  assert.match(sent.at(-1),/Mousse de Morango/);
+  assert.doesNotMatch(sent.at(-1),/made-up-id|https:\/\/menu/);
+  assert.deepEqual(backend.map(req=>req.action),["catalog"]);
+ }finally{globalThis.fetch=old;}
+});
+
+test("Gemini unavailable during broad product question does not repeat checkout or force menu", async()=>{
+ const old=globalThis.fetch,sent=[],backend=[];
+ globalThis.fetch=async(url,opts)=>{
+  if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"timeout"},503);
+  const req=JSON.parse(opts.body);backend.push(req);
+  return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+   products:[{id:PRODUCT,name:"X Tudo",price:25,optionGroups:[]}]});
+ };
+ try{
+  const phone="5531999903007";
+  await handleChatOrderMessage(params(phone,"quero um X Tudo",sent));
+  await handleChatOrderMessage(params(phone,"Tem alguma sobremesa aí?",sent));
+  assert.match(sent.at(-1),/Não encontrei.*sobremesa/i);
+  assert.doesNotMatch(sent.at(-1),/nome.*entrega.*retirada/i);
+  assert.doesNotMatch(sent.at(-1),/https:\/\/menu/);
+  assert.equal(backend.filter(req=>req.action==="commit").length,0);
+ }finally{globalThis.fetch=old;}
+});
