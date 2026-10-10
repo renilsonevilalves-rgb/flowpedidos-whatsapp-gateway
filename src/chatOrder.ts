@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
 import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
+import { resolveCartAction } from "./chatCartIntent.js";
 
 type Item = { productId: string; quantity: number; notes?: string; selectedOptions?: Array<{ id: string; groupId: string; quantity: number }> };
 type Draft = {
@@ -13,7 +14,7 @@ type Catalog = { menuUrl: string; deliveryMode: string; neighborhoods?: string[]
   optionGroups?: Array<{ id: string; name: string; min: number; max: number; options: Array<{ id: string; name: string; price: number }> }>;
 }> };
 type ConversationTurn = { role: "user" | "assistant"; text: string };
-type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit"; pendingLearning?: AliasCandidate; pendingSwap?: { fromId: string; toId: string }; pendingAdd?: { productId: string }; lastCatalogInquiry?: string };
+type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit"; pendingLearning?: AliasCandidate; pendingSwap?: { fromId: string; toId: string }; pendingAdd?: { productId: string }; lastCatalogInquiry?: string; lastRemovedProductId?: string; lastCartStatusProductId?: string };
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
   sendMessage: (jid: string, data: { text: string }) => Promise<unknown>;
@@ -608,6 +609,85 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   if (cancel(p.text)) { drafts.delete(key); await send(p, "Carrinho descartado. Nenhum pedido foi feito."); return true; }
   if (state.quote && state.quoteExpiry && Date.now() > state.quoteExpiry) state.quote = undefined;
 
+  // Execute explicit cart removals and status checks BEFORE generic catalog questions
+  // or Gemini interpretation. A polite "por favor" must never add products.
+  const userText = norm(p.text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  if (/^(?:sim ou nao|sim ou nao por favor|responde sim ou nao|so sim ou nao)$/.test(userText) &&
+      state.lastCartStatusProductId) {
+    const product = state.catalog.products.find(row => row.id === state.lastCartStatusProductId);
+    const count = state.draft.items.filter(item => item.productId === state!.lastCartStatusProductId)
+      .reduce((sum, item) => sum + item.quantity, 0);
+    await send(p, count ? "Não. *" + (product?.name || "O produto") +
+      "* ainda está no seu carrinho (" + count + "x)." :
+      "Sim. *" + (product?.name || "O produto") + "* não está mais no seu carrinho.");
+    return true;
+  }
+  const cartAction = resolveCartAction(p.text, state.catalog.products, state.draft.items);
+  if (cartAction) {
+    if (cartAction.kind === "keep") {
+      await send(p, "Certo, não retirei nenhum produto. Seu carrinho continua igual. 😊");
+      return true;
+    }
+    if (cartAction.kind === "clarify") {
+      await send(p, cartAction.choices.length
+        ? "Só para não alterar o produto errado: você se refere a *" +
+          cartAction.choices.join("* ou *") + "*?"
+        : cartAction.operation === "status"
+          ? "Qual produto você quer conferir no carrinho?"
+          : "Qual produto exatamente você quer retirar? Se também quiser adicionar ou trocar outro, pode me dizer os dois itens.");
+      return true;
+    }
+    const product = state.catalog.products.find(row => row.id === cartAction.productId);
+    const productName = product?.name || "Esse produto";
+    const matching = state.draft.items.filter(item => item.productId === cartAction.productId);
+    const quantityInCart = matching.reduce((sum, item) => sum + item.quantity, 0);
+    state.lastCartStatusProductId = cartAction.productId;
+    if (cartAction.kind === "status") {
+      const previouslyRemoved = !quantityInCart && state.lastRemovedProductId === cartAction.productId;
+      await send(p, quantityInCart
+        ? "Não, *" + productName + "* ainda está no seu carrinho (" + quantityInCart + "x). Não fiz nenhuma alteração agora."
+        : previouslyRemoved
+          ? "Sim, retirei *" + productName + "* do seu carrinho. Ele não aparece mais no pedido."
+          : "*" + productName + "* não consta no carrinho atual. Não alterei nada agora.");
+      return true;
+    }
+    if (!quantityInCart) {
+      await send(p, "*" + productName + "* já não está no seu carrinho. Não acrescentei nem removi outros itens.");
+      return true;
+    }
+    const toRemove = cartAction.quantity ?? quantityInCart;
+    if (toRemove > quantityInCart) {
+      await send(p, "Você tem " + quantityInCart + "x *" + productName +
+        "* no carrinho, mas pediu para tirar " + toRemove + ". Quer retirar todos?");
+      return true;
+    }
+    if (matching.length > 1 && toRemove < quantityInCart) {
+      await send(p, "Você tem versões diferentes de *" + productName +
+        "* no carrinho. Qual delas e quantas unidades devo retirar?");
+      return true;
+    }
+    const nextItems = state.draft.items.flatMap(item => {
+      if (item.productId !== cartAction.productId) return [item];
+      const remaining = item.quantity - toRemove;
+      return remaining > 0 ? [{ ...item, quantity: remaining }] : [];
+    });
+    state.draft.items = nextItems;
+    state.quote = undefined;
+    state.quoteExpiry = undefined;
+    state.pendingAdd = undefined;
+    state.pendingSwap = undefined;
+    state.lastRemovedProductId = cartAction.productId;
+    if (!nextItems.length) {
+      await send(p, "Retirei *" + productName + "* do pedido. Seu carrinho ficou vazio. O que gostaria de pedir agora?");
+    } else {
+      await acknowledgeCartEdit(p, state, "Retirei " + (toRemove === quantityInCart
+        ? "*" + productName + "*" : toRemove + "x *" + productName + "*") + " do pedido!");
+    }
+    return true;
+  }
+
+  // A later unrelated reply must not reuse an outdated yes/no cart reference.
+  state.lastCartStatusProductId = undefined;
   const inquiry = readInquiry(p.text, state.lastCatalogInquiry);
   if (inquiry) {
     // A broad question like "tem sobremesa?" can be resolved using Gemini

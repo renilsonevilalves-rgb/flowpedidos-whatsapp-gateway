@@ -60,6 +60,6 @@ export function searchCatalog(query: string, products: CatalogEntry[]): {
 }
 export function mayBeCartAddition(text: string): boolean {
   const t = normalizedText(text);
-  if (/\b(?:saber|tem|existe|vende|disponivel|quanto|preco|valor|troca|trocar|substituir|remover|retirar|tirar|sem)\b/.test(t)) return false;
-  return /\b(?:adiciona|adicionar|acrescenta|acrescentar|inclui|incluir|coloca|colocar|bota|botar|poe|por|mais um|mais uma|tambem|quero outro|quero outra|me ve mais)\b/.test(t);
+  if (/\b(?:saber|tem|existe|vende|disponivel|quanto|preco|valor|troca|trocar|substituir|remover|remova|remove|removeu|retirar|retire|retira|retirou|tirar|tire|tira|tirou|excluir|exclua|apagar|apague|sem)\b/.test(t)) return false;
+  return /\b(?:adiciona|adicionar|acrescenta|acrescentar|inclui|incluir|coloca|colocar|bota|botar|poe|mais um|mais uma|tambem|quero outro|quero outra|me ve mais)\b/.test(t);
 }
