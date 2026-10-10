@@ -573,3 +573,123 @@ test("does not learn from checkout canceled before customer confirmation", async
     assert.equal(calls.filter(x => ["learn", "commit"].includes(x.action)).length, 0);
   } finally { globalThis.fetch = old; }
 });
+
+
+test("screenshot regression: asking whether bacon exists answers catalog and offers safe swap without asking for name", async () => {
+  const old = globalThis.fetch, messages = [], calls = [];
+  const turbo = "9354a916-e4e0-4c85-aaf4-7a5106191952";
+  const bacon = "23813179-64df-4d67-8b01-37c8bde01122";
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      const payload = JSON.parse(options.body);
+      if (payload.contents?.[0]?.parts?.[0]?.text?.includes("Bom dia queria um X tudão")) {
+        return response({ candidates: [{ content: { parts: [{ text: JSON.stringify({ draft: {
+          items: [{ productId: turbo, quantity: 1, notes: "", selectedOptions: [] }],
+          name: "", deliveryType: "", address: "", number: "", neighborhood: "",
+          complement: "", reference: "", paymentMethod: "",
+        } }) }] } }] });
+      }
+      return response({ error: "Gemini timed out" }, 503);
+    }
+    const request = JSON.parse(options.body); calls.push(request);
+    if (request.action === "catalog") return response({
+      ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [
+        { id: turbo, name: "X- Tudo Turbo", price: 34.9, optionGroups: [] },
+        { id: bacon, name: "X-Egg Bacon", price: 29.9, optionGroups: [] },
+      ],
+    });
+    if (request.action === "preview") return response({
+      ok: true, quoteToken: "valid.quote", expires: Date.now() + 60000,
+      subtotal: 29.9, total: 29.9, deliveryFee: 0,
+      items: [{ quantity: 1, name: "X-Egg Bacon", total: 29.9 }],
+    });
+    throw Error("Unexpected backend action " + request.action);
+  };
+  try {
+    const phone = "5531999901001";
+    await handleChatOrderMessage(params(phone, "Bom dia queria um X tudão", messages));
+    assert.match(messages.at(-1), /X- Tudo Turbo/);
+    await handleChatOrderMessage(params(phone, "Tem de Bacon? Se tiver quero trocar", messages));
+    assert.match(messages.at(-1), /X-Egg Bacon/);
+    assert.match(messages.at(-1), /trocar.*X- Tudo Turbo/);
+    assert.doesNotMatch(messages.at(-1), /me diz seu.*nome/i);
+    assert.equal(calls.filter(c => ["preview", "commit", "learn"].includes(c.action)).length, 0,
+      "availability does not mutate or commit checkout");
+    await handleChatOrderMessage(params(phone, "Quero saber se tem de Bacon", messages));
+    assert.match(messages.at(-1), /X-Egg Bacon/);
+    assert.doesNotMatch(messages.at(-1), /nome.*entrega.*retirada/i);
+    await handleChatOrderMessage(params(phone, "sim", messages));
+    assert.match(messages.at(-1), /troquei pelo.*X-Egg Bacon/i);
+    assert.match(messages.at(-1), /1x X-Egg Bacon/);
+    assert.match(messages.at(-1), /nome.*entrega.*retirada/i);
+    assert.equal(calls.filter(c => ["preview", "commit", "learn"].includes(c.action)).length, 0);
+  } finally { globalThis.fetch = old; }
+});
+
+test("declining a catalog swap preserves the original cart and does not confirm an order", async () => {
+  const old = globalThis.fetch, sent = [], calls = [];
+  const turbo = "9354a916-e4e0-4c85-aaf4-7a5106191952";
+  const bacon = "23813179-64df-4d67-8b01-37c8bde01122";
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({ error: "timeout" }, 503);
+    const body = JSON.parse(opts.body); calls.push(body);
+    return response({ ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [
+        { id: turbo, name: "X- Tudo Turbo", price: 34.9, optionGroups: [] },
+        { id: bacon, name: "X-Egg Bacon", price: 29.9, optionGroups: [] },
+      ] });
+  };
+  try {
+    const phone = "5531999901002";
+    await handleChatOrderMessage(params(phone, "Quero um X Tudo Turbo", sent));
+    await handleChatOrderMessage(params(phone, "tem de bacon?", sent));
+    await handleChatOrderMessage(params(phone, "não", sent));
+    assert.match(sent.at(-1), /mantive o pedido/i);
+    await handleChatOrderMessage(params(phone, "revisar", sent));
+    assert.match(sent.at(-1), /nome.*entrega.*retirada/i);
+    assert.equal(calls.filter(c => c.action === "commit").length, 0);
+  } finally { globalThis.fetch = old; }
+});
+
+test("ambiguous sizes get a catalog answer, not an automatic substitution", async () => {
+  const old = globalThis.fetch, sent = [], calls = [];
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({ error: "timeout" }, 503);
+    const body = JSON.parse(opts.body); calls.push(body);
+    return response({ ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [
+        { id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] },
+        { id: "99999999-9999-4999-8999-999999999991", name: "Coca Cola 350ml", price: 5, optionGroups: [] },
+        { id: "99999999-9999-4999-8999-999999999992", name: "Coca Cola 2L", price: 12, optionGroups: [] },
+      ] });
+  };
+  try {
+    const phone = "5531999901003";
+    await handleChatOrderMessage(params(phone, "Quero um X Tudo", sent));
+    await handleChatOrderMessage(params(phone, "Tem coca cola? Quero trocar", sent));
+    assert.match(sent.at(-1), /Coca Cola 350ml/);
+    assert.match(sent.at(-1), /Coca Cola 2L/);
+    assert.match(sent.at(-1), /diga exatamente qual produto/i);
+    assert.equal(calls.filter(c => c.action === "commit").length, 0);
+  } finally { globalThis.fetch = old; }
+});
+
+test("unknown products are not invented and existing checkout fields stay intact", async () => {
+  const old = globalThis.fetch, sent = [], calls = [];
+  globalThis.fetch = async (url, opts) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({ error: "timeout" }, 503);
+    const body = JSON.parse(opts.body); calls.push(body);
+    return response({ ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [{ id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] }] });
+  };
+  try {
+    const phone = "5531999901004";
+    await handleChatOrderMessage(params(phone, "Quero um X Tudo", sent));
+    await handleChatOrderMessage(params(phone, "quero saber se tem de bacon", sent));
+    assert.match(sent.at(-1), /não encontrei produto com.*bacon/i);
+    await handleChatOrderMessage(params(phone, "revisar", sent));
+    assert.match(sent.at(-1), /nome.*entrega.*retirada/i);
+    assert.equal(calls.filter(c => c.action === "commit").length, 0);
+  } finally { globalThis.fetch = old; }
+});
