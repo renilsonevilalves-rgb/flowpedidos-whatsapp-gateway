@@ -652,6 +652,13 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   // the name/address questions. Keep it until an exact, validated choice arrives.
   if (state.pendingChoice) {
     const pending = state.pendingChoice;
+    if (/\b(?:qual|quais|lista|mostra|opcoes|tem)\b/.test(normalizedTurn) &&
+        /\b(?:bebida|bebidas|refrigerante|refrigerantes|refri|refris|suco|sucos|sobremesa|sobremesas)\b/.test(normalizedTurn)) {
+      const choices = state.catalog.products.filter(product => pending.productIds.includes(product.id));
+      await send(p, "Claro! 😊 Temos: " + formatOptions(choices, currency) +
+        ". Qual deles você prefere?");
+      return true;
+    }
     if (/^(?:nenhum|nenhuma|deixa|deixa pra la|nao quero|sem bebida|sem refri|sem refrigerante)$/.test(normalizedTurn)) {
       state.pendingChoice = undefined;
       await send(p, "Tudo bem, deixei esse item de fora. 😊 " +
