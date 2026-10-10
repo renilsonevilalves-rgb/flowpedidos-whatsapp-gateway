@@ -811,3 +811,46 @@ test("catalog price question does not alter an existing cart or pretend to quote
     assert.equal(calls.filter(x=>["preview","commit"].includes(x.action)).length,0);
   }finally{globalThis.fetch=old;}
 });
+
+
+test("Gemini can interpret broad human category queries but returns only grounded catalog products",async()=>{
+ const old=globalThis.fetch,sent=[],backend=[];
+ const pudding="bce9773d-9d45-4cda-ba1c-f3fc48dfaf48";
+ const mousse="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+ globalThis.fetch=async(url,opts)=>{
+  const req=JSON.parse(opts.body);
+  if(String(url).includes("generativelanguage.googleapis.com")) return response({
+   candidates:[{content:{parts:[{text:JSON.stringify({
+    type:"availability",query:"sobremesa",productIds:[pudding,mousse,"made-up-id"]})}]}}]});
+  backend.push(req);
+  return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+   products:[{id:pudding,name:"Pudim",price:12,optionGroups:[]},
+             {id:mousse,name:"Mousse de Morango",price:14,optionGroups:[]}]});
+ };
+ try{
+  await handleChatOrderMessage(params("5531999903006","Tem alguma sobremesa aí?",sent));
+  assert.match(sent.at(-1),/Pudim/);
+  assert.match(sent.at(-1),/Mousse de Morango/);
+  assert.doesNotMatch(sent.at(-1),/made-up-id|https:\/\/menu/);
+  assert.deepEqual(backend.map(req=>req.action),["catalog"]);
+ }finally{globalThis.fetch=old;}
+});
+
+test("Gemini unavailable during broad product question does not repeat checkout or force menu", async()=>{
+ const old=globalThis.fetch,sent=[],backend=[];
+ globalThis.fetch=async(url,opts)=>{
+  if(String(url).includes("generativelanguage.googleapis.com")) return response({error:"timeout"},503);
+  const req=JSON.parse(opts.body);backend.push(req);
+  return response({ok:true,menuUrl:"https://menu.test",deliveryMode:"neighborhood",
+   products:[{id:PRODUCT,name:"X Tudo",price:25,optionGroups:[]}]});
+ };
+ try{
+  const phone="5531999903007";
+  await handleChatOrderMessage(params(phone,"quero um X Tudo",sent));
+  await handleChatOrderMessage(params(phone,"Tem alguma sobremesa aí?",sent));
+  assert.match(sent.at(-1),/Não encontrei.*sobremesa/i);
+  assert.doesNotMatch(sent.at(-1),/nome.*entrega.*retirada/i);
+  assert.doesNotMatch(sent.at(-1),/https:\/\/menu/);
+  assert.equal(backend.filter(req=>req.action==="commit").length,0);
+ }finally{globalThis.fetch=old;}
+});
