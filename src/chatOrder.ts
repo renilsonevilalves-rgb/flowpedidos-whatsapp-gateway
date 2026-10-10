@@ -406,7 +406,7 @@ async function classifyOpenQuestion(p: Params, state: State): Promise<{
     const parsed = JSON.parse(raw);
     const type = parsed?.type;
     if (!["availability", "price", "none"].includes(type)) return null;
-    const ids = (Array.isArray(parsed.productIds) ? parsed.productIds : []).slice(0, 8)
+    const ids: string[] = (Array.isArray(parsed.productIds) ? parsed.productIds : []).slice(0, 8)
       .filter((id: unknown): id is string => typeof id === "string" &&
         state.catalog.products.some(product => product.id === id));
     const query = clean(parsed?.query, 70);
