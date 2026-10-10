@@ -87,6 +87,9 @@ export function unresolvedChoice(
   if (!topic) return null;
   const options = catalog.filter(product => matchesChoice(product, topic));
   if (!options.length) return null;
+  // A unique, catalog-validated interpretation such as "suco Dell Vale" must
+  // not be downgraded into a generic category question.
+  if (options.length === 1 && acceptedProductIds.includes(options[0].id)) return null;
 
   // A precisely named option is not an unresolved generic request.
   const specific = options.some(p => {
