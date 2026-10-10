@@ -455,7 +455,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
       const learning = state.pendingLearning;
       const finalItems = state.draft.items;
       drafts.delete(key);
-      await send(p, "✅ Pedido # + result.orderNumber + " — " + currency(result.total) + "\n" + result.message +
+      await send(p, "✅ Pedido #" + result.orderNumber + " — " + currency(result.total) + "\n" + result.message +
         (result.paymentUrl ? "\n\n🔒 Link para pagamento seguro:\n" + result.paymentUrl + "\n\nA loja recebe após a aprovação do pagamento." : ""));
       if (learning && result.orderId && !result.paymentPending &&
           finalItems.some(item => item.productId === learning.productId)) {
