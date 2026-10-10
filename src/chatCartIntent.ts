@@ -5,6 +5,7 @@ type CartLine = { productId: string; quantity: number };
 export type CartAction =
   | { kind: "remove"; productId: string; quantity: number | null }
   | { kind: "status"; productId: string }
+  | { kind: "keep" }
   | { kind: "clarify"; operation: "remove" | "status"; choices: string[] };
 
 function mentionsProduct(text: string, productName: string): boolean {
@@ -35,11 +36,13 @@ export function resolveCartAction(
   if (!text) return null;
 
   const status = /\b(?:retirou|tirou|removeu|excluiu|apagou|conseguiu tirar|conseguiu retirar|ja tirou|ja retirou|foi retirado|foi removido)\b/.test(text) ||
-    /\b(?:ainda tem|continua|esta|ta)\b.*\b(?:no carrinho|no pedido)\b/.test(text);
+    /\b(?:ainda tem|tem|continua|ficou|consta|esta|ta)\b.*\b(?:no (?:meu )?(?:carrinho|pedido))\b/.test(text);
   const removal = /\b(?:tira|tire|tirar|retira|retire|retirar|remove|remova|remover|exclui|exclua|excluir|apaga|apague|apagar|nao quero mais|nao quero)\b/.test(text) ||
     /\b(?:quero|deixa|faz|faca)\b.*\bsem\s+(?:o|a|os|as)\b/.test(text);
   if (!status && !removal) return null;
-  if (!status && /\b(?:nao quero|nao precisa)\s+(?:que\s+)?(?:tirar|tire|retirar|retire|remover|remova)\b/.test(text)) return null;
+  if (!status && (/\b(?:nao quero|nao precisa)\s+(?:que\s+)?(?:tirar|tire|retirar|retire|remover|remova)\b/.test(text) ||
+    /\b(?:nao|nunca|jamais)\s+(?:tira|tire|tirar|retira|retire|retirar|remove|remova|remover)\b/.test(text)))
+    return { kind: "keep" };
   // Conditional questions must not perform a real cart mutation.
   if (!status && /\b(?:se eu|e se|se a gente|quanto ficaria|quanto fica se|quanto sai se)\b/.test(text))
     return { kind: "clarify", operation: "remove", choices: [] };
