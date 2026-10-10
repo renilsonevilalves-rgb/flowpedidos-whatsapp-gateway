@@ -473,7 +473,7 @@ async function respondToCatalogQuestion(p: Params, state: State, inquiry: Inquir
     if (!isFollowup) { state.pendingSwap = undefined; state.pendingAdd = undefined; }
     await send(p, "Temos estas opções: " + shown.map(product => "*" + product.name + "*").join(", ") +
       (products.length > shown.length ? " e outras." : ".") +
-      "\nQual delas você quer? Não vou escolher tamanho ou sabor por conta própria.");
+      "\nMe diga exatamente qual produto você prefere. Não vou escolher tamanho ou sabor por conta própria.");
     return;
   }
   if (optionProducts.length) {
@@ -482,7 +482,7 @@ async function respondToCatalogQuestion(p: Params, state: State, inquiry: Inquir
       ". Quer consultar algum deles? Seu pedido não mudou.");
     return;
   }
-  await send(p, "Não encontrei *" + query + "* entre os produtos disponíveis agora. " +
+  await send(p, "Não encontrei produto com *" + query + "* entre os itens disponíveis agora. " +
     "Posso procurar outro item para você. O pedido atual continua igual.");
 }
 
@@ -653,7 +653,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     }
     if (no(p.text) || /^(?:melhor nao|deixa|deixa pra la)[.!?\s]*$/.test(norm(p.text))) {
       state.pendingAdd = undefined;
-      await send(p, "Combinado! Não acrescentei nada. O pedido continua como estava.");
+      await send(p, "Certo, mantive o pedido como estava 😊 Não acrescentei nada.");
       return true;
     }
     state.pendingAdd = undefined;
