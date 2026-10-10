@@ -610,7 +610,13 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 
   const inquiry = readInquiry(p.text, state.lastCatalogInquiry);
   if (inquiry) {
-    await respondToCatalogQuestion(p, state, inquiry);
+    // A broad question like "tem sobremesa?" can be resolved using Gemini
+    // against real catalog IDs when a literal product-name search finds nothing.
+    const direct = searchCatalog(inquiry.query, state.catalog.products);
+    const suggested = inquiry.type !== "followup" && !direct.products.length && !direct.optionProducts.length
+      ? await classifyOpenQuestion(p, state) : null;
+    await respondToCatalogQuestion(p, state, inquiry,
+      suggested?.type !== "none" ? suggested?.productIds : undefined);
     return true;
   }
   // For nonliteral human questions, let Gemini interpret intent and suggest ONLY
