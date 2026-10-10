@@ -4,6 +4,8 @@ on:
   pull_request:
     paths:
       - "src/chatOrder.ts"
+      - "src/chatLearning.ts"
+      - "tests/chat-learning.mjs"
       - "scripts/patch-chat-order.cjs"
       - "package.json"
       - "tests/chat-order.mjs"
