@@ -598,7 +598,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   let state = drafts.get(key);
   if (state && Date.now() - state.updatedAt > 20 * 60_000) { drafts.delete(key); state = undefined; }
   const firstTurn = !state;
-  if (!state && !startsOrder(p.text) && !readInquiry(p.text)) return false;
+  if (!state && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text)) return false;
   if (!/^55[1-9]{2}\d{8,9}$/.test(String(p.customerPhone || ""))) {
     if (state) { await send(p, "Não consegui identificar seu telefone. Fale com a loja."); return true; }
     return false;
@@ -764,7 +764,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   const textQuestion = /[?？]/.test(p.text) ||
     /\b(?:queria saber|gostaria de saber|quais opcoes|qual sabor|sobremesas|doces|bebidas)\b/.test(norm(p.text));
   const aboutProduct = /\b(?:tem|temos|vende|pudim|produto|sabor|preco|valor|opcoes|sobremesa|doces|bebidas|lanche|disponivel)\b/.test(norm(p.text));
-  if (textQuestion && aboutProduct) {
+  if (textQuestion && (aboutProduct || state.pendingChoice)) {
     const classified = await classifyOpenQuestion(p, state);
     if (classified && classified.type !== "none" && (classified.query || classified.productIds.length)) {
       await respondToCatalogQuestion(p, state, {
@@ -971,7 +971,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (!enabled || !geminiKey || !keys.length || !process.env.VERCEL_API_URL || !p.customerJid || !p.text) return false;
   const key = p.sessionId + ":" + p.customerJid;
-  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text)) return false;
+  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text)) return false;
   const prev = serialized.get(key) || Promise.resolve(false);
   const task = prev.catch(() => false).then(() => processMessage(p, key)).catch(async (error: any) => {
     p.logger.warn({ sessionId: p.sessionId, error: error?.message }, "[Chat-Order] Failed");
