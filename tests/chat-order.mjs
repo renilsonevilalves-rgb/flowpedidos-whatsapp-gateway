@@ -580,8 +580,17 @@ test("screenshot regression: asking whether bacon exists answers catalog and off
   const turbo = "9354a916-e4e0-4c85-aaf4-7a5106191952";
   const bacon = "23813179-64df-4d67-8b01-37c8bde01122";
   globalThis.fetch = async (url, options) => {
-    if (String(url).includes("generativelanguage.googleapis.com"))
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      const payload = JSON.parse(options.body);
+      if (payload.contents?.[0]?.parts?.[0]?.text?.includes("Bom dia queria um X tudão")) {
+        return response({ candidates: [{ content: { parts: [{ text: JSON.stringify({ draft: {
+          items: [{ productId: turbo, quantity: 1, notes: "", selectedOptions: [] }],
+          name: "", deliveryType: "", address: "", number: "", neighborhood: "",
+          complement: "", reference: "", paymentMethod: "",
+        } }) }] } }] });
+      }
       return response({ error: "Gemini timed out" }, 503);
+    }
     const request = JSON.parse(options.body); calls.push(request);
     if (request.action === "catalog") return response({
       ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
