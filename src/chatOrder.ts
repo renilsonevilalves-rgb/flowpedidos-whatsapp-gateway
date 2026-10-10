@@ -1,6 +1,7 @@
 // src/chatOrder.ts
 import { randomUUID } from "node:crypto";
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
+import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
 
 type Item = { productId: string; quantity: number; notes?: string; selectedOptions?: Array<{ id: string; groupId: string; quantity: number }> };
 type Draft = {
@@ -12,7 +13,7 @@ type Catalog = { menuUrl: string; deliveryMode: string; neighborhoods?: string[]
   optionGroups?: Array<{ id: string; name: string; min: number; max: number; options: Array<{ id: string; name: string; price: number }> }>;
 }> };
 type ConversationTurn = { role: "user" | "assistant"; text: string };
-type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit"; pendingLearning?: AliasCandidate; pendingSwap?: { fromId: string; toId: string } };
+type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit"; pendingLearning?: AliasCandidate; pendingSwap?: { fromId: string; toId: string }; pendingAdd?: { productId: string }; lastCatalogInquiry?: string };
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
   sendMessage: (jid: string, data: { text: string }) => Promise<unknown>;
@@ -372,31 +373,101 @@ async function interpret(p: Params, state: State): Promise<Draft | null> {
     return null;
   } finally { clearTimeout(timer); }
 }
-function availabilityQuery(text: string): string | null {
-  const plain = norm(text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
-  // Questions about the live menu are not checkout fields or cart edits.
-  // Examples: "tem de bacon? se tiver quero trocar", "quero saber se tem de bacon".
-  const match = plain.match(/\b(?:tem|temos|teria|existe)\s+(?:(?:algum|alguma|opcao|opcoes|lanche|produto|sabor)\s+)?(?:(?:de|com|do|da|o|a|um|uma)\s+)?([a-z][a-z0-9 ]{2,60}?)(?=\s+(?:se\s+tiver|se\s+sim|quero\s+trocar|gostaria\s+de\s+trocar|pra\s+trocar|para\s+trocar|no\s+cardapio|disponivel|hoje|ai|por\s+favor)\b|$)/);
-  const query = match?.[1]?.trim() || "";
-  if (!query || query.split(" ").length > 5 ||
-      /^(?:como|que|pra|para|entrega|retirada|pedido|fazer|pagar|alterar|trocar)\b/.test(query)) return null;
-  return query;
+async function respondToCatalogQuestion(p: Params, state: State, inquiry: Inquiry): Promise<void> {
+  const isFollowup = inquiry.type === "followup";
+  const query = inquiry.query;
+  // A follow-up is not a new choice. Keep a pending "add" or "swap" answer alive.
+  if (!isFollowup) {
+    state.pendingSwap = undefined;
+    state.pendingAdd = undefined;
+  }
+  state.lastCatalogInquiry = query;
+  const { products, optionProducts } = searchCatalog(query, state.catalog.products);
+  const shown = products.slice(0, 6);
+  if (shown.length === 1) {
+    const product = shown[0];
+    const already = state.draft.items.some(item => item.productId === product.id);
+    if (inquiry.type === "price") {
+      await send(p, "No cardápio, *" + product.name + "* custa *" + currency(product.price) +
+        "*. O total do pedido é confirmado antes de finalizar.");
+      return;
+    }
+    const swap = /\b(?:troca|trocar|substituir|no lugar|em vez)\b/.test(norm(p.text));
+    if (swap && state.draft.items.length === 1 && !already) {
+      const current = state.catalog.products.find(row => row.id === state.draft.items[0].productId);
+      state.pendingSwap = { fromId: state.draft.items[0].productId, toId: product.id };
+      await send(p, "Temos sim, *" + product.name + "*! 😊 Quer trocar *" +
+        (current?.name || "o item atual") + "* por *" + product.name +
+        "*? Responda *SIM* para trocar ou *NÃO* para manter. Seu pedido continua igual por enquanto.");
+      return;
+    }
+    if (!isFollowup) state.pendingAdd = { productId: product.id };
+    await send(p, "Temos sim! 😊 *" + product.name + "* está disponível" +
+      (already ? " e já consta no seu pedido." : ".") +
+      (state.pendingAdd?.productId === product.id
+        ? "\nQuer *adicionar 1 ao pedido*? Responda *SIM* ou *NÃO*."
+        : ""));
+    return;
+  }
+  if (shown.length > 1) {
+    if (!isFollowup) { state.pendingSwap = undefined; state.pendingAdd = undefined; }
+    await send(p, "Temos estas opções: " + shown.map(product => "*" + product.name + "*").join(", ") +
+      (products.length > shown.length ? " e outras." : ".") +
+      "\nQual delas você quer? Não vou escolher tamanho ou sabor por conta própria.");
+    return;
+  }
+  if (optionProducts.length) {
+    await send(p, "Não achei um produto com esse nome, mas temos essa opção ou adicional em: " +
+      optionProducts.slice(0, 4).map(product => "*" + product.name + "*").join(", ") +
+      ". Quer consultar algum deles? Seu pedido não mudou.");
+    return;
+  }
+  await send(p, "Não encontrei *" + query + "* entre os produtos disponíveis agora. " +
+    "Posso procurar outro item para você. O pedido atual continua igual.");
 }
 
-function catalogSearch(query: string, catalog: Catalog) {
-  const tokens = query.split(" ").filter(Boolean);
-  const normalizeLabel = (name: string) => norm(name).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
-  const matches = catalog.products.filter(product => {
-    const name = " " + normalizeLabel(product.name) + " ";
-    return tokens.every(token => name.includes(" " + token + " "));
-  });
-  const optionMatches = catalog.products.filter(product =>
-    (product.optionGroups || []).some(group =>
-      group.options.some(option => {
-        const name = " " + normalizeLabel(option.name) + " ";
-        return tokens.every(token => name.includes(" " + token + " "));
-      })));
-  return { matches, optionMatches };
+function addItemsToDraft(state: State, additions: Item[]): boolean {
+  if (!additions.length) return false;
+  const updated: Item[] = state.draft.items.map(item => ({
+    ...item, selectedOptions: (item.selectedOptions || []).map(option => ({ ...option })),
+  }));
+  for (const next of additions) {
+    if (!state.catalog.products.some(product => product.id === next.productId)) return false;
+    if (!Number.isSafeInteger(next.quantity) || next.quantity < 1) return false;
+    const identical = updated.find(item => item.productId === next.productId &&
+      (item.notes || "") === (next.notes || "") &&
+      JSON.stringify(item.selectedOptions || []) === JSON.stringify(next.selectedOptions || []));
+    if (identical) {
+      if (identical.quantity + next.quantity > 100) return false;
+      identical.quantity += next.quantity;
+    } else updated.push(next);
+  }
+  if (updated.length > 40 || updated.reduce((count, item) => count + item.quantity, 0) > 100) return false;
+  state.draft.items = updated;
+  state.quote = undefined;
+  state.quoteExpiry = undefined;
+  return true;
+}
+
+async function acknowledgeCartEdit(p: Params, state: State, label: string): Promise<void> {
+  const missing = question(state.draft, state.catalog, state.paymentHint);
+  if (missing) {
+    await send(p, label + " 😊\n" + recap(state.draft, state.catalog) + "\n\n" + missing);
+    return;
+  }
+  if (state.draft.deliveryType === "delivery" && norm(state.catalog.deliveryMode) !== "neighborhood") {
+    await send(p, label + ". Para calcular a entrega por distância/iFood, finalize pelo cardápio: " + state.catalog.menuUrl);
+    return;
+  }
+  try {
+    const preview = await requestBackend(p, "preview", { ...state.draft, phone: p.customerPhone });
+    state.quote = preview.quoteToken;
+    state.quoteExpiry = Number(preview.expires);
+    await send(p, label + " 😊\n\n" + summary(state.draft, preview));
+  } catch (e: any) {
+    await send(p, label + ", mas não consegui conferir o valor final agora: " +
+      clean(e?.message, 200) + ". Não confirmei nenhum pedido.");
+  }
 }
 
 function question(d: Draft, catalog: Catalog, paymentHint?: "pix" | "credit") {
@@ -457,7 +528,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   let state = drafts.get(key);
   if (state && Date.now() - state.updatedAt > 20 * 60_000) { drafts.delete(key); state = undefined; }
   const firstTurn = !state;
-  if (!state && !startsOrder(p.text)) return false;
+  if (!state && !startsOrder(p.text) && !readInquiry(p.text)) return false;
   if (!/^55[1-9]{2}\d{8,9}$/.test(String(p.customerPhone || ""))) {
     if (state) { await send(p, "Não consegui identificar seu telefone. Fale com a loja."); return true; }
     return false;
@@ -477,35 +548,27 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   if (cancel(p.text)) { drafts.delete(key); await send(p, "Carrinho descartado. Nenhum pedido foi feito."); return true; }
   if (state.quote && state.quoteExpiry && Date.now() > state.quoteExpiry) state.quote = undefined;
 
-  const availability = availabilityQuery(p.text);
-  if (availability !== null) {
-    state.pendingSwap = undefined;
-    const { matches, optionMatches } = catalogSearch(availability, state.catalog);
-    const shown = matches.slice(0, 6);
-    if (shown.length === 1 && state.draft.items.length === 1 &&
-        shown[0].id !== state.draft.items[0].productId) {
-      const original = state.catalog.products.find(x => x.id === state!.draft.items[0].productId);
-      state.pendingSwap = { fromId: state.draft.items[0].productId, toId: shown[0].id };
-      await send(p, "Temos *" + shown[0].name + "* no cardápio! 😊 Quer trocar *" +
-        (state.draft.items[0].quantity > 1 ? state.draft.items[0].quantity + "x " : "") +
-        (original?.name || "o produto atual") + "* por *" + shown[0].name +
-        "*? Responda *SIM* para trocar ou *NÃO* para manter. Nenhuma alteração foi feita ainda.");
-    } else if (shown.length) {
-      await send(p, (shown.length === 1 ? "Temos sim: *" + shown[0].name + "*."
-        : "Temos estas opções no cardápio: " + shown.map(product => "*" + product.name + "*").join(", ") +
-          (matches.length > shown.length ? " e outras." : ".")) +
-        "\nSeu pedido continua igual. Se quiser trocar, me diga exatamente qual produto sai e qual entra.");
-    } else if (optionMatches.length) {
-      await send(p, "Não encontrei um produto específico com *" + availability + "* no nome, mas há " +
-        "uma opção ou adicional assim em: " +
-        optionMatches.slice(0, 4).map(product => "*" + product.name + "*").join(", ") +
-        ". Seu pedido não foi alterado. Quer consultar as opções de algum desses produtos?");
-    } else {
-      await send(p, "Não encontrei produto com *" + availability +
-        "* entre os itens disponíveis do cardápio no momento. Seu pedido continua igual." +
-        (state.catalog.menuUrl ? "\nVocê pode conferir o cardápio: " + state.catalog.menuUrl : ""));
-    }
+  const inquiry = readInquiry(p.text, state.lastCatalogInquiry);
+  if (inquiry) {
+    await respondToCatalogQuestion(p, state, inquiry);
     return true;
+  }
+  if (state.pendingAdd) {
+    const pending = state.pendingAdd;
+    if (yes(p.text)) {
+      state.pendingAdd = undefined;
+      const product = state.catalog.products.find(row => row.id === pending.productId);
+      if (!product || !addItemsToDraft(state, [{ productId: product.id, quantity: 1, selectedOptions: [] }])) {
+        await send(p, "Não consegui acrescentar esse item com segurança. Qual produto você quer?");
+      } else await acknowledgeCartEdit(p, state, "Adicionei *" + product.name + "* ao carrinho!");
+      return true;
+    }
+    if (no(p.text) || /^(?:melhor nao|deixa|deixa pra la)[.!?\s]*$/.test(norm(p.text))) {
+      state.pendingAdd = undefined;
+      await send(p, "Combinado! Não acrescentei nada. O pedido continua como estava.");
+      return true;
+    }
+    state.pendingAdd = undefined;
   }
 
   if (state.pendingSwap) {
@@ -590,6 +653,15 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   const catalogText = correction && !state.draft.items.length
     ? "quero um " + (state.catalog.products.find(product => product.id === correction.productId)?.name || "")
     : normalizedInput;
+  // A new product in a running conversation is an addition, not an instruction
+  // to re-enter checkout. Only accept a complete, unambiguous catalog match.
+  if (state.draft.items.length && mayBeCartAddition(p.text)) {
+    const addition = safeCatalogItems(catalogText, state.catalog);
+    if (addition.length && addItemsToDraft(state, addition)) {
+      await acknowledgeCartEdit(p, state, "Atualizei seu pedido!");
+      return true;
+    }
+  }
   const catalogItems = (firstTurn || !state.draft.items.length) ? safeCatalogItems(catalogText, state.catalog) : [];
   const fastDraft = catalogItems.length ? { ...state.draft, items: catalogItems } : null;
   const fastWithFields = fastDraft ? safeFieldUpdate(p.text, { ...state, draft: fastDraft }) || fastDraft : null;
@@ -642,7 +714,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (!enabled || !geminiKey || !keys.length || !process.env.VERCEL_API_URL || !p.customerJid || !p.text) return false;
   const key = p.sessionId + ":" + p.customerJid;
-  if (!drafts.has(key) && !startsOrder(p.text)) return false;
+  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text)) return false;
   const prev = serialized.get(key) || Promise.resolve(false);
   const task = prev.catch(() => false).then(() => processMessage(p, key)).catch(async (error: any) => {
     p.logger.warn({ sessionId: p.sessionId, error: error?.message }, "[Chat-Order] Failed");
