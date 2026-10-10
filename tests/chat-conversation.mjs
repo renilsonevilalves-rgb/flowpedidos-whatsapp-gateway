@@ -23,10 +23,11 @@ const param = (phone,text,messages) => ({
   sessionId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", customerJid: phone+"@s.whatsapp.net",
   customerPhone: phone, text, logger, sendMessage: async (_,x)=>messages.push(x.text),
 });
-function mockBackend(calls, data = products) {
+function mockBackend(calls, data = products, failGemini = false) {
   const previousFetch = globalThis.fetch;
   globalThis.fetch = async (url, opts) => {
     if (String(url).includes("generativelanguage.googleapis.com")) {
+      if (failGemini) return response({ error: "Gemini offline" },503);
       const request = JSON.parse(opts.body);
       const input = request.contents[0].parts[0].text;
       if (input.startsWith("Pergunta: ")) {
@@ -107,6 +108,21 @@ test("real promotion appears with only backend-verified discounted price",async(
   try {
     await handleChatOrderMessage(param("5531999919983","Tem algum lanche em promoção?",sent));
     assert.match(sent.at(-1),/Hambúrguer.*R\$\s*17,00/);
+    assert.doesNotMatch(sent.at(-1),/nome.*entrega.*retirada/i);
+    assert.equal(calls.filter(c=>c.action==="commit").length,0);
+  } finally {restore();}
+});
+
+test("outage: a pending beverage question is answered from the real catalog without Gemini",async()=>{
+  const calls=[],sent=[],restore=mockBackend(calls,products,true);
+  try {
+    const id="5531999919984";
+    await handleChatOrderMessage(param(id,"Queria fazer um pedido",sent));
+    await handleChatOrderMessage(param(id,"Um hambúrguer e 1 refrigerantes",sent));
+    assert.match(sent.at(-1),/refrigerante/);
+    await handleChatOrderMessage(param(id,"Qual bebida você tem?",sent));
+    assert.match(sent.at(-1),/Coca cola 350ml/);
+    assert.match(sent.at(-1),/Fanta Laranja 2L/);
     assert.doesNotMatch(sent.at(-1),/nome.*entrega.*retirada/i);
     assert.equal(calls.filter(c=>c.action==="commit").length,0);
   } finally {restore();}
