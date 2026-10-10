@@ -493,3 +493,83 @@ test("after asking for a name, a short name response works even if Gemini is dow
     assert.doesNotMatch(messages.at(-1), /nome/i);
   } finally { globalThis.fetch = old; }
 });
+
+
+test("approved tenant alias resolves even when Gemini is unavailable", async () => {
+  const old = globalThis.fetch, messages = [], calls = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({ error: "unavailable" }, 503);
+    const request = JSON.parse(options.body); calls.push(request);
+    if (request.action === "catalog") return response({
+      ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [{ id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] }],
+      learnedAliases: [{ alias: "xtudao", productId: PRODUCT }],
+    });
+    throw Error("unexpected " + request.action);
+  };
+  try {
+    await handleChatOrderMessage(params("5531999900901", "quero dois xtudao", messages));
+    assert.match(messages.at(-1), /2x X Tudo/);
+    assert.deepEqual(calls.map(x => x.action), ["catalog"]);
+  } finally { globalThis.fetch = old; }
+});
+
+test("learns only after checkout commit; feedback failure must not fail a created order", async () => {
+  const old = globalThis.fetch, messages = [], calls = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({ error: "unavailable" }, 503);
+    const request = JSON.parse(options.body); calls.push(request);
+    if (request.action === "catalog") return response({
+      ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [{ id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] }],
+    });
+    if (request.action === "preview") return response({
+      ok: true, quoteToken: "signed.test", expires: Date.now() + 300000,
+      subtotal: 25, deliveryFee: 0, total: 25,
+      items: [{ name: "X Tudo", quantity: 1, total: 25 }],
+    });
+    if (request.action === "commit") return response({
+      ok: true, orderId: "33333333-3333-4333-8333-333333333333",
+      orderNumber: "7782", total: 25, message: "Pedido confirmado", paymentPending: false,
+    });
+    if (request.action === "learn") return response({ error: "Database unavailable" }, 503);
+    throw Error("unexpected " + request.action);
+  };
+  try {
+    const phone = "5531999900902";
+    await handleChatOrderMessage(params(phone, "quero um xtudao", messages));
+    assert.match(messages.at(-1), /produtos e quantidades/i);
+    await handleChatOrderMessage(params(phone, "xtudao é X Tudo", messages));
+    assert.match(messages.at(-1), /1x X Tudo/);
+    await handleChatOrderMessage(params(phone, "retirada", messages));
+    await handleChatOrderMessage(params(phone, "Maria", messages));
+    await handleChatOrderMessage(params(phone, "dinheiro", messages));
+    assert.equal(calls.filter(c => c.action === "learn").length, 0);
+    assert.equal(calls.filter(c => c.action === "commit").length, 0);
+    await handleChatOrderMessage(params(phone, "sim", messages));
+    const events = calls.filter(c => c.action === "learn");
+    assert.equal(events.length, 1);
+    assert.equal(events[0].alias, "xtudao");
+    assert.equal(events[0].productId, PRODUCT);
+    assert.equal(events[0].orderId, "33333333-3333-4333-8333-333333333333");
+    assert.match(messages.at(-1), /Pedido #7782/);
+    assert.equal(calls.filter(c => c.action === "commit").length, 1);
+  } finally { globalThis.fetch = old; }
+});
+
+test("does not learn from checkout canceled before customer confirmation", async () => {
+  const old = globalThis.fetch, messages = [], calls = [];
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes("generativelanguage.googleapis.com")) return response({ error: "unavailable" }, 503);
+    const request = JSON.parse(options.body); calls.push(request);
+    return response({ ok: true, menuUrl: "https://menu.test", deliveryMode: "neighborhood",
+      products: [{ id: PRODUCT, name: "X Tudo", price: 25, optionGroups: [] }] });
+  };
+  try {
+    const phone = "5531999900903";
+    await handleChatOrderMessage(params(phone, "quero um xtudao", messages));
+    await handleChatOrderMessage(params(phone, "xtudao é X Tudo", messages));
+    await handleChatOrderMessage(params(phone, "desistir", messages));
+    assert.equal(calls.filter(x => ["learn", "commit"].includes(x.action)).length, 0);
+  } finally { globalThis.fetch = old; }
+});
