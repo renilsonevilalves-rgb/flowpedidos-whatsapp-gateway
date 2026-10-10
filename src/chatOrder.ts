@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
 import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
 import { resolveCartAction } from "./chatCartIntent.js";
+import { isPromotionQuestion, promotionsFor, scopeLabel, unresolvedChoice, formatOptions, type ChoiceTopic } from "./chatConversation.js";
 
 type Item = { productId: string; quantity: number; notes?: string; selectedOptions?: Array<{ id: string; groupId: string; quantity: number }> };
 type Draft = {
@@ -10,11 +11,15 @@ type Draft = {
   address: string; number: string; neighborhood: string; complement: string; reference: string; paymentMethod: string;
 };
 type Catalog = { menuUrl: string; deliveryMode: string; neighborhoods?: string[]; learnedAliases?: LearnedAlias[]; products: Array<{
-  id: string; name: string; price: number;
+  id: string; name: string; price: number; category?: string; description?: string;
+  promotionEnabled?: boolean; originalPrice?: number | null;
   optionGroups?: Array<{ id: string; name: string; min: number; max: number; options: Array<{ id: string; name: string; price: number }> }>;
 }> };
 type ConversationTurn = { role: "user" | "assistant"; text: string };
-type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit"; pendingLearning?: AliasCandidate; pendingSwap?: { fromId: string; toId: string }; pendingAdd?: { productId: string }; lastCatalogInquiry?: string; lastRemovedProductId?: string; lastCartStatusProductId?: string };
+type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit"; pendingLearning?: AliasCandidate; pendingSwap?: { fromId: string; toId: string }; pendingAdd?: { productId: string }; lastCatalogInquiry?: string; lastRemovedProductId?: string; lastCartStatusProductId?: string;
+  lastPromotion?: { query: string; at: number };
+  pendingChoice?: { topic: ChoiceTopic; productIds: string[] };
+};
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
   sendMessage: (jid: string, data: { text: string }) => Promise<unknown>;
@@ -81,7 +86,11 @@ function modelCatalog(c: Catalog) {
     const groups = (p.optionGroups || []).map((g) => g.name + " [groupId=" + g.id + ", min=" + g.min + ", max=" + g.max + "]: " +
       g.options.map((o) => o.name + " [id=" + o.id + "]").join(", ")).join("; ");
     const aliases = (c.learnedAliases || []).filter(a => a.productId === p.id).slice(0, 8).map(a => a.alias);
-    return p.name + " [productId=" + p.id + ", R$" + p.price + "]" + (groups ? " | " + groups : "") + (aliases.length ? " | Apelidos aprovados: " + aliases.join(", ") : "");
+    return p.name + " [productId=" + p.id + ", R$" + p.price +
+      (p.category ? ", categoria=" + clean(p.category, 70) : "") +
+      (p.promotionEnabled && Number(p.originalPrice) > p.price
+        ? ", promocao=sim, precoAnterior=R$" + Number(p.originalPrice) : "") +
+      "]" + (groups ? " | " + groups : "") + (aliases.length ? " | Apelidos aprovados: " + aliases.join(", ") : "");
   }).join("\n").slice(0, 48000);
 }
 
@@ -589,7 +598,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   let state = drafts.get(key);
   if (state && Date.now() - state.updatedAt > 20 * 60_000) { drafts.delete(key); state = undefined; }
   const firstTurn = !state;
-  if (!state && !startsOrder(p.text) && !readInquiry(p.text)) return false;
+  if (!state && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text)) return false;
   if (!/^55[1-9]{2}\d{8,9}$/.test(String(p.customerPhone || ""))) {
     if (state) { await send(p, "Não consegui identificar seu telefone. Fale com a loja."); return true; }
     return false;
@@ -608,6 +617,64 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   state.history = [...(state.history || []), { role: "user" as const, text: clean(p.text, 800) }].slice(-10);
   if (cancel(p.text)) { drafts.delete(key); await send(p, "Carrinho descartado. Nenhum pedido foi feito."); return true; }
   if (state.quote && state.quoteExpiry && Date.now() > state.quoteExpiry) state.quote = undefined;
+
+  const normalizedTurn = norm(p.text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  const promotionFollowup = /^(?:nenhum|nenhuma|nenhum mesmo|nenhuma mesmo|serio|tem certeza|nenhum ai|nao tem nenhum|nem um)$/.test(normalizedTurn);
+  if (isPromotionQuestion(p.text) || (promotionFollowup && state.lastPromotion &&
+      Date.now() - state.lastPromotion.at < 5 * 60_000)) {
+    const promotionQuery = isPromotionQuestion(p.text) ? p.text : state.lastPromotion!.query;
+    // Re-read canonical catalog for availability and promotion status instead of
+    // answering from a possibly stale in-memory cart draft.
+    let freshCatalog: Catalog | null;
+    try { freshCatalog = await requestBackend(p, "catalog", {}); }
+    catch { freshCatalog = null; }
+    if (!freshCatalog) {
+      await send(p, "Não consegui conferir as promoções da loja agora. Posso tentar novamente?");
+      return true;
+    }
+    state.catalog = freshCatalog;
+    state.lastPromotion = { query: promotionQuery, at: Date.now() };
+    const promoted = promotionsFor(promotionQuery, state.catalog.products);
+    if (!promoted.length) {
+      const label = scopeLabel(promotionQuery);
+      await send(p, "No catálogo atualizado, não encontrei " +
+        (label === "produto" ? "produtos em promoção" : label + "s em promoção") +
+        " neste momento. Se aparecer uma oferta nova, os valores vêm sempre do cardápio da loja.");
+    } else {
+      await send(p, "Temos sim! 😊 " + formatOptions(promoted, currency) +
+        ". Quer algum desses? Se preferir, pode continuar escolhendo seu pedido por aqui.");
+    }
+    return true;
+  }
+  state.lastPromotion = undefined;
+
+  // A pending category is a missing part of the order, not a reason to repeat
+  // the name/address questions. Keep it until an exact, validated choice arrives.
+  if (state.pendingChoice) {
+    const pending = state.pendingChoice;
+    if (/\b(?:qual|quais|lista|mostra|opcoes|tem)\b/.test(normalizedTurn) &&
+        /\b(?:bebida|bebidas|refrigerante|refrigerantes|refri|refris|suco|sucos|sobremesa|sobremesas)\b/.test(normalizedTurn)) {
+      const choices = state.catalog.products.filter(product => pending.productIds.includes(product.id));
+      await send(p, "Claro! 😊 Temos: " + formatOptions(choices, currency) +
+        ". Qual deles você prefere?");
+      return true;
+    }
+    if (/^(?:nenhum|nenhuma|deixa|deixa pra la|nao quero|sem bebida|sem refri|sem refrigerante)$/.test(normalizedTurn)) {
+      state.pendingChoice = undefined;
+      await send(p, "Tudo bem, deixei esse item de fora. 😊 " +
+        (state.draft.items.length ? recap(state.draft, state.catalog) + "\n\n" : "") +
+        question(state.draft, state.catalog, state.paymentHint));
+      return true;
+    }
+    const parsedChoice = safeCatalogItems(p.text, state.catalog);
+    if (parsedChoice.length === 1 && pending.productIds.includes(parsedChoice[0].productId) &&
+        addItemsToDraft(state, parsedChoice)) {
+      state.pendingChoice = undefined;
+      const chosen = state.catalog.products.find(product => product.id === parsedChoice[0].productId);
+      await acknowledgeCartEdit(p, state, "Anotei " + parsedChoice[0].quantity + "x *" + (chosen?.name || "produto") + "*!");
+      return true;
+    }
+  }
 
   // Execute explicit cart removals and status checks BEFORE generic catalog questions
   // or Gemini interpretation. A polite "por favor" must never add products.
@@ -704,7 +771,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   const textQuestion = /[?？]/.test(p.text) ||
     /\b(?:queria saber|gostaria de saber|quais opcoes|qual sabor|sobremesas|doces|bebidas)\b/.test(norm(p.text));
   const aboutProduct = /\b(?:tem|temos|vende|pudim|produto|sabor|preco|valor|opcoes|sobremesa|doces|bebidas|lanche|disponivel)\b/.test(norm(p.text));
-  if (textQuestion && aboutProduct) {
+  if (textQuestion && (aboutProduct || state.pendingChoice)) {
     const classified = await classifyOpenQuestion(p, state);
     if (classified && classified.type !== "none" && (classified.query || classified.productIds.length)) {
       await respondToCatalogQuestion(p, state, {
@@ -853,6 +920,35 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     interpreted = null;
   }
   if (interpreted?.paymentMethod) state.paymentHint = undefined;
+  // Mixed requests like "um hambúrguer e um refrigerante" are incomplete
+  // until the customer chooses the beverage variant. Never silently accept
+  // the hamburger as the full order or invent a Coca-Cola size.
+  const generic = !review ? unresolvedChoice(p.text, state.catalog.products,
+    interpreted?.items.map(item => item.productId) || []) : null;
+  if (generic) {
+    const choices = new Set(generic.options.map(product => product.id));
+    let keep = interpreted || state.draft;
+    // Gemini may have guessed a variant from an unspecified category; retain
+    // previously confirmed items only.
+    const priorIds = new Set(state.draft.items.map(item => item.productId));
+    keep = { ...keep, items: keep.items.filter(item =>
+      !choices.has(item.productId) || priorIds.has(item.productId)) };
+    if (!keep.items.length && !state.draft.items.length) {
+      const components = p.text.split(/\s+e\s+/i);
+      const recovered = components.flatMap(piece => safeCatalogItems(piece, state.catalog))
+        .filter(item => !choices.has(item.productId));
+      if (recovered.length) keep = { ...keep, items: recovered };
+    }
+    state.draft = keep;
+    state.quote = undefined;
+    state.quoteExpiry = undefined;
+    state.pendingChoice = { topic: generic.topic, productIds: generic.options.map(product => product.id) };
+    const recapText = keep.items.length ? recap(keep, state.catalog) + "\n\n" : "";
+    await send(p, recapText + "Só falta escolher qual *" + generic.topic +
+      "* você prefere 😊 Temos: " + formatOptions(generic.options, currency) +
+      ". Qual deles eu adiciono ao pedido?");
+    return true;
+  }
   if (!interpreted) {
     const variantHelp = !isClearlySpecifiedVariant(catalogText, state.catalog.products);
     const currentQuestion = question(state.draft, state.catalog, state.paymentHint);
@@ -882,7 +978,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (!enabled || !geminiKey || !keys.length || !process.env.VERCEL_API_URL || !p.customerJid || !p.text) return false;
   const key = p.sessionId + ":" + p.customerJid;
-  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text)) return false;
+  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text)) return false;
   const prev = serialized.get(key) || Promise.resolve(false);
   const task = prev.catch(() => false).then(() => processMessage(p, key)).catch(async (error: any) => {
     p.logger.warn({ sessionId: p.sessionId, error: error?.message }, "[Chat-Order] Failed");
