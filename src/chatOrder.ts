@@ -12,7 +12,7 @@ type Catalog = { menuUrl: string; deliveryMode: string; neighborhoods?: string[]
   optionGroups?: Array<{ id: string; name: string; min: number; max: number; options: Array<{ id: string; name: string; price: number }> }>;
 }> };
 type ConversationTurn = { role: "user" | "assistant"; text: string };
-type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit"; pendingLearning?: AliasCandidate };
+type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit"; pendingLearning?: AliasCandidate; pendingSwap?: { fromId: string; toId: string } };
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
   sendMessage: (jid: string, data: { text: string }) => Promise<unknown>;
@@ -372,6 +372,33 @@ async function interpret(p: Params, state: State): Promise<Draft | null> {
     return null;
   } finally { clearTimeout(timer); }
 }
+function availabilityQuery(text: string): string | null {
+  const plain = norm(text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  // Questions about the live menu are not checkout fields or cart edits.
+  // Examples: "tem de bacon? se tiver quero trocar", "quero saber se tem de bacon".
+  const match = plain.match(/\b(?:tem|temos|teria|existe)\s+(?:(?:algum|alguma|opcao|opcoes|lanche|produto|sabor)\s+)?(?:(?:de|com|do|da|o|a|um|uma)\s+)?([a-z][a-z0-9 ]{2,60}?)(?=\s+(?:se\s+tiver|se\s+sim|quero\s+trocar|gostaria\s+de\s+trocar|pra\s+trocar|para\s+trocar|no\s+cardapio|disponivel|hoje|ai|por\s+favor)\b|$)/);
+  const query = match?.[1]?.trim() || "";
+  if (!query || query.split(" ").length > 5 ||
+      /^(?:como|que|pra|para|entrega|retirada|pedido|fazer|pagar|alterar|trocar)\b/.test(query)) return null;
+  return query;
+}
+
+function catalogSearch(query: string, catalog: Catalog) {
+  const tokens = query.split(" ").filter(Boolean);
+  const normalizeLabel = (name: string) => norm(name).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  const matches = catalog.products.filter(product => {
+    const name = " " + normalizeLabel(product.name) + " ";
+    return tokens.every(token => name.includes(" " + token + " "));
+  });
+  const optionMatches = catalog.products.filter(product =>
+    (product.optionGroups || []).some(group =>
+      group.options.some(option => {
+        const name = " " + normalizeLabel(option.name) + " ";
+        return tokens.every(token => name.includes(" " + token + " "));
+      })));
+  return { matches, optionMatches };
+}
+
 function question(d: Draft, catalog: Catalog, paymentHint?: "pix" | "credit") {
   if (!d.items.length) return "Claro! O que você gostaria de pedir? Pode mandar os produtos e quantidades juntos 😊";
   for (const item of d.items) {
@@ -449,6 +476,77 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   state.history = [...(state.history || []), { role: "user" as const, text: clean(p.text, 800) }].slice(-10);
   if (cancel(p.text)) { drafts.delete(key); await send(p, "Carrinho descartado. Nenhum pedido foi feito."); return true; }
   if (state.quote && state.quoteExpiry && Date.now() > state.quoteExpiry) state.quote = undefined;
+
+  const availability = availabilityQuery(p.text);
+  if (availability !== null) {
+    state.pendingSwap = undefined;
+    const { matches, optionMatches } = catalogSearch(availability, state.catalog);
+    const shown = matches.slice(0, 6);
+    if (shown.length === 1 && state.draft.items.length === 1 &&
+        shown[0].id !== state.draft.items[0].productId) {
+      const original = state.catalog.products.find(x => x.id === state!.draft.items[0].productId);
+      state.pendingSwap = { fromId: state.draft.items[0].productId, toId: shown[0].id };
+      await send(p, "Temos *" + shown[0].name + "* no cardápio! 😊 Quer trocar *" +
+        (state.draft.items[0].quantity > 1 ? state.draft.items[0].quantity + "x " : "") +
+        (original?.name || "o produto atual") + "* por *" + shown[0].name +
+        "*? Responda *SIM* para trocar ou *NÃO* para manter. Nenhuma alteração foi feita ainda.");
+    } else if (shown.length) {
+      await send(p, (shown.length === 1 ? "Temos sim: *" + shown[0].name + "*."
+        : "Temos estas opções no cardápio: " + shown.map(product => "*" + product.name + "*").join(", ") +
+          (matches.length > shown.length ? " e outras." : ".")) +
+        "\nSeu pedido continua igual. Se quiser trocar, me diga exatamente qual produto sai e qual entra.");
+    } else if (optionMatches.length) {
+      await send(p, "Não encontrei um produto específico com *" + availability + "* no nome, mas há " +
+        "uma opção ou adicional assim em: " +
+        optionMatches.slice(0, 4).map(product => "*" + product.name + "*").join(", ") +
+        ". Seu pedido não foi alterado. Quer consultar as opções de algum desses produtos?");
+    } else {
+      await send(p, "Não encontrei produto com *" + availability +
+        "* entre os itens disponíveis do cardápio no momento. Seu pedido continua igual." +
+        (state.catalog.menuUrl ? "\nVocê pode conferir o cardápio: " + state.catalog.menuUrl : ""));
+    }
+    return true;
+  }
+
+  if (state.pendingSwap) {
+    const pending = state.pendingSwap;
+    if (yes(p.text)) {
+      state.pendingSwap = undefined;
+      const position = state.draft.items.findIndex(item => item.productId === pending.fromId);
+      const newProduct = state.catalog.products.find(product => product.id === pending.toId);
+      if (position < 0 || !newProduct) {
+        await send(p, "A opção mudou no cardápio ou no seu carrinho. Me diga qual produto quer trocar.");
+        return true;
+      }
+      state.draft.items = state.draft.items.map((item, i) =>
+        i === position ? { productId: newProduct.id, quantity: item.quantity, notes: "", selectedOptions: [] } : item);
+      state.quote = undefined;
+      const missing = question(state.draft, state.catalog, state.paymentHint);
+      if (missing) {
+        await send(p, "Pronto, troquei pelo *" + newProduct.name + "*. " +
+          "Confira o carrinho atualizado:\n" + recap(state.draft, state.catalog) + "\n\n" + missing);
+        return true;
+      }
+      try {
+        const preview = await requestBackend(p, "preview", { ...state.draft, phone: p.customerPhone });
+        state.quote = preview.quoteToken;
+        state.quoteExpiry = Number(preview.expires);
+        await send(p, "Troca anotada! 😊\n\n" + summary(state.draft, preview));
+      } catch (error: any) {
+        await send(p, "Troquei pelo *" + newProduct.name + "*, mas preciso conferir o total antes de confirmar: " +
+          clean(error?.message, 180) + ". Nenhum novo pedido foi criado.");
+      }
+      return true;
+    }
+    if (no(p.text) || /^(?:nao quero|deixa o mesmo|mantem|pode manter|melhor nao)[.!?\s]*$/.test(norm(p.text))) {
+      state.pendingSwap = undefined;
+      await send(p, "Certo, mantive o pedido como estava 😊 Nenhuma troca foi feita.");
+      return true;
+    }
+    // Other replies are normal input; don't let a much later "sim" swap an old item.
+    state.pendingSwap = undefined;
+  }
+
   if (state.quote && yes(p.text)) {
     try {
       const result = await requestBackend(p, "commit", { ...state.draft, phone: p.customerPhone, quoteToken: state.quote });
