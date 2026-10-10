@@ -61,6 +61,8 @@ test("explicit cart removals have priority over 'por favor' and catalog question
   assert.deepEqual(resolveCartAction("Não tire o pudim", products, lines), { kind: "keep" });
   assert.deepEqual(resolveCartAction("Não quero tirar o pudim", products, lines), { kind: "keep" });
   assert.deepEqual(resolveCartAction("Tem pudim no carrinho?", products, lines), { kind: "status", productId: ID_PUDIM });
+  assert.deepEqual(resolveCartAction("Tira o pudim que tem no carrinho", products, lines),
+    { kind: "remove", productId: ID_PUDIM, quantity: null });
   assert.deepEqual(resolveCartAction("E se eu tirar o pudim, quanto fica?", products, lines),
     { kind: "clarify", operation: "remove", choices: [] });
 });
