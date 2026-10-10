@@ -624,6 +624,10 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   }
   const cartAction = resolveCartAction(p.text, state.catalog.products, state.draft.items);
   if (cartAction) {
+    if (cartAction.kind === "keep") {
+      await send(p, "Certo, não retirei nenhum produto. Seu carrinho continua igual. 😊");
+      return true;
+    }
     if (cartAction.kind === "clarify") {
       await send(p, cartAction.choices.length
         ? "Só para não alterar o produto errado: você se refere a *" +
@@ -682,6 +686,8 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     return true;
   }
 
+  // A later unrelated reply must not reuse an outdated yes/no cart reference.
+  state.lastCartStatusProductId = undefined;
   const inquiry = readInquiry(p.text, state.lastCatalogInquiry);
   if (inquiry) {
     // A broad question like "tem sobremesa?" can be resolved using Gemini
