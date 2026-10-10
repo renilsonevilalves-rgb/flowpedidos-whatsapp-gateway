@@ -40,6 +40,9 @@ export function resolveCartAction(
     /\b(?:quero|deixa|faz|faca)\b.*\bsem\s+(?:o|a|os|as)\b/.test(text);
   if (!status && !removal) return null;
   if (!status && /\b(?:nao quero|nao precisa)\s+(?:que\s+)?(?:tirar|tire|retirar|retire|remover|remova)\b/.test(text)) return null;
+  // Conditional questions must not perform a real cart mutation.
+  if (!status && /\b(?:se eu|e se|se a gente|quanto ficaria|quanto fica se|quanto sai se)\b/.test(text))
+    return { kind: "clarify", operation: "remove", choices: [] };
   const operation: "status" | "remove" = status ? "status" : "remove";
 
   // Do not silently execute half of a request containing multiple types of cart edits.
