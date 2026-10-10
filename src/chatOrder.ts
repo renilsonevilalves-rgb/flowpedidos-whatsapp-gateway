@@ -1,17 +1,18 @@
 // src/chatOrder.ts
 import { randomUUID } from "node:crypto";
+import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
 
 type Item = { productId: string; quantity: number; notes?: string; selectedOptions?: Array<{ id: string; groupId: string; quantity: number }> };
 type Draft = {
   draftId: string; items: Item[]; name: string; deliveryType: string;
   address: string; number: string; neighborhood: string; complement: string; reference: string; paymentMethod: string;
 };
-type Catalog = { menuUrl: string; deliveryMode: string; neighborhoods?: string[]; products: Array<{
+type Catalog = { menuUrl: string; deliveryMode: string; neighborhoods?: string[]; learnedAliases?: LearnedAlias[]; products: Array<{
   id: string; name: string; price: number;
   optionGroups?: Array<{ id: string; name: string; min: number; max: number; options: Array<{ id: string; name: string; price: number }> }>;
 }> };
 type ConversationTurn = { role: "user" | "assistant"; text: string };
-type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit" };
+type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit"; pendingLearning?: AliasCandidate };
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
   sendMessage: (jid: string, data: { text: string }) => Promise<unknown>;
@@ -54,7 +55,7 @@ async function requestBackend(p: Params, action: string, data: Record<string, un
   let lastError = "Sistema temporariamente indisponível.";
   for (const key of keys) {
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 9000);
+    const timer = setTimeout(() => controller.abort(), action === "learn" ? 2500 : 9000);
     try {
       const response = await fetch(endpoint, {
         method: "POST", headers: { "Content-Type": "application/json", "X-API-Key": key },
@@ -77,7 +78,8 @@ function modelCatalog(c: Catalog) {
   return c.products.map((p) => {
     const groups = (p.optionGroups || []).map((g) => g.name + " [groupId=" + g.id + ", min=" + g.min + ", max=" + g.max + "]: " +
       g.options.map((o) => o.name + " [id=" + o.id + "]").join(", ")).join("; ");
-    return p.name + " [productId=" + p.id + ", R$" + p.price + "]" + (groups ? " | " + groups : "");
+    const aliases = (c.learnedAliases || []).filter(a => a.productId === p.id).slice(0, 8).map(a => a.alias);
+    return p.name + " [productId=" + p.id + ", R$" + p.price + "]" + (groups ? " | " + groups : "") + (aliases.length ? " | Apelidos aprovados: " + aliases.join(", ") : "");
   }).join("\n").slice(0, 48000);
 }
 
@@ -450,14 +452,30 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   if (state.quote && yes(p.text)) {
     try {
       const result = await requestBackend(p, "commit", { ...state.draft, phone: p.customerPhone, quoteToken: state.quote });
+      const learning = state.pendingLearning;
+      const finalItems = state.draft.items;
       drafts.delete(key);
-      await send(p, "✅ Pedido #" + result.orderNumber + " — " + currency(result.total) + "\n" + result.message +
+      await send(p, "✅ Pedido # + result.orderNumber + " — " + currency(result.total) + "\n" + result.message +
         (result.paymentUrl ? "\n\n🔒 Link para pagamento seguro:\n" + result.paymentUrl + "\n\nA loja recebe após a aprovação do pagamento." : ""));
+      if (learning && result.orderId && !result.paymentPending &&
+          finalItems.some(item => item.productId === learning.productId)) {
+        try {
+          await requestBackend(p, "learn", {
+            orderId: result.orderId, phone: p.customerPhone,
+            alias: learning.alias, productId: learning.productId,
+          });
+        } catch {
+          p.logger.warn({ sessionId: p.sessionId }, "[Chat-Learning] Feedback skipped; checkout unaffected");
+        }
+      }
     } catch (e: any) { state.quote = undefined; await send(p, "Não consegui confirmar se o pedido foi registrado. Para evitar duplicidade, diga *revisar* e confirme o mesmo carrinho novamente. Se houver dúvida, consulte a loja.\n" + clean(e?.message, 200)); }
     return true;
   }
   if (state.quote && no(p.text)) { state.quote = undefined; await send(p, "Certo, não confirmei. O que quer mudar?"); return true; }
   state.quote = undefined;
+  const correction = explicitProductCorrection(p.text, state.catalog.products);
+  if (correction) state.pendingLearning = correction;
+  const normalizedInput = applyApprovedAliases(p.text, state.catalog.learnedAliases, state.catalog.products);
   const review = /^(revisar|conferir|resumo)[.!?\s]*$/i.test(norm(p.text));
   const incoming = norm(p.text);
   if (/^(pix|pixe|piks|pix por favor)$/.test(incoming)) state.paymentHint = "pix";
@@ -471,7 +489,10 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     /\b(?:quero|queria|tambem|outro|outra|adiciona|adicionar|acrescenta|acrescentar|inclui|incluir|tira|tirar|retira|retirar|remove|remover|troca|trocar|substitui|substituir|muda|mudar|mais um|mais uma|coloca|colocar|sem)\b/.test(incoming);
   // Fast and reliable for simple catalog orders: no unnecessary AI network wait.
   // Advanced modifiers and ambiguous products are still delegated to Gemini.
-  const catalogItems = (firstTurn || !state.draft.items.length) ? safeCatalogItems(p.text, state.catalog) : [];
+  const catalogText = correction && !state.draft.items.length
+    ? "quero um " + (state.catalog.products.find(product => product.id === correction.productId)?.name || "")
+    : normalizedInput;
+  const catalogItems = (firstTurn || !state.draft.items.length) ? safeCatalogItems(catalogText, state.catalog) : [];
   const fastDraft = catalogItems.length ? { ...state.draft, items: catalogItems } : null;
   const fastWithFields = fastDraft ? safeFieldUpdate(p.text, { ...state, draft: fastDraft }) || fastDraft : null;
   const fieldDraft = !firstTurn ? safeFieldUpdate(p.text, state) : null;
@@ -482,20 +503,20 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   let interpreted: Draft | null = review ? state.draft :
     (paymentDraft || (!mixedIntent && !cartEdit ? (fastWithFields || fieldDraft) : null));
   if (!interpreted) interpreted = await interpret(p, state);
-  if (!interpreted && !cartEdit) interpreted = fastWithFields || fieldDraft;
+  if (!interpreted && (!cartEdit || correction)) interpreted = fastWithFields || fieldDraft;
   // Never let an incomplete LLM response silently wipe an existing cart.
   if (interpreted && state.draft.items.length && !interpreted.items.length &&
       !/\b(?:limpar carrinho|tirar tudo|remover tudo|nao quero mais nada)\b/.test(incoming)) {
     interpreted = { ...interpreted, items: state.draft.items };
   }
   // Only explicitly distinguished catalog variants are eligible for checkout.
-  if (interpreted?.items.length && !isClearlySpecifiedVariant(p.text, state.catalog.products) &&
+  if (interpreted?.items.length && !isClearlySpecifiedVariant(catalogText, state.catalog.products) &&
       (firstTurn || cartEdit || !state.draft.items.length)) {
     interpreted = null;
   }
   if (interpreted?.paymentMethod) state.paymentHint = undefined;
   if (!interpreted) {
-    const variantHelp = !isClearlySpecifiedVariant(p.text, state.catalog.products);
+    const variantHelp = !isClearlySpecifiedVariant(catalogText, state.catalog.products);
     const currentQuestion = question(state.draft, state.catalog, state.paymentHint);
     await send(p, variantHelp ? "Temos opções parecidas no cardápio. Me diga o *tamanho ou sabor exato* para eu não escolher errado 😊"
       : cartEdit ? "Quero acertar a alteração! Pode me dizer *qual produto, quantidade e o que deseja mudar*?"
