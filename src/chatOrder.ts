@@ -760,6 +760,8 @@ async function handlePendingFieldEdit(p: Params, state: State, field: EditableFi
 }
 async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
   let previewRequested = false; // at most one validated backend price query per message
+  let verifiedPreview: any = null;
+  const cartChanges: string[] = [];
   // The model has no direct access to APIs. Every tool is validated and scoped
   // to this already authorized tenant and WhatsApp customer.
   const safeCart = () => ({
@@ -892,6 +894,16 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         }
         state.quote = undefined; state.quoteExpiry = undefined;
         state.quoteNeedsReview = true;
+        verifiedPreview = null;
+        const current = state.draft.items.filter(item => item.productId === productId)
+          .reduce((sum, item) => sum + item.quantity, 0);
+        const countText = quantity + (quantity === 1 ? " unidade" : " unidades");
+        cartChanges.push(operation === "remove"
+          ? "✅ Retirei " + countText + " de *" + product.name + "*." +
+            (current ? " Restam " + current + " no pedido." : " Esse produto saiu do carrinho.")
+          : operation === "add"
+            ? "✅ Adicionei " + countText + " de *" + product.name + "*."
+            : "✅ Atualizei *" + product.name + "* para " + current + (current === 1 ? " unidade." : " unidades."));
         return { ok: true, mutated: true, cart: safeCart() };
       }
       if (tool === "update_checkout") {
@@ -956,13 +968,50 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
           const preview = await requestBackend(p, "preview", { ...state.draft, phone: p.customerPhone });
           state.quote = preview.quoteToken; state.quoteExpiry = Number(preview.expires);
           state.quoteNeedsReview = false;
+          verifiedPreview = preview;
           return { ok: true, finalReply: summary(state.draft, preview), total: preview.total };
         } catch { return { ok: false, error: "Não consegui validar o valor final agora. Nenhum pedido foi criado." }; }
       }
       return { ok: false, error: "Ferramenta desconhecida" };
     },
   });
-  if (!agent) return false;
+  if (!agent && !cartChanges.length) return false;
+  // Cart changes must get a deterministic, factual acknowledgment even if
+  // Gemini's second response times out or the provider returns HTTP 429.
+  // This uses exactly one official backend quote, never an LLM-estimated price.
+  if (cartChanges.length) {
+    const label = cartChanges.join("\n");
+    const missing = question(state.draft, state.catalog, state.paymentHint);
+    if (missing) {
+      await send(p, label + "\n\n" + missing);
+      return true;
+    }
+    if (state.draft.deliveryType === "delivery" && norm(state.catalog.deliveryMode) !== "neighborhood") {
+      await send(p, label + "\nPara consultar a entrega por distância, use: " + state.catalog.menuUrl);
+      return true;
+    }
+    let current = verifiedPreview;
+    if (!current && !previewRequested) {
+      try {
+        previewRequested = true;
+        current = await requestBackend(p, "preview", { ...state.draft, phone: p.customerPhone });
+        state.quote = current.quoteToken;
+        state.quoteExpiry = Number(current.expires);
+        state.quoteNeedsReview = false;
+      } catch (error: any) {
+        p.logger.warn({ sessionId: p.sessionId, reason: clean(error?.message, 80) },
+          "[Chat-Coordinator] Updated cart but quote unavailable");
+      }
+    }
+    if (!current || !state.quote) {
+      await send(p, label + "\n\nNão consegui conferir o novo total agora. " +
+        "Seu carrinho foi atualizado, mas o pedido ainda não foi confirmado. Digite *revisar* para tentar novamente.");
+      return true;
+    }
+    await send(p, label + "\n\n💰 Novo total: *" + currency(current.total) +
+      "*\n\nEstá tudo certo? Responda *SIM* para confirmar ou diga o que deseja alterar.");
+    return true;
+  }
   // Pending edit takes priority on the next turn. If the model asked for a
   // correction but did not invoke a tool, existing deterministic flows apply.
   if (agent.reply) {
