@@ -850,13 +850,31 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
           return { ok: false, error: "Há vários produtos no carrinho. Pergunte qual deles deve ser alterado." };
         }
         if (operation === "add") {
-          if (product.optionGroups?.some(group => group.min > 0)) {
-            return { ok: false, error: "Produto precisa de escolha obrigatória de opções: " +
-              product.optionGroups.filter(group => group.min > 0).map(group => group.name).join(", ") };
+          const requestedOptions = Array.isArray(args.selectedOptions) ? args.selectedOptions : [];
+          if (requestedOptions.length > 30)
+            return { ok: false, error: "Excesso de adicionais; preciso revisar o pedido." };
+          const selectedOptions: NonNullable<Item["selectedOptions"]> = [];
+          for (const requested of requestedOptions) {
+            const group = product.optionGroups?.find(group => group.id === String(requested?.groupId || ""));
+            const option = group?.options.find(option => option.id === String(requested?.id || ""));
+            const count = Number(requested?.quantity);
+            if (!group || !option || !Number.isSafeInteger(count) || count < 1 || count > 20)
+              return { ok: false, error: "Adicional inválido. Selecione uma opção disponível no cardápio." };
+            if (!norm(p.text).includes(norm(option.name)))
+              return { ok: false, error: "Confirme o adicional pelo nome; não posso escolher por conta própria." };
+            selectedOptions.push({ groupId: group.id, id: option.id, quantity: count });
+          }
+          for (const group of product.optionGroups || []) {
+            const groupCount = selectedOptions.filter(option => option.groupId === group.id)
+              .reduce((sum, option) => sum + option.quantity, 0);
+            if (groupCount < Number(group.min || 0) || groupCount > Number(group.max || 0)) {
+              return { ok: false, error: "Escolha as opções obrigatórias do grupo " + group.name +
+                " (" + group.min + " a " + group.max + ")." };
+            }
           }
           const requestedNotes = clean(args.notes, 180);
           const notes = requestedNotes && norm(p.text).includes(norm(requestedNotes)) ? requestedNotes : "";
-          if (!addItemsToDraft(state, [{ productId, quantity, notes, selectedOptions: [] }]))
+          if (!addItemsToDraft(state, [{ productId, quantity, notes, selectedOptions }]))
             return { ok: false, error: "Limite do carrinho ou produto ambíguo." };
         } else {
           if (!total) return { ok: false, error: "Produto não está no carrinho." };
