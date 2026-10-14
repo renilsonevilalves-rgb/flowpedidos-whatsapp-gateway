@@ -6,6 +6,7 @@ import {tmpdir} from "node:os";
 import {join} from "node:path";
 
 process.env.API_KEY="field-tests-strong-key";
+process.env.WHATSAPP_RECEIPT_DIR = join(tmpdir(), "wa-receipt-unit-tests-" + process.pid);
 process.env.GEMINI_API_KEY="field-tests-gemini";
 process.env.VERCEL_API_URL="https://backend.test";
 process.env.GEMINI_MODEL="test-model";
