@@ -17,6 +17,7 @@ const hook = [
   "      const chatHandled = await handleChatOrderMessage({",
   "        sessionId: id, customerJid: chatCustomerJid, customerPhone: chatCustomerPhone, text,",
   "        sendMessage: async (jid, content) => { await sock.sendMessage(jid, content); },",
+  "        getStoreInfo: () => fetchStoreInfo(id, true),",
   "        logger,",
   "      });",
   "      if (chatHandled) continue;",
