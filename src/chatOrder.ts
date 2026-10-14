@@ -837,10 +837,17 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         const said = norm(p.text);
         const productName = norm(product.name);
         const nameParts = productName.split(" ").filter(part => part.length > 2);
+        const samePrefix = state.catalog.products.filter(other =>
+          norm(other.name).split(" ").slice(0, 2).join(" ") === nameParts.slice(0, 2).join(" "));
         const explicitlyMentioned = said.includes(productName) ||
-          (nameParts.length >= 2 && said.includes(nameParts.slice(0, 2).join(" ")));
+          (nameParts.length >= 2 && samePrefix.length === 1 &&
+            said.includes(nameParts.slice(0, 2).join(" ")));
         if (operation === "add" && !explicitlyMentioned) {
-          return { ok: false, error: "Confirme o produto exato pelo nome antes de adicionar." };
+          return { ok: false, error: "Confirme o produto e a variante exatos pelo nome antes de adicionar." };
+        }
+        if (operation !== "add" && !explicitlyMentioned &&
+            state.draft.items.some(item => item.productId !== productId)) {
+          return { ok: false, error: "Há vários produtos no carrinho. Pergunte qual deles deve ser alterado." };
         }
         if (operation === "add") {
           if (product.optionGroups?.some(group => group.min > 0)) {
