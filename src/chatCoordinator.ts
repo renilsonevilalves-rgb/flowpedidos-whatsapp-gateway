@@ -42,6 +42,8 @@ const declarations = [
     parameters: { type: "OBJECT", properties: {} } },
 ];
 
+// Temporary provider outages should not cause a storm of repeated requests.
+let geminiUnavailableUntil = 0;
 const instructions = [
   "Você é o coordenador central de um atendente de delivery no WhatsApp brasileiro.",
   "Converse naturalmente; compreenda correções, mensagens curtas, pedidos em várias etapas, erros de digitação e contexto.",
@@ -61,6 +63,9 @@ const instructions = [
 ].join("\n");
 
 async function invoke(params: AgentParams, contents: unknown[]): Promise<any> {
+  // Circuit breaker: fall through to the verified legacy flow while the
+  // provider is rate limited, instead of re-querying on every customer turn.
+  if (Date.now() < geminiUnavailableUntil) return null;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8500);
   try {
@@ -80,12 +85,22 @@ async function invoke(params: AgentParams, contents: unknown[]): Promise<any> {
       }),
     });
     if (!response.ok) {
+      if (response.status === 429 || response.status === 503) {
+        const retrySeconds = Number(response.headers.get("retry-after"));
+        const recommended = Number.isFinite(retrySeconds) && retrySeconds > 0
+          ? Math.min(90_000, retrySeconds * 1000)
+          : response.status === 429 ? 30_000 : 12_000;
+        geminiUnavailableUntil = Math.max(geminiUnavailableUntil, Date.now() + recommended);
+      }
       params.log.warn({ sessionId: params.sessionId, status: response.status },
         "[Chat-Coordinator] Gemini service unavailable");
       return null;
     }
     return response.json().catch(() => null);
   } catch (error: any) {
+    if (error?.name === "AbortError") {
+      geminiUnavailableUntil = Math.max(geminiUnavailableUntil, Date.now() + 3000);
+    }
     params.log.warn({ sessionId: params.sessionId,
       reason: error?.name === "AbortError" ? "timeout" : "request" },
     "[Chat-Coordinator] Gemini request failed");
