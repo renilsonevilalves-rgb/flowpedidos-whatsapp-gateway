@@ -51,6 +51,27 @@ function canUseCentralAgent(sessionId: string): boolean {
 const serialized = new Map<string, Promise<boolean>>();
 const clean = (v: unknown, max = 240) => String(v || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max);
 const norm = (v: unknown) => clean(v, 2000).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+// Bound typo tolerance to one character and never guess between product variants.
+function nearWord(a: string, b: string): boolean {
+  if (a === b) return true;
+  if (Math.min(a.length, b.length) < 4 || Math.abs(a.length - b.length) > 1) return false;
+  let i = 0, j = 0, edits = 0;
+  while (i < a.length && j < b.length) {
+    if (a[i] === b[j]) { i++; j++; continue; }
+    if (++edits > 1) return false;
+    if (a.length > b.length) i++;
+    else if (b.length > a.length) j++;
+    else { i++; j++; }
+  }
+  return edits + Number(i < a.length || j < b.length) <= 1;
+}
+const meaningfulWords = (value: string) =>
+  norm(value).split(/[^a-z0-9]+/).filter(word => word.length >= 3);
+function groundedProductMention(message: string, productName: string): boolean {
+  const said = meaningfulWords(message);
+  const name = meaningfulWords(productName);
+  return name.length > 0 && name.every(word => said.some(token => nearWord(token, word)));
+}
 const currency = (n: number) => new Intl.NumberFormat("pt-BR", { style: "currency", currency: "BRL" }).format(n);
 const yes = (t: string) => /^(sim|simm+|confirmo|confirmado|pode confirmar|pode fechar|pode mandar|isso mesmo|ta certinho|tudo certo|tudo certinho|ok|fechado)[.!?\s]*$/i.test(norm(t));
 const no = (t: string) => /^(nao|quero mudar|alterar|corrigir)[.!?\s]*$/i.test(norm(t));
@@ -784,6 +805,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
     snapshot: {
       storeName: state.catalog.storeName || "",
       cart: safeCart(),
+      pendingEdit: state.pendingEdit || null,
       menuUrl: state.catalog.menuUrl,
       products: state.catalog.products.slice(0, 120).map(item => ({
         id: item.id, name: item.name, price: item.price, category: item.category,
@@ -796,9 +818,14 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         if (!query || query.length < 2) return { ok: false, error: "Qual produto deseja procurar?" };
         const words = query.split(/\s+/).filter(word => word.length > 2).slice(0, 7);
         if (!words.length) return { ok: false, error: "Informe o nome de um produto" };
-        const matched = state.catalog.products.filter(product => {
+        const exact = state.catalog.products.filter(product => {
           const full = norm(product.name + " " + (product.category || "") + " " + (product.description || ""));
           return words.every(word => full.includes(word));
+        }).slice(0, 12);
+        // Typo recovery is local to the already fetched tenant catalog: no DB or LLM retry.
+        const matched = exact.length ? exact : state.catalog.products.filter(product => {
+          const available = meaningfulWords(product.name + " " + (product.category || ""));
+          return words.every(word => available.some(token => nearWord(word, token)));
         }).slice(0, 12);
         return { ok: true, products: matched.map(product => ({
           id: product.id, name: product.name, price: product.price, description: product.description,
@@ -847,7 +874,11 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         const explicitlyMentioned = said.includes(productName) ||
           (nameParts.length >= 2 && samePrefix.length === 1 &&
             said.includes(nameParts.slice(0, 2).join(" ")));
-        if (operation === "add" && !explicitlyMentioned) {
+        const typoCandidates = !explicitlyMentioned && operation === "add"
+          ? state.catalog.products.filter(other => groundedProductMention(p.text, other.name))
+          : [];
+        const uniqueTypo = typoCandidates.length === 1 && typoCandidates[0].id === productId;
+        if (operation === "add" && !explicitlyMentioned && !uniqueTypo) {
           return { ok: false, error: "Confirme o produto e a variante exatos pelo nome antes de adicionar." };
         }
         if (operation !== "add" && !explicitlyMentioned &&
@@ -1107,6 +1138,17 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   }
 
   const normalizedTurn = norm(p.text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  // Pilot first: let Gemini interpret combined edits, corrections and replies.
+  // If unavailable, all existing deterministic field/checkout guards still run.
+  // Central Gemini tool orchestration replaces rigid routing for pilot stores;
+  // the proven legacy path remains as a fail-closed fallback when unavailable.
+  // Signed checkout confirmation must take precedence over Gemini routing.
+  // Never let the model reinterpret a customer's explicit SIM/NAO while a
+  // validated preview is pending; legacy commit remains the sole authority.
+  if (canUseCentralAgent(p.sessionId) &&
+      !(state.quote && (yes(p.text) || no(p.text))) &&
+      await centralAgentMessage(p, state)) return true;
+
   // Gemini decides WHICH existing checkout field the customer is editing.
   // Deterministic validators control WHAT can be written. Other fields and
   // the cart remain untouched. This precedes generic checkout/Cart regexes.
@@ -1138,15 +1180,6 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     });
     if (decision) return handlePendingFieldEdit(p, state, decision.field, decision.value);
   }
-
-  // Central Gemini tool orchestration replaces rigid routing for pilot stores;
-  // the proven legacy path remains as a fail-closed fallback when unavailable.
-  // Signed checkout confirmation must take precedence over Gemini routing.
-  // Never let the model reinterpret a customer's explicit SIM/NAO while a
-  // validated preview is pending; legacy commit remains the sole authority.
-  if (canUseCentralAgent(p.sessionId) &&
-      !(state.quote && (yes(p.text) || no(p.text))) &&
-      await centralAgentMessage(p, state)) return true;
 
   const promotionFollowup = /^(?:nenhum|nenhuma|nenhum mesmo|nenhuma mesmo|serio|tem certeza|nenhum ai|nao tem nenhum|nem um)$/.test(normalizedTurn);
   if (isPromotionQuestion(p.text) || (promotionFollowup && state.lastPromotion &&
