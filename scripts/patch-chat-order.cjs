@@ -44,5 +44,21 @@ if (storeInfoBlock.includes(oldPayload)) storeInfoBlock = storeInfoBlock.replace
 if (!storeInfoBlock.includes(newPayload)) throw new Error("Chat order: store-info payload not found");
 source = source.slice(0, startStoreInfo) + storeInfoBlock + source.slice(endStoreInfo);
 
+// Recover committed-order receipts after a gateway restart/WhatsApp reconnect.
+// The receipt outbox never retries payment or backend commit.
+const outboxImport = 'import { drainOrderReceipts } from "./chatReceiptOutbox.js";';
+if (!source.includes(outboxImport)) {
+  const importAnchor = 'import { handleChatOrderMessage } from "./chatOrder.js";';
+  if (!source.includes(importAnchor)) throw new Error("Receipt recovery: chat handler import missing");
+  source = source.replace(importAnchor, importAnchor + "\n" + outboxImport);
+}
+const connectionAnchor = '        logger.info({ sessionId: id, phone: session.phone }, "WhatsApp connected");';
+if (!source.includes("void drainOrderReceipts(id,")) {
+  if (!source.includes(connectionAnchor)) throw new Error("Receipt recovery: WhatsApp connected hook missing");
+  source = source.replace(connectionAnchor, connectionAnchor + "\n" +
+    '        void drainOrderReceipts(id, async (jid, data) => { await sock.sendMessage(jid, data); }, logger)' +
+    '.catch(() => logger.warn({ sessionId: id }, "[Chat-Receipt] Recovery scan failed"));');
+}
+
 writeFileSync(path, source, "utf8");
 console.log("Gemini chat checkout handler integrated (disabled unless explicitly enabled).");
