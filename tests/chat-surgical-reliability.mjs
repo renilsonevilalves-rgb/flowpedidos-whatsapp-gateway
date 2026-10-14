@@ -6,6 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.API_KEY = "wa-surgical-validation-key";
+process.env.CHAT_RECEIPTS_DIR = join(tmpdir(), "wa-receipts-test-" + process.pid);
 process.env.GEMINI_API_KEY = "wa-test-gemini-key";
 process.env.GEMINI_MODEL = "test-gemini";
 process.env.VERCEL_API_URL = "https://backend.test";
