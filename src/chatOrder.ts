@@ -684,7 +684,10 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   let state = drafts.get(key);
   if (state && Date.now() - state.updatedAt > 20 * 60_000) { drafts.delete(key); state = undefined; }
   let firstTurn = !state;
-  if (!state && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) return false;
+  if (!state && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) {
+    const saved = await loadChatSession(p.sessionId, p.customerJid);
+    if (!saved.draft?.items?.length) return false;
+  }
   if (!/^55[1-9]{2}\d{8,9}$/.test(String(p.customerPhone || ""))) {
     if (state) { await send(p, "Não consegui identificar seu telefone. Fale com a loja."); return true; }
     return false;
@@ -804,6 +807,28 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
       await acknowledgeCartEdit(p, state, "Anotei " + parsedChoice[0].quantity + "x *" + (chosen?.name || "produto") + "*!");
       return true;
     }
+  }
+
+  // Re-quote the real cart instead of making Gemini guess a total based on
+  // stale catalog prices or claiming the full amount cannot be calculated.
+  if (state.draft.items.length &&
+      /\b(?:qual (?:o )?total|valor (?:total|do (?:meu )?pedido)|quanto (?:ficou|fica|deu|sai) (?:o |meu |esse )?pedido)\b/.test(normalizedTurn)) {
+    const missing = question(state.draft, state.catalog, state.paymentHint);
+    if (missing) {
+      await send(p, "Para calcular o total corretamente, " + missing);
+      return true;
+    }
+    try {
+      const preview = await requestBackend(p, "preview", { ...state.draft, phone: p.customerPhone });
+      state.quote = preview.quoteToken;
+      state.quoteExpiry = Number(preview.expires);
+      state.quoteNeedsReview = false;
+      await send(p, summary(state.draft, preview));
+    } catch (error: any) {
+      await send(p, "Não consegui conferir o total neste momento: " + clean(error?.message, 170) +
+        ". Nenhum pedido foi confirmado.");
+    }
+    return true;
   }
 
   // Execute explicit cart removals and status checks BEFORE generic catalog questions
@@ -1116,7 +1141,13 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (!enabled || !geminiKey || !keys.length || !process.env.VERCEL_API_URL || !p.customerJid || !p.text) return false;
   const key = p.sessionId + ":" + p.customerJid;
-  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) return false;
+  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) {
+    // Persisted cart recovery must also work after a restart when the next
+    // customer message is a short reply such as "SIM", "retirada" or a name.
+    if (concernsExistingOrder(p.text)) return false;
+    const saved = await loadChatSession(p.sessionId, p.customerJid);
+    if (!saved.draft?.items?.length) return false;
+  }
   const prev = serialized.get(key) || Promise.resolve(false);
   const task = prev.catch(() => false).then(() => processMessage(p, key)).catch(async (error: any) => {
     p.logger.warn({ sessionId: p.sessionId, error: error?.message }, "[Chat-Order] Failed");
