@@ -1012,6 +1012,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
       "*\n\nEstá tudo certo? Responda *SIM* para confirmar ou diga o que deseja alterar.");
     return true;
   }
+  if (!agent) return false;
   // Pending edit takes priority on the next turn. If the model asked for a
   // correction but did not invoke a tool, existing deterministic flows apply.
   if (agent.reply) {
