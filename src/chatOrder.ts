@@ -794,7 +794,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   state.lastCartStatusProductId = undefined;
   // Store-service questions are answered by Gemini using verified, tenant-scoped data.
   // Product-name queries still use deterministic catalog matching below.
-  const smallTalk = /^(?:obrigado|obrigada|obg|valeu|show|legal|bacana|entendi|beleza|perfeito|otimo|bom dia|boa tarde|boa noite|oi|ola)[.!?\\s]*$/.test(normalizedTurn);
+  const smallTalk = /^(?:obrigado|obrigada|obg|valeu|show|legal|bacana|entendi|beleza|perfeito|otimo|bom dia|boa tarde|boa noite|oi|ola)[.!?\s]*$/.test(normalizedTurn);
   if (smallTalk) return answerContextualQuestion(p, state);
   const serviceQuery = /\b(?:horario|horas|aberto|aberta|abre|fecha|funcionamento|endereco|localizacao|onde fica|taxa|frete|entrega|entregam|bairro|aceita|aceitam|pagamento|pix|cartao|dinheiro|troco|recomenda|indica|sugestao|ajuda|ingredientes|ingrediente|alergia|alergico)\b/.test(normalizedTurn);
   if (isStoreQuestion(p.text) && (serviceQuery || !readInquiry(p.text))) {
