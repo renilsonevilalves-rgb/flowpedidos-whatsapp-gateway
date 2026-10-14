@@ -12,6 +12,7 @@ process.env.GEMINI_API_KEY = "test-agent-model";
 process.env.GEMINI_MODEL = "test-gemini";
 process.env.VERCEL_API_URL = "https://backend.test";
 process.env.API_KEY = "test-backend";
+process.env.CHAT_RECEIPTS_DIR = join(tmpdir(), "wa-receipts-test-" + process.pid);
 
 const { runChatCoordinator } = await import("../dist/chatCoordinator.js");
 const { handleChatOrderMessage } = await import("../dist/chatOrder.js");
