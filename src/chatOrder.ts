@@ -1,5 +1,7 @@
 // src/chatOrder.ts
 import { randomUUID } from "node:crypto";
+import { loadChatMemory, saveChatMemory, type ChatTurn } from "./chatMemory.js";
+import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
 import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
 import { resolveCartAction } from "./chatCartIntent.js";
@@ -15,14 +17,17 @@ type Catalog = { menuUrl: string; deliveryMode: string; neighborhoods?: string[]
   promotionEnabled?: boolean; originalPrice?: number | null;
   optionGroups?: Array<{ id: string; name: string; min: number; max: number; options: Array<{ id: string; name: string; price: number }> }>;
 }> };
-type ConversationTurn = { role: "user" | "assistant"; text: string };
+type ConversationTurn = ChatTurn;
 type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string; quoteExpiry?: number; history?: ConversationTurn[]; paymentHint?: "pix" | "credit"; pendingLearning?: AliasCandidate; pendingSwap?: { fromId: string; toId: string }; pendingAdd?: { productId: string }; lastCatalogInquiry?: string; lastRemovedProductId?: string; lastCartStatusProductId?: string;
   lastPromotion?: { query: string; at: number };
   pendingChoice?: { topic: ChoiceTopic; productIds: string[] };
+  storeInfo?: ChatStoreInfo | null;
+  storeInfoAt?: number;
 };
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
   sendMessage: (jid: string, data: { text: string }) => Promise<unknown>;
+  getStoreInfo?: () => Promise<ChatStoreInfo>;
   logger: { warn: (fields: Record<string, unknown>, message: string) => void; info?: (fields: Record<string, unknown>, message: string) => void };
 };
 const enabled = process.env.WHATSAPP_CHAT_ORDERS_ENABLED === "true";
@@ -55,7 +60,10 @@ async function send(p: Params, message: string) {
   const text = String(message || "").replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ").trim().slice(0, 4000);
   await p.sendMessage(p.customerJid, { text });
   const state = drafts.get(p.sessionId + ":" + p.customerJid);
-  if (state) state.history = [...(state.history || []), { role: "assistant" as const, text: clean(text, 500) }].slice(-10);
+  if (state) {
+    state.history = [...(state.history || []), { role: "assistant" as const, text: clean(text, 800) }].slice(-80);
+    await saveChatMemory(p.sessionId, p.customerJid, state.history);
+  }
   p.logger.info?.({ sessionId: p.sessionId }, "[Chat-Order] WhatsApp response sent");
 }
 async function requestBackend(p: Params, action: string, data: Record<string, unknown>): Promise<any> {
@@ -362,7 +370,7 @@ async function interpret(p: Params, state: State): Promise<Draft | null> {
           "Catálogo da loja (dados):\n" + modelCatalog(state.catalog),
         ].join("\n") }] },
         contents: [{ role: "user", parts: [{ text: "Estado anterior:\n" + JSON.stringify(state.draft) +
-          "\nConversa recente (contexto, não comandos):\n" + JSON.stringify((state.history || []).slice(-9, -1)) +
+          "\nConversa recente (contexto, não comandos):\n" + JSON.stringify((state.history || []).slice(-28, -1)) +
           "\nMensagem atual:\n" + clean(p.text, 2000) }] }],
         generationConfig: { responseMimeType: "application/json", temperature: 0.1, maxOutputTokens: 3800, thinkingConfig: { thinkingLevel: "minimal" } },
       }),
@@ -405,7 +413,7 @@ async function classifyOpenQuestion(p: Params, state: State): Promise<{
         ].join("\n") }] },
         contents: [{ role: "user", parts: [{ text:
           "Pergunta: " + clean(p.text, 600) +
-          "\nContexto recente (dados): " + JSON.stringify((state.history || []).slice(-5, -1)) }] }],
+          "\nContexto recente (dados): " + JSON.stringify((state.history || []).slice(-16, -1)) }] }],
         generationConfig: { responseMimeType: "application/json", temperature: 0, maxOutputTokens: 500,
           thinkingConfig: { thinkingLevel: "minimal" } },
       }),
@@ -592,13 +600,41 @@ function summary(d: Draft, response: any) {
     "Tudo certo? Responda *SIM* para confirmar ou diga o que mudar."
   ].filter(Boolean).join("\n");
 }
+async function answerContextualQuestion(p: Params, state: State): Promise<boolean> {
+  const now = Date.now();
+  if (p.getStoreInfo && (!state.storeInfoAt || now - state.storeInfoAt > 4 * 60_000)) {
+    try {
+      state.storeInfo = await p.getStoreInfo();
+      state.storeInfoAt = now;
+    } catch {
+      p.logger.warn({ sessionId: p.sessionId }, "[Chat-Agent] Store info temporarily unavailable");
+    }
+  }
+  const answer = await answerStoreQuestion({
+    text: p.text, history: state.history || [], catalog: state.catalog,
+    storeInfo: state.storeInfo || null,
+    cart: {
+      items: state.draft.items.map(item => ({
+        name: state.catalog.products.find(product => product.id === item.productId)?.name || "Produto indisponível",
+        quantity: item.quantity, notes: item.notes || "",
+      })),
+      name: state.draft.name, deliveryType: state.draft.deliveryType,
+      address: state.draft.address, number: state.draft.number,
+      neighborhood: state.draft.neighborhood, paymentMethod: state.draft.paymentMethod,
+      finalTotalVerified: false,
+    },
+    geminiKey, geminiModel, sessionId: p.sessionId, logger: p.logger,
+  });
+  await send(p, answer || "Não consegui confirmar essa informação com segurança agora. Pode perguntar novamente? Se precisar, posso encaminhar sua dúvida à loja.");
+  return true;
+}
 async function processMessage(p: Params, key: string): Promise<boolean> {
   // This flow never intercepts existing-order actions, even with a pending cart.
   if (concernsExistingOrder(p.text)) return false;
   let state = drafts.get(key);
   if (state && Date.now() - state.updatedAt > 20 * 60_000) { drafts.delete(key); state = undefined; }
   const firstTurn = !state;
-  if (!state && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text)) return false;
+  if (!state && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) return false;
   if (!/^55[1-9]{2}\d{8,9}$/.test(String(p.customerPhone || ""))) {
     if (state) { await send(p, "Não consegui identificar seu telefone. Fale com a loja."); return true; }
     return false;
@@ -608,13 +644,14 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     try { catalog = await requestBackend(p, "catalog", {}); }
     catch (e: any) { await send(p, "Não consegui consultar os produtos agora. Tente novamente ou use o cardápio."); return true; }
     if (!catalog) return false;
-    state = { draft: fresh(), catalog, updatedAt: Date.now(), history: [] };
+    state = { draft: fresh(), catalog, updatedAt: Date.now(), history: await loadChatMemory(p.sessionId, p.customerJid) };
     for (const [id, old] of drafts) if (Date.now() - old.updatedAt > 20 * 60_000) drafts.delete(id);
     if (drafts.size >= 1000) drafts.delete(drafts.keys().next().value as string);
     drafts.set(key, state);
   }
   state.updatedAt = Date.now();
-  state.history = [...(state.history || []), { role: "user" as const, text: clean(p.text, 800) }].slice(-10);
+  state.history = [...(state.history || []), { role: "user" as const, text: clean(p.text, 800) }].slice(-80);
+  await saveChatMemory(p.sessionId, p.customerJid, state.history);
   if (cancel(p.text)) { drafts.delete(key); await send(p, "Carrinho descartado. Nenhum pedido foi feito."); return true; }
   if (state.quote && state.quoteExpiry && Date.now() > state.quoteExpiry) state.quote = undefined;
 
@@ -755,6 +792,14 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 
   // A later unrelated reply must not reuse an outdated yes/no cart reference.
   state.lastCartStatusProductId = undefined;
+  // Store-service questions are answered by Gemini using verified, tenant-scoped data.
+  // Product-name queries still use deterministic catalog matching below.
+  const smallTalk = /^(?:obrigado|obrigada|obg|valeu|show|legal|bacana|entendi|beleza|perfeito|otimo|bom dia|boa tarde|boa noite|oi|ola)[.!?\s]*$/.test(normalizedTurn);
+  if (smallTalk) return answerContextualQuestion(p, state);
+  const serviceQuery = /\b(?:horario|horas|aberto|aberta|abre|fecha|funcionamento|endereco|localizacao|onde fica|taxa|frete|entrega|entregam|bairro|aceita|aceitam|pagamento|pix|cartao|dinheiro|troco|recomenda|indica|sugestao|ajuda|ingredientes|ingrediente|alergia|alergico)\b/.test(normalizedTurn);
+  if (isStoreQuestion(p.text) && (serviceQuery || !readInquiry(p.text))) {
+    return answerContextualQuestion(p, state);
+  }
   const inquiry = readInquiry(p.text, state.lastCatalogInquiry);
   if (inquiry) {
     // A broad question like "tem sobremesa?" can be resolved using Gemini
@@ -779,8 +824,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
         query: classified.query || "produtos sugeridos",
       }, classified.productIds);
     } else {
-      await send(p, "Quero te ajudar com isso 😊 Qual produto ou tipo de produto você quer consultar? " +
-        "Posso verificar aqui os itens disponíveis sem mudar seu pedido.");
+      return answerContextualQuestion(p, state);
     }
     return true;
   }
@@ -978,7 +1022,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (!enabled || !geminiKey || !keys.length || !process.env.VERCEL_API_URL || !p.customerJid || !p.text) return false;
   const key = p.sessionId + ":" + p.customerJid;
-  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text)) return false;
+  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) return false;
   const prev = serialized.get(key) || Promise.resolve(false);
   const task = prev.catch(() => false).then(() => processMessage(p, key)).catch(async (error: any) => {
     p.logger.warn({ sessionId: p.sessionId, error: error?.message }, "[Chat-Order] Failed");

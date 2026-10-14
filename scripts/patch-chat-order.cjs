@@ -17,6 +17,7 @@ const hook = [
   "      const chatHandled = await handleChatOrderMessage({",
   "        sessionId: id, customerJid: chatCustomerJid, customerPhone: chatCustomerPhone, text,",
   "        sendMessage: async (jid, content) => { await sock.sendMessage(jid, content); },",
+  "        getStoreInfo: () => fetchStoreInfo(id, true),",
   "        logger,",
   "      });",
   "      if (chatHandled) continue;",
@@ -27,5 +28,21 @@ if (!source.includes("const chatHandled = await handleChatOrderMessage")) {
   if (!source.includes(anchor)) throw new Error("Chat order routing: incoming message anchor not found");
   source = source.replace(anchor, hook);
 }
+// All earlier prebuild patches rely on the original fetchStoreInfo signature.
+// Extend it only in the final chat-order patch, after privacy/session guards.
+const oldSignature = "async function fetchStoreInfo(sessionId: string) {";
+const newSignature = "async function fetchStoreInfo(sessionId: string, includeAiContext = false) {";
+if (source.includes(oldSignature)) source = source.replace(oldSignature, newSignature);
+if (!source.includes(newSignature)) throw new Error("Chat order: fetchStoreInfo signature not found");
+const startStoreInfo = source.indexOf(newSignature);
+const endStoreInfo = source.indexOf("\n\nfunction unwrapMessage", startStoreInfo);
+if (endStoreInfo < 0) throw new Error("Chat order: fetchStoreInfo ending not found");
+let storeInfoBlock = source.slice(startStoreInfo, endStoreInfo);
+const oldPayload = "body: JSON.stringify({ sessionId }),";
+const newPayload = "body: JSON.stringify({ sessionId, includeAiContext }),";
+if (storeInfoBlock.includes(oldPayload)) storeInfoBlock = storeInfoBlock.replace(oldPayload, newPayload);
+if (!storeInfoBlock.includes(newPayload)) throw new Error("Chat order: store-info payload not found");
+source = source.slice(0, startStoreInfo) + storeInfoBlock + source.slice(endStoreInfo);
+
 writeFileSync(path, source, "utf8");
 console.log("Gemini chat checkout handler integrated (disabled unless explicitly enabled).");
