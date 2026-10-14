@@ -126,6 +126,9 @@ export async function planFieldEdit(args: {
     const raw = payload?.candidates?.[0]?.content?.parts?.map((v: any) => v?.text || "").join("") || "";
     const parsed = JSON.parse(raw);
     if (!fieldNames.has(parsed?.field)) return backup;
+    // Explicit "número do endereço" cannot be reinterpreted as replacing
+    // the full address, regardless of the model response.
+    if (backup?.field === "number" && parsed.field !== "number") return backup;
     const field = parsed.field as EditableField;
     // The model chooses the target field, but unverified text is never applied
     // until it also passes our narrow field-specific validators.
