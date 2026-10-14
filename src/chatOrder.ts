@@ -637,7 +637,13 @@ function question(d: Draft, catalog: Catalog, paymentHint?: "pix" | "credit") {
 function recap(d: Draft, catalog: Catalog): string {
   const lines = d.items.slice(0, 8).map(item => {
     const product = catalog.products.find(p => p.id === item.productId);
-    return item.quantity + "x " + (product?.name || "Produto") + (item.notes ? " (" + item.notes + ")" : "");
+    const options = (item.selectedOptions || []).flatMap(selected =>
+      product?.optionGroups?.flatMap(group =>
+        group.options.filter(option => option.id === selected.id && group.id === selected.groupId)
+          .map(option => option.name.toLocaleLowerCase("pt-BR"))) || []);
+    return item.quantity + "x " + (product?.name || "Produto") +
+      (options.length ? " " + options.join(", ") : "") +
+      (item.notes ? " (" + item.notes + ")" : "");
   });
   return "Anotei seu pedido:\n" + lines.join("\n") + (d.items.length > 8 ? "\nE mais " + (d.items.length - 8) + " item(ns)." : "");
 }
@@ -762,6 +768,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
   let previewRequested = false; // at most one validated backend price query per message
   let verifiedPreview: any = null;
   const cartChanges: string[] = [];
+  let startedNewCart = false;
   // The model has no direct access to APIs. Every tool is validated and scoped
   // to this already authorized tenant and WhatsApp customer.
   const safeCart = () => ({
@@ -853,6 +860,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
           return { ok: false, error: "Há vários produtos no carrinho. Pergunte qual deles deve ser alterado." };
         }
         if (operation === "add") {
+          if (!state.draft.items.length) startedNewCart = true;
           const requestedOptions = Array.isArray(args.selectedOptions) ? args.selectedOptions : [];
           if (requestedOptions.length > 30)
             return { ok: false, error: "Excesso de adicionais; preciso revisar o pedido." };
@@ -983,7 +991,8 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
     const label = cartChanges.join("\n");
     const missing = question(state.draft, state.catalog, state.paymentHint);
     if (missing) {
-      await send(p, label + "\n\n" + missing);
+      await send(p, (startedNewCart ? recap(state.draft, state.catalog) : label) +
+        "\n\n" + missing);
       return true;
     }
     if (state.draft.deliveryType === "delivery" && norm(state.catalog.deliveryMode) !== "neighborhood") {
@@ -1008,8 +1017,12 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         "Seu carrinho foi atualizado, mas o pedido ainda não foi confirmado. Digite *revisar* para tentar novamente.");
       return true;
     }
-    await send(p, label + "\n\n💰 Novo total: *" + currency(current.total) +
-      "*\n\nEstá tudo certo? Responda *SIM* para confirmar ou diga o que deseja alterar.");
+    if (startedNewCart) {
+      await send(p, summary(state.draft, current));
+    } else {
+      await send(p, label + "\n\n💰 Novo total: *" + currency(current.total) +
+        "*\n\nEstá tudo certo? Responda *SIM* para confirmar ou diga o que deseja alterar.");
+    }
     return true;
   }
   if (!agent) return false;
