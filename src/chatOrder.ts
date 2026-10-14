@@ -1404,26 +1404,48 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   }
 
   if (state.quote && yes(p.text)) {
+    let result: any;
     try {
-      const result = await requestBackend(p, "commit", { ...state.draft, phone: p.customerPhone, quoteToken: state.quote });
-      const learning = state.pendingLearning;
-      const finalItems = state.draft.items;
-      drafts.delete(key);
-      await saveChatSession(p.sessionId, p.customerJid, state.history, null);
-      await send(p, "✅ Pedido #" + result.orderNumber + " — " + currency(result.total) + "\n" + result.message +
-        (result.paymentUrl ? "\n\n🔒 Link para pagamento seguro:\n" + result.paymentUrl + "\n\nA loja recebe após a aprovação do pagamento." : ""));
-      if (learning && result.orderId && !result.paymentPending &&
-          finalItems.some(item => item.productId === learning.productId)) {
-        try {
-          await requestBackend(p, "learn", {
-            orderId: result.orderId, phone: p.customerPhone,
-            alias: learning.alias, productId: learning.productId,
-          });
-        } catch {
-          p.logger.warn({ sessionId: p.sessionId }, "[Chat-Learning] Feedback skipped; checkout unaffected");
-        }
+      result = await requestBackend(p, "commit", {
+        ...state.draft, phone: p.customerPhone, quoteToken: state.quote,
+      });
+    } catch (e: any) {
+      state.quote = undefined; state.quoteExpiry = undefined;
+      state.quoteNeedsReview = true;
+      await send(p, "Não consegui confirmar se o pedido foi registrado. Para evitar duplicidade, " +
+        "consulte a loja ou digite *revisar* antes de tentar novamente.\n" +
+        clean(e?.message, 200));
+      return true;
+    }
+    // The backend commit is idempotent by tenant/customer/draftId. Preserve
+    // the successful result BEFORE sending WhatsApp: if the socket drops,
+    // a repeated SIM can replay this very receipt without a second commit.
+    const learning = state.pendingLearning;
+    const finalItems = state.draft.items;
+    const receipt = "✅ Pedido #" + result.orderNumber + " — " + currency(result.total) +
+      "\n" + result.message +
+      (result.paymentUrl ? "\n\n🔒 Link para pagamento seguro:\n" + result.paymentUrl +
+        "\n\nA loja recebe após a aprovação do pagamento." : "");
+    drafts.delete(key);
+    await saveChatSession(p.sessionId, p.customerJid, state.history, null, null,
+      { text: receipt, expiresAt: Date.now() + 20 * 60_000 });
+    try {
+      await send(p, receipt);
+    } catch (error: any) {
+      p.logger.warn({ sessionId: p.sessionId, reason: clean(error?.message, 90) },
+        "[Chat-Order] Committed; WhatsApp receipt delivery failed, saved for safe replay");
+    }
+    if (learning && result.orderId && !result.paymentPending &&
+        finalItems.some(item => item.productId === learning.productId)) {
+      try {
+        await requestBackend(p, "learn", {
+          orderId: result.orderId, phone: p.customerPhone,
+          alias: learning.alias, productId: learning.productId,
+        });
+      } catch {
+        p.logger.warn({ sessionId: p.sessionId }, "[Chat-Learning] Feedback skipped; checkout unaffected");
       }
-    } catch (e: any) { state.quote = undefined; await send(p, "Não consegui confirmar se o pedido foi registrado. Para evitar duplicidade, diga *revisar* e confirme o mesmo carrinho novamente. Se houver dúvida, consulte a loja.\n" + clean(e?.message, 200)); }
+    }
     return true;
   }
   if (state.quote && no(p.text)) { state.quote = undefined; state.quoteNeedsReview = true; await send(p, "Certo, não confirmei. O que quer mudar?"); return true; }
@@ -1537,6 +1559,22 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (!enabled || !geminiKey || !keys.length || !process.env.VERCEL_API_URL || !p.customerJid || !p.text) return false;
   const key = p.sessionId + ":" + p.customerJid;
+  // Customer re-sending SIM just after completion (including after a
+  // gateway restart) gets the SAME stored receipt, never another checkout.
+  // A new product request must still start a fresh draft normally.
+  if (!drafts.has(key) && yes(p.text)) {
+    const prior = await loadChatSession(p.sessionId, p.customerJid);
+    if (prior.receipt) {
+      try {
+        await p.sendMessage(p.customerJid, { text: prior.receipt.text });
+        p.logger.info?.({ sessionId: p.sessionId }, "[Chat-Order] Replayed previous receipt");
+      } catch (error: any) {
+        p.logger.warn({ sessionId: p.sessionId, reason: clean(error?.message, 90) },
+          "[Chat-Order] Receipt replay failed; retry is safe");
+      }
+      return true;
+    }
+  }
   if (!drafts.has(key) && !canUseCentralAgent(p.sessionId) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) {
     // Persisted cart recovery must also work after a restart when the next
     // customer message is a short reply such as "SIM", "retirada" or a name.
