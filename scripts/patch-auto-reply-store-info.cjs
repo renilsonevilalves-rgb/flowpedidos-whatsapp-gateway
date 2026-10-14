@@ -12,7 +12,7 @@ if (start < 0 || end < 0) {
   throw new Error('Could not locate fetchStoreInfo block; refusing to patch gateway source.');
 }
 
-const replacement = `async function fetchStoreInfo(sessionId: string) {
+const replacement = `async function fetchStoreInfo(sessionId: string, includeAiContext = false) {
   const baseUrl = (VERCEL_API_URL || 'https://flowoficial01.vercel.app').replace(/\\/$/, '');
   const keys = [API_KEY, API_KEY_2].filter((value, index, all) => Boolean(value) && all.indexOf(value) === index);
   if (!keys.length) throw new Error('No gateway API key is configured');
@@ -27,7 +27,7 @@ const replacement = `async function fetchStoreInfo(sessionId: string) {
         const response = await fetch(\`\${baseUrl}/api/webhook/whatsapp/store-info\`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', 'X-API-Key': key },
-          body: JSON.stringify({ sessionId }),
+          body: JSON.stringify({ sessionId, includeAiContext }),
           signal: controller.signal,
         });
         const data = await response.json().catch(() => ({}));
