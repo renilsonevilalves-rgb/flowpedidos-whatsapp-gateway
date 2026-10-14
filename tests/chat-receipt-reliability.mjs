@@ -209,3 +209,41 @@ test("prepared receipt without a matching SQL order never creates or announces a
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test("simultaneous reconnect events cannot deliver the same prepared receipt twice", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wa-precommit-concurrent-"));
+  const oldDir = process.env.WHATSAPP_RECEIPT_DIR;
+  const oldFetch = globalThis.fetch;
+  process.env.WHATSAPP_RECEIPT_DIR = root;
+  let calls = 0, sends = 0, release;
+  const blocker = new Promise(resolve => { release = resolve; });
+  globalThis.fetch = async (_url, opts) => {
+    assert.equal(JSON.parse(opts.body).action, "receipt");
+    calls++;
+    await blocker;
+    return json({
+      ok: true, found: true, orderId: "77777777-7777-4777-8777-777777777777",
+      orderNumber: "3246", total: 62.78, message: "Pedido confirmado.",
+    });
+  };
+  try {
+    await prepareOrderReceipt({
+      sessionId: TENANT, customerJid: JID, phone: PHONE, draftId: draft.draftId,
+    });
+    const deliver = async () => { sends++; };
+    const first = drainOrderReceipts(TENANT, deliver, mockLogger);
+    const second = drainOrderReceipts(TENANT, deliver, mockLogger);
+    assert.equal(await second, 0);
+    release();
+    assert.equal(await first, 1);
+    assert.equal(calls, 1);
+    assert.equal(sends, 1);
+    assert.equal((await readdir(root)).length, 0);
+  } finally {
+    release?.();
+    globalThis.fetch = oldFetch;
+    if (oldDir === undefined) delete process.env.WHATSAPP_RECEIPT_DIR;
+    else process.env.WHATSAPP_RECEIPT_DIR = oldDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
