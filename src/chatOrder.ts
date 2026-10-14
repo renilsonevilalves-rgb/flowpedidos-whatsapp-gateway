@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft } from "./chatMemory.js";
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
 import { looksLikeFieldEdit, planFieldEdit, replyValue, type EditableField } from "./chatFieldAgent.js";
+import { runChatCoordinator } from "./chatCoordinator.js";
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
 import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
 import { resolveCartAction } from "./chatCartIntent.js";
@@ -13,7 +14,7 @@ type Draft = {
   draftId: string; items: Item[]; name: string; deliveryType: string;
   address: string; number: string; neighborhood: string; complement: string; reference: string; paymentMethod: string;
 };
-type Catalog = { menuUrl: string; deliveryMode: string; neighborhoods?: string[]; learnedAliases?: LearnedAlias[]; products: Array<{
+type Catalog = { storeName?: string; menuUrl: string; deliveryMode: string; neighborhoods?: string[]; learnedAliases?: LearnedAlias[]; products: Array<{
   id: string; name: string; price: number; category?: string; description?: string;
   promotionEnabled?: boolean; originalPrice?: number | null;
   optionGroups?: Array<{ id: string; name: string; min: number; max: number; options: Array<{ id: string; name: string; price: number }> }>;
@@ -39,6 +40,13 @@ const keys = [process.env.API_KEY, process.env.API_KEY_2].filter(Boolean) as str
 const geminiKey = String(process.env.GEMINI_API_KEY || "");
 const geminiModel = String(process.env.GEMINI_MODEL || "gemini-3.1-flash-lite");
 const drafts = new Map<string, State>();
+const agentEnabled = process.env.WHATSAPP_GEMINI_AGENT_ENABLED === "true";
+const agentTenants = new Set(String(process.env.WHATSAPP_GEMINI_AGENT_TENANTS || "")
+  .split(",").map(v => v.trim()).filter(Boolean));
+function canUseCentralAgent(sessionId: string): boolean {
+  // Allowlisted pilot only. Empty allowlist is deliberately disabled.
+  return agentEnabled && agentTenants.has(sessionId);
+}
 const serialized = new Map<string, Promise<boolean>>();
 const clean = (v: unknown, max = 240) => String(v || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max);
 const norm = (v: unknown) => clean(v, 2000).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
@@ -750,13 +758,238 @@ async function handlePendingFieldEdit(p: Params, state: State, field: EditableFi
   await acknowledgeCartEdit(p, state, label);
   return true;
 }
+async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
+  let previewRequested = false; // at most one validated backend price query per message
+  // The model has no direct access to APIs. Every tool is validated and scoped
+  // to this already authorized tenant and WhatsApp customer.
+  const safeCart = () => ({
+    items: state.draft.items.map(item => ({
+      productId: item.productId,
+      productName: state.catalog.products.find(product => product.id === item.productId)?.name || "",
+      quantity: item.quantity, notes: item.notes || "", selectedOptions: item.selectedOptions || [],
+    })),
+    name: state.draft.name, deliveryType: state.draft.deliveryType,
+    address: state.draft.address, number: state.draft.number,
+    neighborhood: state.draft.neighborhood, complement: state.draft.complement,
+    paymentMethod: state.draft.paymentMethod,
+  });
+  const agent = await runChatCoordinator({
+    text: p.text, history: state.history || [], apiKey: geminiKey,
+    model: String(process.env.GEMINI_AGENT_MODEL || geminiModel),
+    log: p.logger, sessionId: p.sessionId,
+    snapshot: {
+      storeName: state.catalog.storeName || "",
+      cart: safeCart(),
+      menuUrl: state.catalog.menuUrl,
+      products: state.catalog.products.slice(0, 120).map(item => ({
+        id: item.id, name: item.name, price: item.price, category: item.category,
+      })),
+    },
+    execute: async (tool, rawArgs) => {
+      const args = rawArgs || {};
+      if (tool === "find_products") {
+        const query = norm(args.search).slice(0, 100);
+        if (!query || query.length < 2) return { ok: false, error: "Qual produto deseja procurar?" };
+        const words = query.split(/\s+/).filter(word => word.length > 2).slice(0, 7);
+        if (!words.length) return { ok: false, error: "Informe o nome de um produto" };
+        const matched = state.catalog.products.filter(product => {
+          const full = norm(product.name + " " + (product.category || "") + " " + (product.description || ""));
+          return words.every(word => full.includes(word));
+        }).slice(0, 12);
+        return { ok: true, products: matched.map(product => ({
+          id: product.id, name: product.name, price: product.price, description: product.description,
+          optionGroups: product.optionGroups?.map(group => ({
+            groupId: group.id, name: group.name, min: group.min, max: group.max,
+            options: group.options.map(option => ({
+              id: option.id, name: option.name, price: option.price,
+            })),
+          })),
+        })) };
+      }
+      if (tool === "read_cart") return { ok: true, cart: safeCart() };
+      if (tool === "read_store") {
+        if (p.getStoreInfo && (!state.storeInfoAt || Date.now() - state.storeInfoAt > 4 * 60_000)) {
+          try { state.storeInfo = await p.getStoreInfo(); state.storeInfoAt = Date.now(); }
+          catch { return { ok: false, error: "Dados da loja indisponíveis por enquanto." }; }
+        }
+        const info = state.storeInfo;
+        if (!info) return { ok: false, error: "Informações de funcionamento indisponíveis" };
+        return { ok: true, store: {
+          name: info.storeName, openingHours: info.openingHours || null,
+          isOpen: info.isOpen, timezone: info.timezone,
+          address: info.aiContext?.business?.address || null,
+          city: info.aiContext?.business?.city || null,
+          phone: info.aiContext?.business?.phone || null,
+          deliveryMode: state.catalog.deliveryMode,
+          neighborhoods: info.aiContext?.delivery?.neighborhoods?.slice(0, 80) || state.catalog.neighborhoods || [],
+        } };
+      }
+      if (tool === "edit_cart") {
+        const productId = clean(args.productId, 80);
+        const operation = String(args.operation || "");
+        const quantity = Number(args.quantity);
+        if (!["add", "remove", "set_quantity"].includes(operation) ||
+            !Number.isSafeInteger(quantity) || quantity < 1 || quantity > 40)
+          return { ok: false, error: "A quantidade ou operação precisa ser esclarecida." };
+        const product = state.catalog.products.find(item => item.id === productId);
+        if (!product) return { ok: false, error: "Produto não existe no catálogo atual" };
+        const previous = state.draft.items.filter(item => item.productId === productId);
+        const total = previous.reduce((sum, item) => sum + item.quantity, 0);
+        const said = norm(p.text);
+        const productName = norm(product.name);
+        const nameParts = productName.split(" ").filter(part => part.length > 2);
+        const samePrefix = state.catalog.products.filter(other =>
+          norm(other.name).split(" ").slice(0, 2).join(" ") === nameParts.slice(0, 2).join(" "));
+        const explicitlyMentioned = said.includes(productName) ||
+          (nameParts.length >= 2 && samePrefix.length === 1 &&
+            said.includes(nameParts.slice(0, 2).join(" ")));
+        if (operation === "add" && !explicitlyMentioned) {
+          return { ok: false, error: "Confirme o produto e a variante exatos pelo nome antes de adicionar." };
+        }
+        if (operation !== "add" && !explicitlyMentioned &&
+            state.draft.items.some(item => item.productId !== productId)) {
+          return { ok: false, error: "Há vários produtos no carrinho. Pergunte qual deles deve ser alterado." };
+        }
+        if (operation === "add") {
+          const requestedOptions = Array.isArray(args.selectedOptions) ? args.selectedOptions : [];
+          if (requestedOptions.length > 30)
+            return { ok: false, error: "Excesso de adicionais; preciso revisar o pedido." };
+          const selectedOptions: NonNullable<Item["selectedOptions"]> = [];
+          for (const requested of requestedOptions) {
+            const group = product.optionGroups?.find(group => group.id === String(requested?.groupId || ""));
+            const option = group?.options.find(option => option.id === String(requested?.id || ""));
+            const count = Number(requested?.quantity);
+            if (!group || !option || !Number.isSafeInteger(count) || count < 1 || count > 20)
+              return { ok: false, error: "Adicional inválido. Selecione uma opção disponível no cardápio." };
+            if (!norm(p.text).includes(norm(option.name)))
+              return { ok: false, error: "Confirme o adicional pelo nome; não posso escolher por conta própria." };
+            selectedOptions.push({ groupId: group.id, id: option.id, quantity: count });
+          }
+          for (const group of product.optionGroups || []) {
+            const groupCount = selectedOptions.filter(option => option.groupId === group.id)
+              .reduce((sum, option) => sum + option.quantity, 0);
+            if (groupCount < Number(group.min || 0) || groupCount > Number(group.max || 0)) {
+              return { ok: false, error: "Escolha as opções obrigatórias do grupo " + group.name +
+                " (" + group.min + " a " + group.max + ")." };
+            }
+          }
+          const requestedNotes = clean(args.notes, 180);
+          const notes = requestedNotes && norm(p.text).includes(norm(requestedNotes)) ? requestedNotes : "";
+          if (!addItemsToDraft(state, [{ productId, quantity, notes, selectedOptions }]))
+            return { ok: false, error: "Limite do carrinho ou produto ambíguo." };
+        } else {
+          if (!total) return { ok: false, error: "Produto não está no carrinho." };
+          if (previous.length !== 1)
+            return { ok: false, error: "Há versões diferentes do produto. Pergunte qual variante alterar." };
+          if (operation === "remove" && quantity > total)
+            return { ok: false, error: "Quantidade maior que a existente no carrinho." };
+          const newQuantity = operation === "remove" ? total - quantity : quantity;
+          const edited = state.draft.items.map(item => item.productId === productId
+            ? { ...item, quantity: newQuantity } : item).filter(item => item.quantity > 0);
+          if (edited.reduce((sum, item) => sum + item.quantity, 0) > 100)
+            return { ok: false, error: "Carrinho ultrapassa o limite de segurança." };
+          state.draft.items = edited;
+        }
+        state.quote = undefined; state.quoteExpiry = undefined;
+        state.quoteNeedsReview = true;
+        return { ok: true, mutated: true, cart: safeCart() };
+      }
+      if (tool === "update_checkout") {
+        const field = String(args.field || "");
+        const fields = new Set(["name","deliveryType","address","number","neighborhood",
+          "complement","reference","paymentMethod"]);
+        if (!fields.has(field)) return { ok: false, error: "Campo inválido" };
+        const supplied = clean(args.value, 200);
+        const utterance = norm(p.text);
+        let value = supplied;
+        if (field === "number") {
+          value = replyValue(supplied, "number");
+          if (!value || !utterance.includes(value)) {
+            state.pendingEdit = "number";
+            return { ok: false, error: "Pergunte apenas o novo número do endereço." };
+          }
+        } else if (field === "deliveryType") {
+          value = supplied === "pickup" && /\b(?:retirada|retirar|buscar)\b/.test(utterance) ? "pickup" :
+            supplied === "delivery" && /\b(?:entrega|entregar|delivery)\b/.test(utterance) ? "delivery" : "";
+        } else if (field === "paymentMethod") {
+          const mapping: Record<string, RegExp> = {
+            money: /\bdinheiro\b/, pix: /\bpix\b/, credit: /\b(?:cartao|credito)\b/,
+            online_pix: /\bpix\b/, online_credit: /\b(?:cartao|credito)\b/,
+            online_debit: /\b(?:cartao|debito)\b/,
+          };
+          value = mapping[supplied]?.test(utterance) ? supplied : "";
+          if (value === "pix" && !/\b(?:entrega|retirada|na hora)\b/.test(utterance)) value = "";
+          if (value === "credit" && !/\b(?:entrega|retirada|na hora)\b/.test(utterance)) value = "";
+          if (value.startsWith("online_") && !/\bonline\b/.test(utterance)) value = "";
+        } else if (field === "address") {
+          value = replyValue(supplied, "address");
+          if (!value || !utterance.includes(norm(value))) value = "";
+        } else if (field === "name") {
+          value = replyValue(supplied, "name");
+          if (!value || !utterance.includes(norm(value))) value = "";
+        } else if (field === "neighborhood") {
+          value = replyValue(supplied, "neighborhood");
+          const known = state.catalog.neighborhoods || [];
+          if (known.length) value = known.find(name => norm(name) === norm(value)) || "";
+          if (!value || !utterance.includes(norm(value))) value = "";
+        } else {
+          if (!value || !utterance.includes(norm(value))) value = "";
+        }
+        if (!value) return { ok: false, error: "Pergunte somente o novo valor do campo " + field };
+        if (field === "number" && state.draft.deliveryType !== "delivery")
+          return { ok: false, error: "O pedido está para retirada. Confirme primeiro mudança para entrega." };
+        const before = (state.draft as any)[field];
+        (state.draft as any)[field] = value;
+        state.pendingEdit = undefined;
+        state.quote = undefined; state.quoteExpiry = undefined;
+        state.quoteNeedsReview = true;
+        return { ok: true, mutated: before !== value, field, value, cart: safeCart() };
+      }
+      if (tool === "preview_order") {
+        if (previewRequested) return { ok: false, error: "Prévia já consultada nesta mensagem." };
+        previewRequested = true;
+        const missing = question(state.draft, state.catalog, state.paymentHint);
+        if (missing) return { ok: false, error: "Ainda faltam informações: " + missing };
+        if (state.draft.deliveryType === "delivery" && norm(state.catalog.deliveryMode) !== "neighborhood")
+          return { ok: false, error: "Esta loja precisa cotar entrega por distância/iFood no cardápio." };
+        try {
+          const preview = await requestBackend(p, "preview", { ...state.draft, phone: p.customerPhone });
+          state.quote = preview.quoteToken; state.quoteExpiry = Number(preview.expires);
+          state.quoteNeedsReview = false;
+          return { ok: true, finalReply: summary(state.draft, preview), total: preview.total };
+        } catch { return { ok: false, error: "Não consegui validar o valor final agora. Nenhum pedido foi criado." }; }
+      }
+      return { ok: false, error: "Ferramenta desconhecida" };
+    },
+  });
+  if (!agent) return false;
+  // Pending edit takes priority on the next turn. If the model asked for a
+  // correction but did not invoke a tool, existing deterministic flows apply.
+  if (agent.reply) {
+    // The model cannot create orders, process payment or assert final totals.
+    // Such statements must be backed by the verified backend checkout path.
+    let response = agent.reply;
+    if (/\b(?:pedido (?:foi )?(?:confirmado|registrado|finalizado|enviado)|pagamento (?:foi )?(?:realizado|confirmado|aprovado)|ja (?:confirmei|finalizei) (?:seu |o )?pedido)\b/i.test(norm(response))) {
+      response = "Seu pedido ainda não foi confirmado por esta mensagem. Posso conferir os itens e o total antes de você confirmar.";
+    }
+    if (/R\$\s*\d/.test(response) &&
+        !agent.usedTools.some(tool => ["find_products","preview_order","read_store"].includes(tool))) {
+      response = "Vou precisar consultar os valores atuais da loja antes de informar um preço.";
+    }
+    await send(p, response);
+    p.logger.info?.({ sessionId: p.sessionId, toolCalls: agent.usedTools }, "[Chat-Coordinator] response");
+    return true;
+  }
+  return false;
+}
+
 async function processMessage(p: Params, key: string): Promise<boolean> {
   // This flow never intercepts existing-order actions, even with a pending cart.
   if (concernsExistingOrder(p.text)) return false;
   let state = drafts.get(key);
   if (state && Date.now() - state.updatedAt > 20 * 60_000) { drafts.delete(key); state = undefined; }
   let firstTurn = !state;
-  if (!state && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) {
+  if (!state && !canUseCentralAgent(p.sessionId) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) {
     const saved = await loadChatSession(p.sessionId, p.customerJid);
     if (!saved.draft?.items?.length) return false;
   }
@@ -856,6 +1089,15 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     });
     if (decision) return handlePendingFieldEdit(p, state, decision.field, decision.value);
   }
+
+  // Central Gemini tool orchestration replaces rigid routing for pilot stores;
+  // the proven legacy path remains as a fail-closed fallback when unavailable.
+  // Signed checkout confirmation must take precedence over Gemini routing.
+  // Never let the model reinterpret a customer's explicit SIM/NAO while a
+  // validated preview is pending; legacy commit remains the sole authority.
+  if (canUseCentralAgent(p.sessionId) &&
+      !(state.quote && (yes(p.text) || no(p.text))) &&
+      await centralAgentMessage(p, state)) return true;
 
   const promotionFollowup = /^(?:nenhum|nenhuma|nenhum mesmo|nenhuma mesmo|serio|tem certeza|nenhum ai|nao tem nenhum|nem um)$/.test(normalizedTurn);
   if (isPromotionQuestion(p.text) || (promotionFollowup && state.lastPromotion &&
@@ -1246,7 +1488,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (!enabled || !geminiKey || !keys.length || !process.env.VERCEL_API_URL || !p.customerJid || !p.text) return false;
   const key = p.sessionId + ":" + p.customerJid;
-  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) {
+  if (!drafts.has(key) && !canUseCentralAgent(p.sessionId) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) {
     // Persisted cart recovery must also work after a restart when the next
     // customer message is a short reply such as "SIM", "retirada" or a name.
     if (concernsExistingOrder(p.text)) return false;
