@@ -42,6 +42,9 @@ const declarations = [
     parameters: { type: "OBJECT", properties: {} } },
 ];
 
+// A quota/rate-limit response must not trigger a new provider request for
+// every customer message. The fallback order flow can still run safely.
+let rateLimitedUntil = 0;
 const instructions = [
   "Você é o coordenador central de um atendente de delivery no WhatsApp brasileiro.",
   "Converse naturalmente; compreenda correções, mensagens curtas, pedidos em várias etapas, erros de digitação e contexto.",
@@ -61,6 +64,7 @@ const instructions = [
 ].join("\n");
 
 async function invoke(params: AgentParams, contents: unknown[]): Promise<any> {
+  if (Date.now() < rateLimitedUntil) return null;
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 8500);
   try {
@@ -80,6 +84,13 @@ async function invoke(params: AgentParams, contents: unknown[]): Promise<any> {
       }),
     });
     if (!response.ok) {
+      if (response.status === 429 || response.status === 503) {
+        const seconds = Number(response.headers.get("retry-after"));
+        const waitMs = Number.isFinite(seconds) && seconds > 0
+          ? Math.min(180_000, Math.max(20_000, Math.ceil(seconds * 1000)))
+          : 45_000;
+        rateLimitedUntil = Math.max(rateLimitedUntil, Date.now() + waitMs);
+      }
       params.log.warn({ sessionId: params.sessionId, status: response.status },
         "[Chat-Coordinator] Gemini service unavailable");
       return null;
