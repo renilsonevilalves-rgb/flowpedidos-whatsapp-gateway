@@ -132,3 +132,43 @@ test("active cart is encrypted and restored independently per customer after a r
     await rm(directory,{recursive:true,force:true});
   }
 });
+
+test("after gateway restart a saved cart accepts short SIM only to re-preview, never commits directly", async () => {
+  const directory=await mkdtemp(join(tmpdir(),"wa-resume-checkout-"));
+  const originalDir=process.env.CHAT_MEMORY_DIR;
+  const originalFetch=globalThis.fetch;
+  process.env.CHAT_MEMORY_DIR=directory;
+  const customer="5531999966033";
+  const draft={draftId:"12345678-1234-4234-8234-123456789abc",
+    items:[{productId:PRODUCT,quantity:2,notes:"",selectedOptions:[]}],
+    name:"Joana",deliveryType:"pickup",address:"",number:"",
+    neighborhood:"",complement:"",reference:"",paymentMethod:"money"};
+  const seen=[],calls=[];
+  globalThis.fetch=async (_url,opts)=>{
+    const req=JSON.parse(opts.body);
+    calls.push(req);
+    if(req.action==="catalog")return send(catalog);
+    if(req.action==="preview")return send({ok:true,quoteToken:"restored.quote",expires:Date.now()+60000,
+      items:[{quantity:2,name:"Hot dog tradicional",total:25.98}],
+      subtotal:25.98,deliveryFee:0,total:25.98});
+    if(req.action==="commit")return send({ok:true,orderNumber:"5200",total:25.98,message:"Pedido recebido"});
+    throw new Error("Unexpected endpoint");
+  };
+  try{
+    await saveChatSession(TENANT,customer+"@s.whatsapp.net",[],draft);
+    const p=text=>({sessionId:TENANT,customerJid:customer+"@s.whatsapp.net",
+      customerPhone:customer,text,logger,sendMessage:async(_jid,x)=>seen.push(x.text)});
+    assert.equal(await handleChatOrderMessage(p("SIM")),true);
+    assert.equal(calls.filter(c=>c.action==="commit").length,0);
+    assert.match(seen.at(-1),/Confira seu pedido/);
+    assert.match(seen.at(-1),/Joana/);
+    await handleChatOrderMessage(p("SIM"));
+    assert.equal(calls.filter(c=>c.action==="commit").length,1);
+    assert.equal((await loadChatSession(TENANT,customer+"@s.whatsapp.net")).draft,null);
+  }finally{
+    globalThis.fetch=originalFetch;
+    if(originalDir===undefined)delete process.env.CHAT_MEMORY_DIR;
+    else process.env.CHAT_MEMORY_DIR=originalDir;
+    await rm(directory,{recursive:true,force:true});
+  }
+});
