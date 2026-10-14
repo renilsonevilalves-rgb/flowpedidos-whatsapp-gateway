@@ -2,6 +2,7 @@
 import { randomUUID } from "node:crypto";
 import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft } from "./chatMemory.js";
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
+import { looksLikeFieldEdit, planFieldEdit, replyValue, type EditableField } from "./chatFieldAgent.js";
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
 import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
 import { resolveCartAction } from "./chatCartIntent.js";
@@ -24,6 +25,7 @@ type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string
   storeInfo?: ChatStoreInfo | null;
   storeInfoAt?: number;
   quoteNeedsReview?: boolean;
+  pendingEdit?: EditableField;
 };
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
@@ -110,7 +112,7 @@ async function send(p: Params, message: string) {
   if (state) {
     state.history = [...(state.history || []), ...chunks.map(text =>
       ({ role: "assistant" as const, text: clean(text, 800) }))].slice(-80);
-    await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft);
+    await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft, state.pendingEdit || null);
   }
   p.logger.info?.({ sessionId: p.sessionId, partCount: chunks.length }, "[Chat-Order] WhatsApp response sent");
 }
@@ -693,6 +695,61 @@ async function answerContextualQuestion(p: Params, state: State): Promise<boolea
   await send(p, answer || "Não consegui confirmar essa informação com segurança agora. Pode perguntar novamente? Se precisar, posso encaminhar sua dúvida à loja.");
   return true;
 }
+function fieldQuestion(field: EditableField, d: Draft): string {
+  switch (field) {
+    case "number": return "Claro! Qual é o *novo número*? Vou manter a *" +
+      (d.address || "rua atual") + "* e o bairro *" + (d.neighborhood || "atual") + "*.";
+    case "address": return "Claro! Qual é o nome da *nova rua*? Vou manter o número e o bairro, a menos que você também queira mudá-los.";
+    case "neighborhood": return "Qual é o *novo bairro*? Vou manter a rua e o número.";
+    case "name": return "Combinado! Qual nome devo colocar no pedido?";
+    case "paymentMethod": return "Claro! Como prefere pagar: *dinheiro*, *Pix ou cartão na entrega/retirada*, ou *online*?";
+    case "deliveryType": return "Você prefere *entrega* ou *retirada*?";
+  }
+}
+async function handlePendingFieldEdit(p: Params, state: State, field: EditableField, value: string): Promise<boolean> {
+  // Never let an LLM invent payment, address, street number or other checkout facts.
+  const validated = replyValue(value, field);
+  if (!validated) {
+    state.pendingEdit = field;
+    await send(p, fieldQuestion(field, state.draft));
+    return true;
+  }
+  state.pendingEdit = undefined;
+  const previous = state.draft;
+  const updated: Draft = { ...previous, items: previous.items };
+  if (field === "number") {
+    if (previous.deliveryType !== "delivery") {
+      await send(p, "O pedido está marcado para *retirada*. Quer mudar para entrega antes de alterar o número do endereço?");
+      return true;
+    }
+    updated.number = validated;
+  } else if (field === "address") updated.address = validated;
+  else if (field === "neighborhood") {
+    const candidates = state.catalog.neighborhoods || [];
+    const matching = candidates.filter(neighborhood => norm(neighborhood) === norm(validated));
+    if (candidates.length && matching.length !== 1) {
+      state.pendingEdit = field;
+      await send(p, "Não encontrei esse bairro entre as áreas atendidas. Pode informar o bairro como aparece no cardápio?");
+      return true;
+    }
+    updated.neighborhood = matching[0] || validated;
+  } else if (field === "name") updated.name = validated;
+  else if (field === "paymentMethod") updated.paymentMethod = validated;
+  else if (field === "deliveryType") updated.deliveryType = validated;
+  state.draft = updated;
+  state.quote = undefined;
+  state.quoteExpiry = undefined;
+  state.quoteNeedsReview = true;
+  const label = field === "number" ? "Pronto! Alterei apenas o *número* para *" + updated.number +
+      "*. Mantive a rua *" + updated.address + "* e o bairro *" + updated.neighborhood + "*." :
+    field === "address" ? "Atualizei somente a rua para *" + updated.address + "*." :
+    field === "neighborhood" ? "Atualizei somente o bairro para *" + updated.neighborhood + "*." :
+    field === "name" ? "Atualizei o nome para *" + updated.name + "*." :
+    field === "paymentMethod" ? "Atualizei a forma de pagamento." :
+    "Atualizei para *" + (updated.deliveryType === "pickup" ? "retirada" : "entrega") + "*.";
+  await acknowledgeCartEdit(p, state, label);
+  return true;
+}
 async function processMessage(p: Params, key: string): Promise<boolean> {
   // This flow never intercepts existing-order actions, even with a pending cart.
   if (concernsExistingOrder(p.text)) return false;
@@ -717,6 +774,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     state = {
       draft: restored || fresh(), catalog, updatedAt: Date.now(),
       history: stored.history, quoteNeedsReview: Boolean(restored?.items.length),
+      pendingEdit: restored && ["number","address","neighborhood","name","paymentMethod","deliveryType"].includes(stored.pendingEdit || "") ? stored.pendingEdit as EditableField : undefined,
     };
     if (restored?.items.length) firstTurn = false;
     for (const [id, old] of drafts) if (Date.now() - old.updatedAt > 20 * 60_000) drafts.delete(id);
@@ -725,7 +783,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   }
   state.updatedAt = Date.now();
   state.history = [...(state.history || []), { role: "user" as const, text: clean(p.text, 800) }].slice(-80);
-  await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft);
+  await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft, state.pendingEdit || null);
   if (cancel(p.text)) {
     drafts.delete(key);
     await saveChatSession(p.sessionId, p.customerJid, state.history, null);
@@ -741,7 +799,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   if (state.quote && !yes(p.text) && !no(p.text)) {
     state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
   }
-  if (!state.quote && state.quoteNeedsReview && yes(p.text)) {
+  if (!state.quote && state.quoteNeedsReview && !state.pendingEdit && yes(p.text)) {
     if (!state.draft.items.length) {
       state.quoteNeedsReview = false;
       await send(p, "Seu carrinho está vazio. O que gostaria de pedir?");
@@ -767,6 +825,38 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   }
 
   const normalizedTurn = norm(p.text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  // Gemini decides WHICH existing checkout field the customer is editing.
+  // Deterministic validators control WHAT can be written. Other fields and
+  // the cart remain untouched. This precedes generic checkout/Cart regexes.
+  if (state.draft.items.length && state.pendingEdit) {
+    const field = state.pendingEdit;
+    if (looksLikeFieldEdit(p.text)) {
+      const decision = await planFieldEdit({
+        text: p.text, draft: state.draft, history: state.history || [],
+        geminiKey, model: geminiModel, logger: p.logger, sessionId: p.sessionId,
+      });
+      if (decision && decision.field !== field) {
+        state.pendingEdit = undefined;
+        return handlePendingFieldEdit(p, state, decision.field, decision.value);
+      }
+    }
+    const answer = replyValue(p.text, field);
+    if (answer) return handlePendingFieldEdit(p, state, field, answer);
+    // A separate question should receive a real answer, not endless requests
+    // for the same field; keep the field pending for the next message.
+    if (isStoreQuestion(p.text) && !looksLikeFieldEdit(p.text))
+      return answerContextualQuestion(p, state);
+    await send(p, fieldQuestion(field, state.draft));
+    return true;
+  }
+  if (state.draft.items.length && looksLikeFieldEdit(p.text)) {
+    const decision = await planFieldEdit({
+      text: p.text, draft: state.draft, history: state.history || [],
+      geminiKey, model: geminiModel, logger: p.logger, sessionId: p.sessionId,
+    });
+    if (decision) return handlePendingFieldEdit(p, state, decision.field, decision.value);
+  }
+
   const promotionFollowup = /^(?:nenhum|nenhuma|nenhum mesmo|nenhuma mesmo|serio|tem certeza|nenhum ai|nao tem nenhum|nem um)$/.test(normalizedTurn);
   if (isPromotionQuestion(p.text) || (promotionFollowup && state.lastPromotion &&
       Date.now() - state.lastPromotion.at < 5 * 60_000)) {
