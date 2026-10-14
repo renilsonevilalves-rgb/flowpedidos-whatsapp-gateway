@@ -759,6 +759,7 @@ async function handlePendingFieldEdit(p: Params, state: State, field: EditableFi
   return true;
 }
 async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
+  let previewRequested = false; // at most one validated backend price query per message
   // The model has no direct access to APIs. Every tool is validated and scoped
   // to this already authorized tenant and WhatsApp customer.
   const safeCart = () => ({
@@ -945,6 +946,8 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         return { ok: true, mutated: before !== value, field, value, cart: safeCart() };
       }
       if (tool === "preview_order") {
+        if (previewRequested) return { ok: false, error: "Prévia já consultada nesta mensagem." };
+        previewRequested = true;
         const missing = question(state.draft, state.catalog, state.paymentHint);
         if (missing) return { ok: false, error: "Ainda faltam informações: " + missing };
         if (state.draft.deliveryType === "delivery" && norm(state.catalog.deliveryMode) !== "neighborhood")
