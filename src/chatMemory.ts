@@ -10,7 +10,8 @@ export type RememberedDraft = {
   name: string; deliveryType: string; address: string; number: string;
   neighborhood: string; complement: string; reference: string; paymentMethod: string;
 };
-export type ChatSessionMemory = { history: ChatTurn[]; draft: RememberedDraft | null; pendingEdit?: string | null };
+export type RecentReceipt = { text: string; expiresAt: number };
+export type ChatSessionMemory = { history: ChatTurn[]; draft: RememberedDraft | null; pendingEdit?: string | null; receipt?: RecentReceipt | null };
 const DRAFT_TTL_MS = 60 * 60 * 1000;
 
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -71,7 +72,15 @@ export async function loadChatSession(sessionId: string, customerJid: string): P
     const expiry = Number(payload?.draftExpiresAt);
     const draft = expiry > Date.now() && payload?.draft && typeof payload.draft === "object" &&
       Array.isArray(payload.draft.items) ? payload.draft as RememberedDraft : null;
-    return { history: sanitizedHistory(payload?.history || []), draft, pendingEdit: draft && typeof payload?.pendingEdit === "string" ? payload.pendingEdit : null };
+    const recent = payload?.receipt;
+    const receipt = typeof recent?.text === "string" &&
+      recent.text.length > 0 && recent.text.length <= 4000 &&
+      Number.isFinite(recent.expiresAt) && recent.expiresAt > Date.now() &&
+      recent.expiresAt <= Date.now() + 30 * 60_000
+      ? { text: recent.text, expiresAt: recent.expiresAt } as RecentReceipt : null;
+    return { history: sanitizedHistory(payload?.history || []), draft,
+      pendingEdit: draft && typeof payload?.pendingEdit === "string" ? payload.pendingEdit : null,
+      receipt };
   } catch {
     return { history: [], draft: null };
   }
@@ -81,7 +90,8 @@ export async function loadChatMemory(sessionId: string, customerJid: string): Pr
   return (await loadChatSession(sessionId, customerJid)).history;
 }
 
-export async function saveChatSession(sessionId: string, customerJid: string, history: ChatTurn[], draft: RememberedDraft | null, pendingEdit: string | null = null): Promise<void> {
+export async function saveChatSession(sessionId: string, customerJid: string, history: ChatTurn[], draft: RememberedDraft | null,
+  pendingEdit: string | null = null, receipt: RecentReceipt | null = null): Promise<void> {
   const path = memoryPath(sessionId, customerJid);
   if (!path) return;
   let temporary = "";
@@ -93,6 +103,10 @@ export async function saveChatSession(sessionId: string, customerJid: string, hi
       draft: draft && Array.isArray(draft.items) ? draft : null,
       pendingEdit: pendingEdit && ["number","address","neighborhood","name","paymentMethod","deliveryType"].includes(pendingEdit) ? pendingEdit : null,
       draftExpiresAt: draft ? Date.now() + DRAFT_TTL_MS : 0,
+      receipt: receipt && typeof receipt.text === "string" &&
+        receipt.text.length > 0 && receipt.text.length <= 4000 &&
+        Number.isFinite(receipt.expiresAt) && receipt.expiresAt > Date.now() &&
+        receipt.expiresAt <= Date.now() + 30 * 60_000 ? receipt : null,
     }), "utf8");
     const encrypted = Buffer.concat([cipher.update(clear), cipher.final()]);
     const envelope = JSON.stringify({
