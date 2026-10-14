@@ -4,6 +4,7 @@ import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft }
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
 import { looksLikeFieldEdit, planFieldEdit, replyValue, type EditableField } from "./chatFieldAgent.js";
 import { runChatCoordinator } from "./chatCoordinator.js";
+import { deliverOrderReceipt } from "./chatReceiptOutbox.js";
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
 import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
 import { resolveCartAction } from "./chatCartIntent.js";
@@ -759,6 +760,9 @@ async function handlePendingFieldEdit(p: Params, state: State, field: EditableFi
   return true;
 }
 async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
+  let lastRemoval: { productName: string; quantity: number } | null = null;
+  let mutations = 0;
+  let verifiedTotal: number | null = null;
   let previewRequested = false; // at most one validated backend price query per message
   // The model has no direct access to APIs. Every tool is validated and scoped
   // to this already authorized tenant and WhatsApp customer.
@@ -892,6 +896,8 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         }
         state.quote = undefined; state.quoteExpiry = undefined;
         state.quoteNeedsReview = true;
+        mutations++;
+        lastRemoval = operation === "remove" ? { productName: product.name, quantity } : null;
         return { ok: true, mutated: true, cart: safeCart() };
       }
       if (tool === "update_checkout") {
@@ -943,6 +949,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         state.pendingEdit = undefined;
         state.quote = undefined; state.quoteExpiry = undefined;
         state.quoteNeedsReview = true;
+        if (before !== value) { mutations++; lastRemoval = null; }
         return { ok: true, mutated: before !== value, field, value, cart: safeCart() };
       }
       if (tool === "preview_order") {
@@ -956,6 +963,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
           const preview = await requestBackend(p, "preview", { ...state.draft, phone: p.customerPhone });
           state.quote = preview.quoteToken; state.quoteExpiry = Number(preview.expires);
           state.quoteNeedsReview = false;
+          verifiedTotal = Number(preview.total);
           return { ok: true, finalReply: summary(state.draft, preview), total: preview.total };
         } catch { return { ok: false, error: "Não consegui validar o valor final agora. Nenhum pedido foi criado." }; }
       }
@@ -963,6 +971,47 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
     },
   });
   if (!agent) return false;
+  // A simple removal deserves a specific acknowledgment and a fresh official
+  // total even if Gemini times out after successfully editing the cart.
+  // At most one backend preview per message, regardless of extra Gemini calls.
+  if (lastRemoval && mutations === 1 && agent.usedTools.includes("edit_cart")) {
+    const removed = lastRemoval as { productName: string; quantity: number };
+    const label = "✅ Retirei *" + removed.quantity + "x " + removed.productName + "* do pedido.";
+    if (!state.draft.items.length) {
+      await send(p, label + "\nSeu carrinho ficou vazio. O que gostaria de pedir?");
+      return true;
+    }
+    const missing = question(state.draft, state.catalog, state.paymentHint);
+    if (missing) {
+      await send(p, label + "\n\n" + missing);
+      return true;
+    }
+    if (state.draft.deliveryType === "delivery" &&
+        norm(state.catalog.deliveryMode) !== "neighborhood") {
+      await send(p, label + "\nPara conferir o frete atualizado, finalize pelo cardápio: " +
+        state.catalog.menuUrl);
+      return true;
+    }
+    try {
+      if (verifiedTotal === null || !state.quote ||
+          (state.quoteExpiry && Date.now() > state.quoteExpiry)) {
+        const preview = await requestBackend(p, "preview",
+          { ...state.draft, phone: p.customerPhone });
+        state.quote = preview.quoteToken;
+        state.quoteExpiry = Number(preview.expires);
+        verifiedTotal = Number(preview.total);
+      }
+      if (!Number.isFinite(verifiedTotal)) throw new Error("Invalid preview total");
+      state.quoteNeedsReview = false;
+      await send(p, label + "\n💰 *Novo total: " + currency(verifiedTotal) + "*." +
+        "\n\nEstá tudo certo? Responda *SIM* para confirmar ou diga o que deseja alterar.");
+    } catch {
+      state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
+      await send(p, label + "\nNão consegui conferir o novo total agora. " +
+        "Digite *revisar* para atualizar antes de confirmar.");
+    }
+    return true;
+  }
   // Pending edit takes priority on the next turn. If the model asked for a
   // correction but did not invoke a tool, existing deterministic flows apply.
   if (agent.reply) {
@@ -1355,26 +1404,49 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   }
 
   if (state.quote && yes(p.text)) {
+    // Once the backend commits, sending its WhatsApp confirmation MUST NOT be
+    // part of the same retryable transaction. Receipt delivery is an encrypted
+    // outbox operation, never another commit.
+    let result: any;
     try {
-      const result = await requestBackend(p, "commit", { ...state.draft, phone: p.customerPhone, quoteToken: state.quote });
-      const learning = state.pendingLearning;
-      const finalItems = state.draft.items;
-      drafts.delete(key);
-      await saveChatSession(p.sessionId, p.customerJid, state.history, null);
-      await send(p, "✅ Pedido #" + result.orderNumber + " — " + currency(result.total) + "\n" + result.message +
-        (result.paymentUrl ? "\n\n🔒 Link para pagamento seguro:\n" + result.paymentUrl + "\n\nA loja recebe após a aprovação do pagamento." : ""));
-      if (learning && result.orderId && !result.paymentPending &&
-          finalItems.some(item => item.productId === learning.productId)) {
-        try {
-          await requestBackend(p, "learn", {
-            orderId: result.orderId, phone: p.customerPhone,
-            alias: learning.alias, productId: learning.productId,
-          });
-        } catch {
-          p.logger.warn({ sessionId: p.sessionId }, "[Chat-Learning] Feedback skipped; checkout unaffected");
-        }
+      result = await requestBackend(p, "commit",
+        { ...state.draft, phone: p.customerPhone, quoteToken: state.quote });
+    } catch (error: any) {
+      state.quote = undefined;
+      state.quoteExpiry = undefined;
+      state.quoteNeedsReview = true;
+      await send(p, "Não consegui verificar se o pedido foi registrado. " +
+        "Para evitar pedidos duplicados, confira com a loja antes de repetir a confirmação.\n" +
+        clean(error?.message, 180));
+      return true;
+    }
+    const learning = state.pendingLearning;
+    const finalItems = state.draft.items;
+    const receipt = "✅ *Pedido #" + result.orderNumber + " confirmado!*\n" +
+      "Total: *" + currency(result.total) + "*\n" + clean(result.message, 900) +
+      (result.paymentUrl ? "\n\n🔒 Link de pagamento:\n" + result.paymentUrl : "");
+    // Clearing the draft never means clearing a pending confirmation receipt.
+    drafts.delete(key);
+    await saveChatSession(p.sessionId, p.customerJid, state.history, null);
+    const receiptSent = await deliverOrderReceipt({
+      sessionId: p.sessionId, customerJid: p.customerJid,
+      orderId: clean(result.orderId || result.orderNumber || state.draft.draftId, 120),
+      text: receipt,
+    }, p.sendMessage, p.logger).catch(() => false);
+    if (!receiptSent) p.logger.warn({ sessionId: p.sessionId },
+      "[Chat-Order] Order committed but receipt queued for recovery");
+    if (learning && result.orderId && !result.paymentPending &&
+        finalItems.some(item => item.productId === learning.productId)) {
+      try {
+        await requestBackend(p, "learn", {
+          orderId: result.orderId, phone: p.customerPhone,
+          alias: learning.alias, productId: learning.productId,
+        });
+      } catch {
+        p.logger.warn({ sessionId: p.sessionId },
+          "[Chat-Learning] Feedback skipped; checkout unaffected");
       }
-    } catch (e: any) { state.quote = undefined; await send(p, "Não consegui confirmar se o pedido foi registrado. Para evitar duplicidade, diga *revisar* e confirme o mesmo carrinho novamente. Se houver dúvida, consulte a loja.\n" + clean(e?.message, 200)); }
+    }
     return true;
   }
   if (state.quote && no(p.text)) { state.quote = undefined; state.quoteNeedsReview = true; await send(p, "Certo, não confirmei. O que quer mudar?"); return true; }
