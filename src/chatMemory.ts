@@ -4,6 +4,15 @@ import { mkdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
 export type ChatTurn = { role: "user" | "assistant"; text: string };
+export type RememberedDraft = {
+  draftId: string;
+  items: Array<{ productId: string; quantity: number; notes?: string; selectedOptions?: Array<{ id: string; groupId: string; quantity: number }> }>;
+  name: string; deliveryType: string; address: string; number: string;
+  neighborhood: string; complement: string; reference: string; paymentMethod: string;
+};
+export type ChatSessionMemory = { history: ChatTurn[]; draft: RememberedDraft | null };
+const DRAFT_TTL_MS = 60 * 60 * 1000;
+
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_TURNS = 80;
 const MAX_TEXT = 800;
@@ -39,40 +48,51 @@ function sanitizedHistory(input: ChatTurn[]): ChatTurn[] {
     })).filter(turn => turn.text);
 }
 
-export async function loadChatMemory(sessionId: string, customerJid: string): Promise<ChatTurn[]> {
+export async function loadChatSession(sessionId: string, customerJid: string): Promise<ChatSessionMemory> {
   const path = memoryPath(sessionId, customerJid);
-  if (!path) return [];
+  if (!path) return { history: [], draft: null };
   try {
     const raw = await readFile(path);
-    if (raw.length > MAX_FILE_BYTES) return [];
+    if (raw.length > MAX_FILE_BYTES) return { history: [], draft: null };
     const envelope = JSON.parse(raw.toString("utf8"));
-    if (envelope?.version !== 1 || !Number.isFinite(envelope.expiresAt)) return [];
+    if (envelope?.version !== 1 || !Number.isFinite(envelope.expiresAt)) return { history: [], draft: null };
     if (Date.now() >= envelope.expiresAt) {
       await unlink(path).catch(() => undefined);
-      return [];
+      return { history: [], draft: null };
     }
     const nonce = Buffer.from(envelope.nonce, "base64");
     const tag = Buffer.from(envelope.tag, "base64");
     const encrypted = Buffer.from(envelope.data, "base64");
-    if (nonce.length !== 12 || tag.length !== 16) return [];
+    if (nonce.length !== 12 || tag.length !== 16) return { history: [], draft: null };
     const decipher = createDecipheriv("aes-256-gcm", encryptionKey(), nonce);
     decipher.setAuthTag(tag);
     const body = Buffer.concat([decipher.update(encrypted), decipher.final()]);
     const payload = JSON.parse(body.toString("utf8"));
-    return sanitizedHistory(payload?.history || []);
+    const expiry = Number(payload?.draftExpiresAt);
+    const draft = expiry > Date.now() && payload?.draft && typeof payload.draft === "object" &&
+      Array.isArray(payload.draft.items) ? payload.draft as RememberedDraft : null;
+    return { history: sanitizedHistory(payload?.history || []), draft };
   } catch {
-    return [];
+    return { history: [], draft: null };
   }
 }
 
-export async function saveChatMemory(sessionId: string, customerJid: string, history: ChatTurn[]): Promise<void> {
+export async function loadChatMemory(sessionId: string, customerJid: string): Promise<ChatTurn[]> {
+  return (await loadChatSession(sessionId, customerJid)).history;
+}
+
+export async function saveChatSession(sessionId: string, customerJid: string, history: ChatTurn[], draft: RememberedDraft | null): Promise<void> {
   const path = memoryPath(sessionId, customerJid);
   if (!path) return;
   let temporary = "";
   try {
     const nonce = randomBytes(12);
     const cipher = createCipheriv("aes-256-gcm", encryptionKey(), nonce);
-    const clear = Buffer.from(JSON.stringify({ history: sanitizedHistory(history) }), "utf8");
+    const clear = Buffer.from(JSON.stringify({
+      history: sanitizedHistory(history),
+      draft: draft && Array.isArray(draft.items) ? draft : null,
+      draftExpiresAt: draft ? Date.now() + DRAFT_TTL_MS : 0,
+    }), "utf8");
     const encrypted = Buffer.concat([cipher.update(clear), cipher.final()]);
     const envelope = JSON.stringify({
       version: 1, expiresAt: Date.now() + RETENTION_MS,
@@ -88,4 +108,8 @@ export async function saveChatMemory(sessionId: string, customerJid: string, his
     if (temporary) await unlink(temporary).catch(() => undefined);
     // Conversation memory is optional: filesystem problems cannot interrupt orders.
   }
+}
+
+export async function saveChatMemory(sessionId: string, customerJid: string, history: ChatTurn[]): Promise<void> {
+  await saveChatSession(sessionId, customerJid, history, null);
 }
