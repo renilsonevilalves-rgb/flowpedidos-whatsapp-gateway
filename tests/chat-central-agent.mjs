@@ -314,6 +314,9 @@ test("pilot Gemini handles combined checkout changes before the old single-field
 
 test("one-letter typo adds only the uniquely matched catalog product", async () => {
   const original = globalThis.fetch;
+  const directory = await mkdtemp(join(tmpdir(), "wa-pilot-typo-"));
+  const previous = process.env.CHAT_MEMORY_DIR;
+  process.env.CHAT_MEMORY_DIR = directory;
   const sent = [], actions = [];
   const phone = "5531999955113";
   let modelRequests = 0;
@@ -342,5 +345,10 @@ test("one-letter typo adds only the uniquely matched catalog product", async () 
     assert.match(sent.at(-1), /pudim/i);
     assert.equal(actions.filter(action => action.action === "commit").length, 0);
     assert.equal((await loadChatSession(TENANT, phone + "@s.whatsapp.net")).draft.items[0].productId, PRODUCT);
-  } finally { globalThis.fetch = original; }
+  } finally {
+    globalThis.fetch = original;
+    if (previous === undefined) delete process.env.CHAT_MEMORY_DIR;
+    else process.env.CHAT_MEMORY_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
 });
