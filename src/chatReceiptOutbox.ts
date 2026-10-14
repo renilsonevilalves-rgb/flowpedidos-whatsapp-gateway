@@ -12,6 +12,7 @@ type Log = { warn: (fields: Record<string, unknown>, message: string) => void;
 type Sender = (jid: string, data: { text: string }) => Promise<unknown>;
 const MAX_AGE_MS = 24 * 60 * 60 * 1000;
 const busy = new Set<string>();
+const draining = new Set<string>();
 const secret = () => String(process.env.API_KEY || process.env.API_KEY_2 || "");
 const dir = () => process.env.WHATSAPP_RECEIPT_DIR ||
   join(dirname(process.env.DATA_DIR || "/data/whatsapp-sessions"), "whatsapp-chat-receipts");
@@ -164,7 +165,9 @@ export async function deliverOrderReceipt(
 // once if a crash happened after WhatsApp accepted the send but before unlink;
 // it can NEVER create a duplicate order.
 export async function drainOrderReceipts(sessionId: string, sendMessage: Sender, log: Log): Promise<number> {
-  if (!secret()) return 0;
+  if (!secret() || draining.has(sessionId)) return 0;
+  draining.add(sessionId);
+  try {
   let names: string[];
   try { names = await readdir(dir()); } catch { return 0; }
   let sent = 0;
@@ -183,4 +186,5 @@ export async function drainOrderReceipts(sessionId: string, sendMessage: Sender,
   }
   if (sent) log.info?.({ sessionId, sent }, "[Chat-Receipt] Pending confirmations recovered");
   return sent;
+  } finally { draining.delete(sessionId); }
 }
