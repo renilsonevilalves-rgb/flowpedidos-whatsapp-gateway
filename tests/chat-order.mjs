@@ -1,12 +1,15 @@
 // tests/chat-order.mjs
 import test from "node:test";
 import assert from "node:assert/strict";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 process.env.WHATSAPP_CHAT_ORDERS_ENABLED = "true";
 process.env.GEMINI_API_KEY = "fake-test-gemini";
 process.env.GEMINI_MODEL = "test-gemini";
 process.env.VERCEL_API_URL = "https://backend.test";
 process.env.API_KEY = "fake-test-backend-key";
+process.env.WHATSAPP_RECEIPT_DIR = join(tmpdir(), "wa-receipt-unit-tests-" + process.pid);
 
 const { handleChatOrderMessage } = await import("../dist/chatOrder.js");
 const PRODUCT = "11111111-1111-4111-8111-111111111111";

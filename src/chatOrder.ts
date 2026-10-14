@@ -4,7 +4,7 @@ import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft }
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
 import { looksLikeFieldEdit, planFieldEdit, replyValue, type EditableField } from "./chatFieldAgent.js";
 import { runChatCoordinator } from "./chatCoordinator.js";
-import { deliverOrderReceipt } from "./chatReceiptOutbox.js";
+import { deliverOrderReceipt, prepareOrderReceipt } from "./chatReceiptOutbox.js";
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
 import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
 import { resolveCartAction } from "./chatCartIntent.js";
@@ -1409,6 +1409,12 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     // outbox operation, never another commit.
     let result: any;
     try {
+      // Persist before the backend commit, so a restart after SQL succeeds
+      // cannot erase every record of the confirmation.
+      await prepareOrderReceipt({
+        sessionId: p.sessionId, customerJid: p.customerJid,
+        draftId: state.draft.draftId, phone: String(p.customerPhone || ""),
+      });
       result = await requestBackend(p, "commit",
         { ...state.draft, phone: p.customerPhone, quoteToken: state.quote });
     } catch (error: any) {
@@ -1431,6 +1437,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     const receiptSent = await deliverOrderReceipt({
       sessionId: p.sessionId, customerJid: p.customerJid,
       orderId: clean(result.orderId || result.orderNumber || state.draft.draftId, 120),
+      draftId: state.draft.draftId, phone: String(p.customerPhone || ""),
       text: receipt,
     }, p.sendMessage, p.logger).catch(() => false);
     if (!receiptSent) p.logger.warn({ sessionId: p.sessionId },
