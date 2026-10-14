@@ -16,7 +16,7 @@ process.env.API_KEY = "mock-encryption-key";
 
 const { handleChatOrderMessage } = await import("../dist/chatOrder.js");
 const { saveChatSession } = await import("../dist/chatMemory.js");
-const { deliverOrderReceipt, drainOrderReceipts } = await import("../dist/chatReceiptOutbox.js");
+const { deliverOrderReceipt, drainOrderReceipts, prepareOrderReceipt } = await import("../dist/chatReceiptOutbox.js");
 const TENANT = "22222222-2222-4222-8222-222222222222";
 const OTHER_TENANT = "44444444-4444-4444-8444-444444444444";
 const PUDIM = "11111111-1111-4111-8111-111111111111";
@@ -130,5 +130,82 @@ test("failed confirmation send is encrypted, survives restart and never commits 
   }finally{
     if(old===undefined)delete process.env.WHATSAPP_RECEIPT_DIR;else process.env.WHATSAPP_RECEIPT_DIR=old;
     await rm(root,{recursive:true,force:true});
+  }
+});
+
+test("crash after backend commit but before WhatsApp response recovers exactly once without re-commit", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wa-precommit-"));
+  const oldDir = process.env.WHATSAPP_RECEIPT_DIR;
+  const oldFetch = globalThis.fetch;
+  process.env.WHATSAPP_RECEIPT_DIR = root;
+  const calls = [], outbound = [];
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    calls.push(payload);
+    assert.equal(payload.action, "receipt");
+    assert.equal(payload.sessionId, TENANT);
+    assert.equal(payload.phone, PHONE);
+    assert.equal(payload.draftId, draft.draftId);
+    return json({
+      ok: true, found: true, orderId: "66666666-6666-4666-8666-666666666666",
+      orderNumber: "3245", total: 62.78,
+      message: "Pedido confirmado e encaminhado à loja.",
+    });
+  };
+  try {
+    await prepareOrderReceipt({
+      sessionId: TENANT, customerJid: JID,
+      phone: PHONE, draftId: draft.draftId,
+    });
+    const files = await readdir(root);
+    assert.equal(files.length, 1);
+    const encrypted = await readFile(join(root, files[0]), "utf8");
+    assert.doesNotMatch(encrypted, /5531999966991|12345678-1234|wa-chat:/);
+    // A second store must not receive this customer's receipt.
+    assert.equal(await drainOrderReceipts(OTHER_TENANT,
+      async () => { throw Error("Wrong store"); }, mockLogger), 0);
+    assert.equal(calls.length, 0);
+    assert.equal(await drainOrderReceipts(TENANT, async (jid, data) => {
+      outbound.push({ jid, text: data.text });
+    }, mockLogger), 1);
+    assert.equal(outbound.length, 1);
+    assert.equal(outbound[0].jid, JID);
+    assert.match(outbound[0].text, /Pedido #3245 confirmado/);
+    assert.match(outbound[0].text, /R\$\s*62,78/);
+    assert.equal(calls.length, 1);
+    assert.equal(calls.some(call => call.action === "commit"), false);
+    assert.equal((await readdir(root)).length, 0);
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldDir === undefined) delete process.env.WHATSAPP_RECEIPT_DIR;
+    else process.env.WHATSAPP_RECEIPT_DIR = oldDir;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("prepared receipt without a matching SQL order never creates or announces an order", async () => {
+  const root = await mkdtemp(join(tmpdir(), "wa-precommit-no-order-"));
+  const oldDir = process.env.WHATSAPP_RECEIPT_DIR;
+  const oldFetch = globalThis.fetch;
+  process.env.WHATSAPP_RECEIPT_DIR = root;
+  let calls = 0, sends = 0;
+  globalThis.fetch = async (_url, options) => {
+    const payload = JSON.parse(options.body);
+    assert.equal(payload.action, "receipt");
+    calls++;
+    return json({ ok: true, found: false });
+  };
+  try {
+    await prepareOrderReceipt({
+      sessionId: TENANT, customerJid: JID, phone: PHONE, draftId: draft.draftId,
+    });
+    assert.equal(await drainOrderReceipts(TENANT, async () => { sends++; }, mockLogger), 0);
+    assert.equal(calls, 1);
+    assert.equal(sends, 0);
+  } finally {
+    globalThis.fetch = oldFetch;
+    if (oldDir === undefined) delete process.env.WHATSAPP_RECEIPT_DIR;
+    else process.env.WHATSAPP_RECEIPT_DIR = oldDir;
+    await rm(root, { recursive: true, force: true });
   }
 });
