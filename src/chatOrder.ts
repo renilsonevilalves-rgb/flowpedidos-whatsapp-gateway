@@ -1,6 +1,6 @@
 // src/chatOrder.ts
 import { randomUUID } from "node:crypto";
-import { loadChatMemory, saveChatMemory, type ChatTurn } from "./chatMemory.js";
+import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft } from "./chatMemory.js";
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
 import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
@@ -23,6 +23,7 @@ type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string
   pendingChoice?: { topic: ChoiceTopic; productIds: string[] };
   storeInfo?: ChatStoreInfo | null;
   storeInfoAt?: number;
+  quoteNeedsReview?: boolean;
 };
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
@@ -55,16 +56,63 @@ function fresh(): Draft {
   return { draftId: randomUUID(), items: [], name: "", deliveryType: "", address: "", number: "",
     neighborhood: "", complement: "", reference: "", paymentMethod: "" };
 }
+// A restored draft is only a proposal. Real inventory, options, prices and checkout
+// remain governed by the fresh catalog and backend preview/commit checks.
+function restoreDraft(saved: RememberedDraft | null, catalog: Catalog): Draft | null {
+  if (!saved || !Array.isArray(saved.items) || saved.items.length > 40 ||
+      !/^[0-9a-f-]{36}$/i.test(String(saved.draftId || ""))) return null;
+  const known = new Map(catalog.products.map(product => [product.id, product]));
+  const items: Item[] = [];
+  for (const entry of saved.items) {
+    const product = known.get(entry.productId);
+    if (!product || !Number.isSafeInteger(entry.quantity) || entry.quantity < 1 || entry.quantity > 100) return null;
+    const selectedOptions: NonNullable<Item["selectedOptions"]> = [];
+    for (const option of entry.selectedOptions || []) {
+      const group = product.optionGroups?.find(group => group.id === option.groupId);
+      if (!group?.options.some(allowed => allowed.id === option.id) ||
+          !Number.isSafeInteger(option.quantity) || option.quantity < 1 || option.quantity > 100) return null;
+      selectedOptions.push({ id: option.id, groupId: option.groupId, quantity: option.quantity });
+    }
+    items.push({
+      productId: entry.productId, quantity: entry.quantity, selectedOptions,
+      notes: clean(entry.notes || "", 200),
+    });
+  }
+  if (items.reduce((total, item) => total + item.quantity, 0) > 100) return null;
+  return {
+    draftId: saved.draftId, items,
+    name: clean(saved.name, 120),
+    deliveryType: ["pickup", "delivery"].includes(saved.deliveryType) ? saved.deliveryType : "",
+    address: clean(saved.address, 250), number: clean(saved.number, 30),
+    neighborhood: clean(saved.neighborhood, 100), complement: clean(saved.complement, 160),
+    reference: clean(saved.reference, 160),
+    paymentMethod: ["pix","credit","money","online_pix","online_credit","online_debit"].includes(saved.paymentMethod) ? saved.paymentMethod : "",
+  };
+}
 async function send(p: Params, message: string) {
-  // Keep WhatsApp summary lines readable: clean() is only for input fields.
-  const text = String(message || "").replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ").trim().slice(0, 4000);
-  await p.sendMessage(p.customerJid, { text });
+  // Never silently truncate a paid cart/checkout summary. Keep final
+  // confirmation instructions visible even with multiple customizations.
+  const full = String(message || "").replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ").trim();
+  if (!full || full.length > 18000) throw new Error("Chat response exceeds safe WhatsApp limit");
+  const chunks: string[] = [];
+  let remaining = full;
+  while (remaining.length > 3500) {
+    const breakAt = remaining.lastIndexOf("\n", 3500);
+    const length = breakAt > 1500 ? breakAt : 3500;
+    chunks.push(remaining.slice(0, length).trim());
+    remaining = remaining.slice(length).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  for (const chunk of chunks) {
+    await p.sendMessage(p.customerJid, { text: chunk });
+  }
   const state = drafts.get(p.sessionId + ":" + p.customerJid);
   if (state) {
-    state.history = [...(state.history || []), { role: "assistant" as const, text: clean(text, 800) }].slice(-80);
-    await saveChatMemory(p.sessionId, p.customerJid, state.history);
+    state.history = [...(state.history || []), ...chunks.map(text =>
+      ({ role: "assistant" as const, text: clean(text, 800) }))].slice(-80);
+    await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft);
   }
-  p.logger.info?.({ sessionId: p.sessionId }, "[Chat-Order] WhatsApp response sent");
+  p.logger.info?.({ sessionId: p.sessionId, partCount: chunks.length }, "[Chat-Order] WhatsApp response sent");
 }
 async function requestBackend(p: Params, action: string, data: Record<string, unknown>): Promise<any> {
   let lastError = "Sistema temporariamente indisponível.";
@@ -584,21 +632,38 @@ function recap(d: Draft, catalog: Catalog): string {
   return "Anotei seu pedido:\n" + lines.join("\n") + (d.items.length > 8 ? "\nE mais " + (d.items.length - 8) + " item(ns)." : "");
 }
 function summary(d: Draft, response: any) {
-  const labels: Record<string, string> = { pix: "Pix na entrega", credit: "Cartão na entrega", money: "Dinheiro", online_pix: "Pix online", online_credit: "Cartão online", online_debit: "Débito online" };
+  const methodPlace = d.deliveryType === "pickup" ? "na retirada" : "na entrega";
+  const labels: Record<string, string> = {
+    pix: "Pix " + methodPlace, credit: "Cartão " + methodPlace,
+    money: "Dinheiro", online_pix: "Pix online", online_credit: "Cartão online",
+    online_debit: "Débito online",
+  };
   const lines: string[] = [];
   for (const item of (response.items || []) as any[]) {
-    lines.push(String(item.quantity) + "x " + item.name + " — " + currency(item.total));
-    for (const o of item.selectedOptions || []) lines.push("  • " + o.quantity + "x " + o.name);
-    if (item.notes) lines.push("  Obs: " + item.notes);
+    lines.push("• " + String(item.quantity) + "x " + item.name + " — " + currency(item.total));
+    for (const option of item.selectedOptions || []) {
+      lines.push("   + " + option.quantity + "x " + option.name);
+    }
+    if (item.notes) lines.push("   Obs.: " + item.notes);
   }
-  return ["📋 *Confira seu pedido*", "", ...lines, "",
+  const method = d.deliveryType === "pickup"
+    ? "📍 Retirada na loja"
+    : "🛵 Entrega: " + d.address + ", " + d.number + " — " + d.neighborhood +
+      (d.complement ? " (" + d.complement + ")" : "");
+  const deliveryCost = d.deliveryType === "delivery"
+    ? ["Taxa de entrega: " + currency(response.deliveryFee)] : [];
+  return [
+    "🧾 *Confira seu pedido*", "",
+    "*Itens*", ...lines, "",
     "Subtotal: " + currency(response.subtotal),
-    "Entrega: " + (d.deliveryType === "pickup" ? "Retirada" : currency(response.deliveryFee)),
-    "Total: *" + currency(response.total) + "*", "Nome: " + d.name,
-    d.deliveryType === "delivery" ? "Endereço: " + d.address + ", " + d.number + " — " + d.neighborhood : "",
-    "Pagamento: " + labels[d.paymentMethod], "",
-    "Tudo certo? Responda *SIM* para confirmar ou diga o que mudar."
-  ].filter(Boolean).join("\n");
+    ...deliveryCost,
+    "Total: *" + currency(response.total) + "*", "",
+    method,
+    "👤 Nome: " + d.name,
+    "💳 Pagamento: " + (labels[d.paymentMethod] || "A confirmar"), "",
+    "Está tudo certo? 😊",
+    "Responda *SIM* para confirmar. Para alterar, diga o que deseja mudar.",
+  ].join("\n");
 }
 async function answerContextualQuestion(p: Params, state: State): Promise<boolean> {
   const now = Date.now();
@@ -633,8 +698,11 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   if (concernsExistingOrder(p.text)) return false;
   let state = drafts.get(key);
   if (state && Date.now() - state.updatedAt > 20 * 60_000) { drafts.delete(key); state = undefined; }
-  const firstTurn = !state;
-  if (!state && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) return false;
+  let firstTurn = !state;
+  if (!state && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) {
+    const saved = await loadChatSession(p.sessionId, p.customerJid);
+    if (!saved.draft?.items?.length) return false;
+  }
   if (!/^55[1-9]{2}\d{8,9}$/.test(String(p.customerPhone || ""))) {
     if (state) { await send(p, "Não consegui identificar seu telefone. Fale com a loja."); return true; }
     return false;
@@ -644,16 +712,59 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     try { catalog = await requestBackend(p, "catalog", {}); }
     catch (e: any) { await send(p, "Não consegui consultar os produtos agora. Tente novamente ou use o cardápio."); return true; }
     if (!catalog) return false;
-    state = { draft: fresh(), catalog, updatedAt: Date.now(), history: await loadChatMemory(p.sessionId, p.customerJid) };
+    const stored = await loadChatSession(p.sessionId, p.customerJid);
+    const restored = restoreDraft(stored.draft, catalog);
+    state = {
+      draft: restored || fresh(), catalog, updatedAt: Date.now(),
+      history: stored.history, quoteNeedsReview: Boolean(restored?.items.length),
+    };
+    if (restored?.items.length) firstTurn = false;
     for (const [id, old] of drafts) if (Date.now() - old.updatedAt > 20 * 60_000) drafts.delete(id);
     if (drafts.size >= 1000) drafts.delete(drafts.keys().next().value as string);
     drafts.set(key, state);
   }
   state.updatedAt = Date.now();
   state.history = [...(state.history || []), { role: "user" as const, text: clean(p.text, 800) }].slice(-80);
-  await saveChatMemory(p.sessionId, p.customerJid, state.history);
-  if (cancel(p.text)) { drafts.delete(key); await send(p, "Carrinho descartado. Nenhum pedido foi feito."); return true; }
-  if (state.quote && state.quoteExpiry && Date.now() > state.quoteExpiry) state.quote = undefined;
+  await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft);
+  if (cancel(p.text)) {
+    drafts.delete(key);
+    await saveChatSession(p.sessionId, p.customerJid, state.history, null);
+    await send(p, "Carrinho descartado. Nenhum pedido foi feito.");
+    return true;
+  }
+  // Only a "SIM" immediately following the most recent unmodified preview
+  // may submit an order. An intervening question, correction or expired quote
+  // forces a fresh backend preview and explicit re-confirmation.
+  if (state.quote && state.quoteExpiry && Date.now() > state.quoteExpiry) {
+    state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
+  }
+  if (state.quote && !yes(p.text) && !no(p.text)) {
+    state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
+  }
+  if (!state.quote && state.quoteNeedsReview && yes(p.text)) {
+    if (!state.draft.items.length) {
+      state.quoteNeedsReview = false;
+      await send(p, "Seu carrinho está vazio. O que gostaria de pedir?");
+      return true;
+    }
+    const missing = question(state.draft, state.catalog, state.paymentHint);
+    if (missing) {
+      await send(p, "Antes de confirmar, " + missing);
+      return true;
+    }
+    try {
+      const preview = await requestBackend(p, "preview", { ...state.draft, phone: p.customerPhone });
+      state.quote = preview.quoteToken;
+      state.quoteExpiry = Number(preview.expires);
+      state.quoteNeedsReview = false;
+      await send(p, "Vou atualizar a conferência antes de confirmar, para evitar enganos.\n\n" +
+        summary(state.draft, preview));
+    } catch (error: any) {
+      await send(p, "Não consegui reconferir o pedido: " + clean(error?.message, 180) +
+        ". Nenhum pedido novo foi confirmado.");
+    }
+    return true;
+  }
 
   const normalizedTurn = norm(p.text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
   const promotionFollowup = /^(?:nenhum|nenhuma|nenhum mesmo|nenhuma mesmo|serio|tem certeza|nenhum ai|nao tem nenhum|nem um)$/.test(normalizedTurn);
@@ -711,6 +822,28 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
       await acknowledgeCartEdit(p, state, "Anotei " + parsedChoice[0].quantity + "x *" + (chosen?.name || "produto") + "*!");
       return true;
     }
+  }
+
+  // Re-quote the real cart instead of making Gemini guess a total based on
+  // stale catalog prices or claiming the full amount cannot be calculated.
+  if (state.draft.items.length &&
+      /\b(?:qual (?:o )?total|valor (?:total|do (?:meu )?pedido)|quanto (?:ficou|fica|deu|sai) (?:o |meu |esse )?pedido)\b/.test(normalizedTurn)) {
+    const missing = question(state.draft, state.catalog, state.paymentHint);
+    if (missing) {
+      await send(p, "Para calcular o total corretamente, " + missing);
+      return true;
+    }
+    try {
+      const preview = await requestBackend(p, "preview", { ...state.draft, phone: p.customerPhone });
+      state.quote = preview.quoteToken;
+      state.quoteExpiry = Number(preview.expires);
+      state.quoteNeedsReview = false;
+      await send(p, summary(state.draft, preview));
+    } catch (error: any) {
+      await send(p, "Não consegui conferir o total neste momento: " + clean(error?.message, 170) +
+        ". Nenhum pedido foi confirmado.");
+    }
+    return true;
   }
 
   // Execute explicit cart removals and status checks BEFORE generic catalog questions
@@ -895,6 +1028,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
       const learning = state.pendingLearning;
       const finalItems = state.draft.items;
       drafts.delete(key);
+      await saveChatSession(p.sessionId, p.customerJid, state.history, null);
       await send(p, "✅ Pedido #" + result.orderNumber + " — " + currency(result.total) + "\n" + result.message +
         (result.paymentUrl ? "\n\n🔒 Link para pagamento seguro:\n" + result.paymentUrl + "\n\nA loja recebe após a aprovação do pagamento." : ""));
       if (learning && result.orderId && !result.paymentPending &&
@@ -911,7 +1045,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     } catch (e: any) { state.quote = undefined; await send(p, "Não consegui confirmar se o pedido foi registrado. Para evitar duplicidade, diga *revisar* e confirme o mesmo carrinho novamente. Se houver dúvida, consulte a loja.\n" + clean(e?.message, 200)); }
     return true;
   }
-  if (state.quote && no(p.text)) { state.quote = undefined; await send(p, "Certo, não confirmei. O que quer mudar?"); return true; }
+  if (state.quote && no(p.text)) { state.quote = undefined; state.quoteNeedsReview = true; await send(p, "Certo, não confirmei. O que quer mudar?"); return true; }
   state.quote = undefined;
   const correction = explicitProductCorrection(p.text, state.catalog.products);
   if (correction) state.pendingLearning = correction;
@@ -1022,11 +1156,21 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (!enabled || !geminiKey || !keys.length || !process.env.VERCEL_API_URL || !p.customerJid || !p.text) return false;
   const key = p.sessionId + ":" + p.customerJid;
-  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) return false;
+  if (!drafts.has(key) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) {
+    // Persisted cart recovery must also work after a restart when the next
+    // customer message is a short reply such as "SIM", "retirada" or a name.
+    if (concernsExistingOrder(p.text)) return false;
+    const saved = await loadChatSession(p.sessionId, p.customerJid);
+    if (!saved.draft?.items?.length) return false;
+  }
   const prev = serialized.get(key) || Promise.resolve(false);
   const task = prev.catch(() => false).then(() => processMessage(p, key)).catch(async (error: any) => {
+    const state = drafts.get(key);
+    if (state) {
+      state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
+    }
     p.logger.warn({ sessionId: p.sessionId, error: error?.message }, "[Chat-Order] Failed");
-    await send(p, "Não consegui continuar. Nenhum pagamento foi feito. Tente novamente.").catch(() => undefined);
+    await send(p, "Não consegui continuar com segurança. Nenhum pedido novo foi confirmado por esta resposta. Tente novamente ou digite *revisar*.").catch(() => undefined);
     return true;
   });
   serialized.set(key, task);
