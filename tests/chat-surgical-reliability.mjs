@@ -55,10 +55,10 @@ test("new WhatsApp checkout template separates items, pickup and payment clearly
     await handleChatOrderMessage(params("Renilson"));
     await handleChatOrderMessage(params("dinheiro"));
     assert.match(sent.at(-1), /Confira seu pedido/);
-    assert.match(sent.at(-1), /• 2x Hot dog tradicional — R\$ 25,98/);
+    assert.match(sent.at(-1), /• 2x Hot dog tradicional — R\$\s+25,98/);
     assert.match(sent.at(-1), /📍 Retirada na loja/);
     assert.doesNotMatch(sent.at(-1), /Entrega: Retirada/);
-    assert.match(sent.at(-1), /Total: \*R\$ 25,98\*/);
+    assert.match(sent.at(-1), /Total: \*R\$\s+25,98\*/);
     assert.match(sent.at(-1), /Nome: Renilson/);
     assert.match(sent.at(-1), /Pagamento: Dinheiro/);
     assert.equal(calls.filter(x=>x.action==="commit").length, 0);
