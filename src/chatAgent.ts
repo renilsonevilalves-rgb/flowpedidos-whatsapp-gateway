@@ -25,15 +25,17 @@ export type ChatCatalog = {
   }>;
 };
 
-const ORDER_VERBS = /\b(?:quero|queria|vou querer|me ve|adiciona|acrescenta|coloca|bota|tira|retira|remove|troca|muda|substitui|confirma|confirmo|finaliza|fecha|cancelar)\b/;
+const ORDER_VERBS = /\b(?:quero|queria|vou querer|me ve|adiciona|acrescenta|coloca|bota|tira|retira|remove|troca|muda|substitui|confirma|confirmo|finaliza|cancelar)\b/;
 const STORE_QUESTIONS = /\b(?:horario|horas|aberto|aberta|abre|fecha|funciona|funcionamento|endereco|localizacao|onde fica|onde voces ficam|taxa|frete|entrega|entregam|entregar|bairro|aceita|aceitam|pagamento|pix|cartao|dinheiro|troco|recomenda|recomendar|indica|indicar|sugere|sugestao|duvida|ajuda|atendente|ingredientes|ingrediente|alergia|alergico)\b/;
 
 export function isStoreQuestion(input: string): boolean {
   const text = normalizedText(input);
   if (!text || text.length > 1800 || /\b(?:cancelamento|rastrear|acompanhar|pedido anterior|meu pedido)\b/.test(text)) return false;
-  if (ORDER_VERBS.test(text) && !/\b(?:pode me ajudar|pode explicar|me recomenda|me indica)\b/.test(text)) return false;
-  if (STORE_QUESTIONS.test(text)) return true;
-  return /[?？]/.test(input) && !/^(?:sim|nao|ok)\b/.test(text);
+  if (ORDER_VERBS.test(text) && !/\b(?:quero saber|queria saber|gostaria de saber|pode me ajudar|pode explicar|me recomenda|me indica)\b/.test(text)) return false;
+  const questionLike = /[?？]/.test(input) ||
+    /^(?:qual|quais|quanto|como|quando|onde|ate que|a que|que horas|voces|voce|tem|aceita|aceitam|entregam|pode|quero saber|queria saber|gostaria de saber|me recomenda|me indica|me ajuda|estao|ta aberto|ta aberta)\b/.test(text);
+  if (questionLike) return !/^(?:sim|nao|ok)\b/.test(text);
+  return /\b(?:horario|funcionamento|localizacao|taxa de entrega|valor da entrega|frete|recomendacao|sugestao)\b/.test(text);
 }
 
 function compactStoreContext(info: ChatStoreInfo | null, catalog: ChatCatalog): string {
