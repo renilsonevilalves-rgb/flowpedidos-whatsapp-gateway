@@ -44,6 +44,7 @@ const declarations = [
 
 // Temporary provider outages should not cause a storm of repeated requests.
 let geminiUnavailableUntil = 0;
+let consecutiveRateLimits = 0;
 const instructions = [
   "Você é o coordenador central de um atendente de delivery no WhatsApp brasileiro.",
   "Converse naturalmente; compreenda correções, mensagens curtas, pedidos em várias etapas, erros de digitação e contexto.",
@@ -53,6 +54,11 @@ const instructions = [
   "Para adicionais e opções pagas utilize selectedOptions com os IDs exatos devolvidos por find_products, apenas quando cliente escolheu explicitamente.",
   "Quando a pessoa pedir apenas para mudar número da casa, faça update_checkout(field=number) e preserve rua/bairro.",
   "Quando faltar um dado necessário, faça UMA pergunta objetiva. Não repita campos já preenchidos.",
+  "Considere o snapshot do carrinho como o estado atual verdadeiro, mesmo que o histórico seja antigo.",
+  "Se pendingEdit estiver preenchido, ele é apenas a última pergunta pendente. Se o cliente alterar outro dado, atender ao pedido atual sem insistir no campo anterior.",
+  "Quando o cliente informar várias alterações na mesma mensagem, execute todas as ferramentas necessárias, respeitando as validações; confirme só as que deram certo.",
+  "Entenda erros pequenos de digitação; depois use IDs reais do cardápio e nunca escolha entre variantes ambíguas.",
+  "Se uma ferramenta responder ok=false, explique brevemente o motivo ou faça só a pergunta indispensável. Nunca diga que corrigiu um campo rejeitado.",
   "Se cliente quiser saber horários/endereço da loja use read_store. Sobre o carrinho use read_cart.",
   "Se o cliente pediu a conferência e o cadastro está completo, use preview_order; a ferramenta calculará total real.",
   "NUNCA execute ou solicite commit/pagamento/cancelamento: a confirmação é tratada em separado mediante autorização explícita.",
@@ -87,15 +93,20 @@ async function invoke(params: AgentParams, contents: unknown[]): Promise<any> {
     if (!response.ok) {
       if (response.status === 429 || response.status === 503) {
         const retrySeconds = Number(response.headers.get("retry-after"));
-        const recommended = Number.isFinite(retrySeconds) && retrySeconds > 0
-          ? Math.min(90_000, retrySeconds * 1000)
-          : response.status === 429 ? 30_000 : 12_000;
+        if (response.status === 429) consecutiveRateLimits = Math.min(4, consecutiveRateLimits + 1);
+        const localBackoff = response.status === 429
+          ? Math.min(300_000, 30_000 * (2 ** consecutiveRateLimits))
+          : 12_000;
+        const recommended = Math.max(localBackoff,
+          Number.isFinite(retrySeconds) && retrySeconds > 0
+            ? Math.min(300_000, retrySeconds * 1000) : 0);
         geminiUnavailableUntil = Math.max(geminiUnavailableUntil, Date.now() + recommended);
       }
       params.log.warn({ sessionId: params.sessionId, status: response.status },
         "[Chat-Coordinator] Gemini service unavailable");
       return null;
     }
+    consecutiveRateLimits = 0;
     return response.json().catch(() => null);
   } catch (error: any) {
     if (error?.name === "AbortError") {
