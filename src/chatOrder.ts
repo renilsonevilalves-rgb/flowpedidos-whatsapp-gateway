@@ -760,6 +760,7 @@ async function handlePendingFieldEdit(p: Params, state: State, field: EditableFi
   return true;
 }
 async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
+  const cartAlreadyStarted = state.draft.items.length > 0;
   let previewRequested = false;
   let lastValidatedPreview: any = null;
   const validatedCartEdits: Array<{operation: string; name: string; quantity: number; resultQuantity: number}> = []; // at most one validated backend price query per message
@@ -1013,8 +1014,14 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
       }
     }
     if (quote && state.quote && Number.isFinite(Number(quote.total))) {
-      await send(p, changes + "\n\nNovo total: *" + currency(Number(quote.total)) +
-        "* (incluindo entrega, se houver).\n\nEstá tudo certo? Responda *SIM* para confirmar, ou diga o que mudar.");
+      // A brand-new checkout must display address, customer and payment first.
+      // Edits to an already-reviewed cart deserve the requested short answer.
+      if (!cartAlreadyStarted) {
+        await send(p, summary(state.draft, quote));
+      } else {
+        await send(p, changes + "\n\nNovo total: *" + currency(Number(quote.total)) +
+          "* (incluindo entrega, se houver).\n\nEstá tudo certo? Responda *SIM* para confirmar, ou diga o que mudar.");
+      }
     } else {
       state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
       await send(p, changes + "\nNão consegui conferir o valor final agora. Diga *revisar* para atualizar o total antes de confirmar.");
