@@ -945,7 +945,17 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
   // Pending edit takes priority on the next turn. If the model asked for a
   // correction but did not invoke a tool, existing deterministic flows apply.
   if (agent.reply) {
-    await send(p, agent.reply);
+    // The model cannot create orders, process payment or assert final totals.
+    // Such statements must be backed by the verified backend checkout path.
+    let response = agent.reply;
+    if (/\b(?:pedido (?:foi )?(?:confirmado|registrado|finalizado|enviado)|pagamento (?:foi )?(?:realizado|confirmado|aprovado)|ja (?:confirmei|finalizei) (?:seu |o )?pedido)\b/i.test(norm(response))) {
+      response = "Seu pedido ainda não foi confirmado por esta mensagem. Posso conferir os itens e o total antes de você confirmar.";
+    }
+    if (/R\$\s*\d/.test(response) &&
+        !agent.usedTools.some(tool => ["find_products","preview_order","read_store"].includes(tool))) {
+      response = "Vou precisar consultar os valores atuais da loja antes de informar um preço.";
+    }
+    await send(p, response);
     p.logger.info?.({ sessionId: p.sessionId, toolCalls: agent.usedTools }, "[Chat-Coordinator] response");
     return true;
   }
