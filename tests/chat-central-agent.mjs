@@ -260,3 +260,76 @@ test("agent selects mandatory paid options only with verified catalog IDs and ex
     assert.equal(actions.filter(x => x.action === "commit").length, 0);
   } finally { globalThis.fetch = oldFetch; }
 });
+
+test("after removing one pudding, tells the customer the new verified total immediately even if Gemini gets HTTP 429", async () => {
+  const originalFetch = globalThis.fetch, sent = [], backend = [];
+  const receiptFolder = await mkdtemp(join(tmpdir(), "wa-remove-total-"));
+  const oldFolder = process.env.CHAT_RECEIPTS_DIR;
+  process.env.CHAT_RECEIPTS_DIR = receiptFolder;
+  const phone = "5531999955109";
+  const PUDIM = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const MAC = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  const localCatalog = { ...catalog, products: [
+    { id: PRODUCT, name: "Vitamina de Açaí", price: 9.99, optionGroups: [] },
+    { id: PUDIM, name: "Pudim", price: 27.89, optionGroups: [] },
+    { id: MAC, name: "Macarrão na chapa grande", price: 22.90, optionGroups: [] },
+  ] };
+  let modelRequests = 0;
+  globalThis.fetch = async (url, opts) => {
+    const req = JSON.parse(opts.body);
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      modelRequests++;
+      if (modelRequests === 1) return response({ candidates: [{ content: { role: "model", parts: [
+        tool("edit_cart", { operation: "remove", productId: PUDIM, quantity: 1 }, "remove-one"),
+      ] } }] });
+      // This is the production failure shown in logs: model 429 after mutation.
+      return response({ error: { message: "Quota exceeded" } }, 429);
+    }
+    backend.push(req);
+    if (req.action === "catalog") return response(localCatalog);
+    if (req.action === "preview") {
+      assert.equal(req.items.find(x => x.productId === PUDIM).quantity, 1);
+      assert.equal(req.items.length, 3);
+      return response({
+        ok: true, quoteToken: "verified.quote.token", expires: Date.now()+60000,
+        items: [{ name: "Vitamina de Açaí", quantity: 1, total: 9.99 },
+          { name: "Pudim", quantity: 1, total: 27.89 },
+          { name: "Macarrão na chapa grande", quantity: 1, total: 22.90 }],
+        subtotal: 60.78, deliveryFee: 2, total: 62.78,
+      });
+    }
+    if (req.action === "commit") return response({ ok: true, orderId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      orderNumber: "6129", total: 62.78, message: "Pedido confirmado e encaminhado à loja." });
+    throw Error("Unexpected backend call: " + req.action);
+  };
+  const draft = { draftId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    name: "Renilson", deliveryType: "delivery",
+    address: "Rua Tereza Cristina", number: "188", neighborhood: "Bernardo monteiro",
+    complement: "", reference: "", paymentMethod: "money",
+    items: [{ productId: PRODUCT, quantity: 1, selectedOptions: [], notes: "" },
+      { productId: PUDIM, quantity: 2, selectedOptions: [], notes: "" },
+      { productId: MAC, quantity: 1, selectedOptions: [], notes: "" }],
+  };
+  try {
+    await saveChatSession(TENANT, phone+"@s.whatsapp.net", [], draft);
+    assert.equal(await handleChatOrderMessage(params(phone, "Pode retirar 1 pudim", sent)), true);
+    assert.equal(modelRequests, 2);
+    assert.match(sent.at(-1), /Retirei \*1 Pudim\*/);
+    assert.match(sent.at(-1), /Novo total: \*R\$\s*62,78\*/);
+    assert.match(sent.at(-1), /Responda \*SIM\* para confirmar/);
+    assert.doesNotMatch(sent.at(-1), /Atualizei os dados disponíveis/);
+    assert.equal(backend.filter(x => x.action === "preview").length, 1);
+    assert.equal(backend.filter(x => x.action === "commit").length, 0);
+    await handleChatOrderMessage(params(phone, "Sim", sent));
+    const commits = backend.filter(x => x.action === "commit");
+    assert.equal(commits.length, 1);
+    assert.equal(commits[0].items.find(x => x.productId === PUDIM).quantity, 1);
+    assert.match(sent.at(-1), /Pedido #6129/);
+    assert.equal(backend.filter(x => x.action === "preview").length, 1);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (oldFolder === undefined) delete process.env.CHAT_RECEIPTS_DIR;
+    else process.env.CHAT_RECEIPTS_DIR = oldFolder;
+    await rm(receiptFolder, { recursive: true, force: true });
+  }
+});
