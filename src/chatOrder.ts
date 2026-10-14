@@ -4,6 +4,7 @@ import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft }
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
 import { looksLikeFieldEdit, planFieldEdit, replyValue, type EditableField } from "./chatFieldAgent.js";
 import { runChatCoordinator } from "./chatCoordinator.js";
+import { stageOrderReceipt, confirmOrderReceipt, clearOrderReceipt } from "./chatReceiptOutbox.js";
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
 import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
 import { resolveCartAction } from "./chatCartIntent.js";
@@ -759,7 +760,9 @@ async function handlePendingFieldEdit(p: Params, state: State, field: EditableFi
   return true;
 }
 async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
-  let previewRequested = false; // at most one validated backend price query per message
+  let previewRequested = false;
+  let lastValidatedPreview: any = null;
+  const validatedCartEdits: Array<{operation: string; name: string; quantity: number; resultQuantity: number}> = []; // at most one validated backend price query per message
   // The model has no direct access to APIs. Every tool is validated and scoped
   // to this already authorized tenant and WhatsApp customer.
   const safeCart = () => ({
@@ -892,6 +895,11 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         }
         state.quote = undefined; state.quoteExpiry = undefined;
         state.quoteNeedsReview = true;
+        validatedCartEdits.push({
+          operation, name: product.name, quantity,
+          resultQuantity: state.draft.items.filter(item => item.productId === productId)
+            .reduce((count, item) => count + item.quantity, 0),
+        });
         return { ok: true, mutated: true, cart: safeCart() };
       }
       if (tool === "update_checkout") {
@@ -956,6 +964,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
           const preview = await requestBackend(p, "preview", { ...state.draft, phone: p.customerPhone });
           state.quote = preview.quoteToken; state.quoteExpiry = Number(preview.expires);
           state.quoteNeedsReview = false;
+          lastValidatedPreview = preview;
           return { ok: true, finalReply: summary(state.draft, preview), total: preview.total };
         } catch { return { ok: false, error: "Não consegui validar o valor final agora. Nenhum pedido foi criado." }; }
       }
@@ -963,6 +972,55 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
     },
   });
   if (!agent) return false;
+
+  // An actual cart mutation must never end with the model's generic fallback
+  // ("Atualizei os dados disponíveis"). Recalculate the exact current total
+  // using the signed backend quote once, and answer immediately. This works
+  // even if Gemini's subsequent response is 429/503 or times out.
+  if (validatedCartEdits.length) {
+    const changes = validatedCartEdits.map(action => {
+      const n = action.quantity;
+      if (action.operation === "remove")
+        return "Retirei *" + n + " " + action.name + "* do pedido.";
+      if (action.operation === "add")
+        return "Adicionei *" + n + " " + action.name + "* ao pedido.";
+      return "Ajustei *" + action.name + "* para *" + action.resultQuantity + "* unidade(s).";
+    }).join("\n");
+    if (!state.draft.items.length) {
+      state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
+      await send(p, changes + "\nSeu carrinho ficou vazio. O que gostaria de pedir agora?");
+      return true;
+    }
+    const missing = question(state.draft, state.catalog, state.paymentHint);
+    if (missing) {
+      await send(p, changes + "\n\n" + missing);
+      return true;
+    }
+    if (state.draft.deliveryType === "delivery" && norm(state.catalog.deliveryMode) !== "neighborhood") {
+      await send(p, changes + "\nPara calcular a entrega, finalize pelo cardápio: " + state.catalog.menuUrl);
+      return true;
+    }
+    let quote = lastValidatedPreview && state.quote ? lastValidatedPreview : null;
+    if (!quote && !previewRequested) {
+      try {
+        quote = await requestBackend(p, "preview", { ...state.draft, phone: p.customerPhone });
+        state.quote = quote.quoteToken;
+        state.quoteExpiry = Number(quote.expires);
+        state.quoteNeedsReview = false;
+      } catch (error: any) {
+        p.logger.warn({ sessionId: p.sessionId, reason: "quote_unavailable" },
+          "[Chat-Coordinator] Post-edit quote unavailable");
+      }
+    }
+    if (quote && state.quote && Number.isFinite(Number(quote.total))) {
+      await send(p, changes + "\n\nNovo total: *" + currency(Number(quote.total)) +
+        "* (incluindo entrega, se houver).\n\nEstá tudo certo? Responda *SIM* para confirmar, ou diga o que mudar.");
+    } else {
+      state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
+      await send(p, changes + "\nNão consegui conferir o valor final agora. Diga *revisar* para atualizar o total antes de confirmar.");
+    }
+    return true;
+  }
   // Pending edit takes priority on the next turn. If the model asked for a
   // correction but did not invoke a tool, existing deterministic flows apply.
   if (agent.reply) {
@@ -1355,14 +1413,26 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   }
 
   if (state.quote && yes(p.text)) {
+    const receiptId = { sessionId: p.sessionId, customerJid: p.customerJid,
+      phone: String(p.customerPhone || ""), draftId: state.draft.draftId };
+    let committed = false;
     try {
+      // Persist the intent BEFORE the backend commit. If Railway stops at any
+      // point after SQL succeeds, the next connection can safely look up the
+      // existing idempotency key and deliver its receipt without re-committing.
+      await stageOrderReceipt(receiptId);
       const result = await requestBackend(p, "commit", { ...state.draft, phone: p.customerPhone, quoteToken: state.quote });
+      committed = true;
       const learning = state.pendingLearning;
       const finalItems = state.draft.items;
+      const receiptMessage = "✅ Pedido #" + result.orderNumber + " — " + currency(result.total) + "\n" + result.message +
+        (result.paymentUrl ? "\n\n🔒 Link para pagamento seguro:\n" + result.paymentUrl +
+          "\n\nA loja recebe após a aprovação do pagamento." : "");
       drafts.delete(key);
       await saveChatSession(p.sessionId, p.customerJid, state.history, null);
-      await send(p, "✅ Pedido #" + result.orderNumber + " — " + currency(result.total) + "\n" + result.message +
-        (result.paymentUrl ? "\n\n🔒 Link para pagamento seguro:\n" + result.paymentUrl + "\n\nA loja recebe após a aprovação do pagamento." : ""));
+      await confirmOrderReceipt(receiptId, receiptMessage);
+      await send(p, receiptMessage);
+      await clearOrderReceipt(receiptId);
       if (learning && result.orderId && !result.paymentPending &&
           finalItems.some(item => item.productId === learning.productId)) {
         try {
@@ -1374,7 +1444,18 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
           p.logger.warn({ sessionId: p.sessionId }, "[Chat-Learning] Feedback skipped; checkout unaffected");
         }
       }
-    } catch (e: any) { state.quote = undefined; await send(p, "Não consegui confirmar se o pedido foi registrado. Para evitar duplicidade, diga *revisar* e confirme o mesmo carrinho novamente. Se houver dúvida, consulte a loja.\n" + clean(e?.message, 200)); }
+    } catch (e: any) {
+      state.quote = undefined;
+      if (committed) {
+        // The order exists. Never suggest confirming it again or re-create it.
+        // The encrypted outbox will retry delivery after a WhatsApp reconnection.
+        p.logger.warn({ sessionId: p.sessionId, reason: "receipt_delivery_pending" },
+          "[Chat-Receipt] Order committed; confirmation pending delivery");
+      } else {
+        await send(p, "Não consegui verificar se o pedido foi registrado. Para evitar duplicidade, não vou enviar outro pedido automaticamente. Consulte a loja ou aguarde a confirmação.\n" +
+          clean(e?.message, 160)).catch(() => undefined);
+      }
+    }
     return true;
   }
   if (state.quote && no(p.text)) { state.quote = undefined; state.quoteNeedsReview = true; await send(p, "Certo, não confirmei. O que quer mudar?"); return true; }
