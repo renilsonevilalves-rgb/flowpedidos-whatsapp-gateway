@@ -168,3 +168,55 @@ test("agent validates checkout edits against the actual customer message, never 
     await rm(directory, { recursive: true, force: true });
   }
 });
+
+test("ambiguous product sizes are never silently chosen by the central agent", async () => {
+  const oldFetch = globalThis.fetch, sent = [], actions = [];
+  let genCount = 0;
+  const extra = "33333333-3333-4333-8333-333333333333";
+  globalThis.fetch = async (url, opts) => {
+    const request = JSON.parse(opts.body);
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      genCount++;
+      if (genCount === 1) return response({ candidates: [{ content: { role: "model", parts: [
+        tool("edit_cart", { operation: "add", productId: PRODUCT, quantity: 1 }, "ambiguous"),
+      ] } }] });
+      assert.match(JSON.stringify(request.contents.at(-1)), /variante exatos/);
+      return response({ candidates: [{ content: { role: "model", parts: [
+        { text: "Qual versão do hot dog você prefere: tradicional ou especial?" },
+      ] } }] });
+    }
+    actions.push(request);
+    if (request.action === "catalog") return response({
+      ...catalog, products: [
+        { id: PRODUCT, name: "Hot dog tradicional", price: 12, optionGroups: [] },
+        { id: extra, name: "Hot dog especial", price: 18, optionGroups: [] },
+      ],
+    });
+    throw new Error("Not authorized to preview or commit");
+  };
+  try {
+    await handleChatOrderMessage(params("5531999955103", "Quero um hot dog", sent));
+    assert.match(sent.at(-1), /Qual versão do hot dog/);
+    assert.equal(actions.filter(x => x.action === "preview" || x.action === "commit").length, 0);
+  } finally { globalThis.fetch = oldFetch; }
+});
+
+test("model-only claims of completed orders are blocked without backend commit", async () => {
+  const oldFetch = globalThis.fetch, sent = [], calls = [];
+  globalThis.fetch = async (url, opts) => {
+    const request = JSON.parse(opts.body);
+    if (String(url).includes("generativelanguage.googleapis.com"))
+      return response({ candidates: [{ content: { role: "model", parts: [
+        { text: "Seu pedido foi confirmado! O pagamento foi realizado." },
+      ] } }] });
+    calls.push(request);
+    if (request.action === "catalog") return response(catalog);
+    throw new Error("No checkout expected");
+  };
+  try {
+    await handleChatOrderMessage(params("5531999955104", "Oi, tudo bem?", sent));
+    assert.match(sent.at(-1), /ainda não foi confirmado/);
+    assert.doesNotMatch(sent.at(-1), /pagamento foi realizado/i);
+    assert.equal(calls.filter(x=>x.action==="commit").length,0);
+  } finally { globalThis.fetch = oldFetch; }
+});
