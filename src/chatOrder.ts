@@ -84,6 +84,30 @@ function startsOrder(text: string) {
   if (concernsExistingOrder(t)) return false;
   return /(pelo whatsapp|por aqui mesmo|aqui no chat|sem cardapio|pedido pelo chat|me ve\b|vou querer\b|(?:quero|queria|gostaria(?: de)?|poderia)\s+(?:fazer\s+)?(?:um\s+|uma\s+)?(?:pedido|pedidinho|pedir)\b|(?:quero|queria|vou querer)\s+(?:\d+x?|um|uma|dois|duas|tres)\s)/.test(t);
 }
+
+/**
+ * Simple, explicit service requests cannot depend on Gemini availability.
+ * Keep this narrow: product questions and cart operations still use the
+ * existing validated agent and checkout flow.
+ */
+export function classifyServiceIntent(input: unknown): "menu" | "greeting" | null {
+  const text = norm(input).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  if (!text || text.length > 160) return null;
+  if (/^(?:oi|ola|opa|e ai|bom dia|boa tarde|boa noite|tudo bem)(?: pessoal| gente)?$/.test(text)) return "greeting";
+  const topic = /\b(?:cardapio+s?|cardpio|cardapyo|menu|catalogo)\b/;
+  if (!topic.test(text)) return null;
+
+  // Never turn "I don't want the menu" or a product/cart question into a link.
+  if (/\b(?:sem|dispenso|nao quero(?: mais)?|nao preciso|nao precisa)\b.{0,40}\b(?:cardapio+s?|cardpio|cardapyo|menu|catalogo)\b/.test(text) ||
+      /\b(?:adiciona|adicionar|coloca|colocar|retira|retirar|tira|tirar|remove|remover|troca|trocar|substitui|substituir)\b/.test(text) ||
+      /\b(?:quanto custa|preco|valor|ingredientes|saber se tem|tem o |tem a |tem um |tem uma )\b/.test(text)) return null;
+
+  if (/^(?:(?:oi|ola|bom dia|boa tarde|boa noite)\s+)?(?:(?:o|um|meu|seu)\s+)?(?:cardapio+s?|cardpio|cardapyo|menu|catalogo)(?:\s+(?:digital|online|da loja|de voces|por favor|pfv|ai))*$/.test(text))
+    return "menu";
+  return /\b(?:quero|queria|gostaria|pode|poderia|manda|mandar|mande|envia|enviar|envie|passa|passar|passe|mostra|mostrar|mostre|ver|ve|abrir|abre|acessar|acesso|receber|preciso|tem|link|onde|cade)\b/.test(text)
+    ? "menu" : null;
+}
+
 function fresh(): Draft {
   return { draftId: randomUUID(), items: [], name: "", deliveryType: "", address: "", number: "",
     neighborhood: "", complement: "", reference: "", paymentMethod: "" };
@@ -1138,6 +1162,30 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   }
 
   const normalizedTurn = norm(p.text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+
+  // Explicit requests for the digital menu and simple greetings must work
+  // even when Gemini is rate-limited (429), unavailable (503), or times out.
+  // This read-only path never mutates a cart, submits an order or guesses prices.
+  const serviceIntent = classifyServiceIntent(p.text);
+  if (serviceIntent === "menu") {
+    const link = clean(state.catalog.menuUrl, 1200);
+    if (/^https:\/\/[^\s]+$/i.test(link)) {
+      const name = clean(state.catalog.storeName || "da loja", 80);
+      await send(p, "📋 *Cardápio digital " + name + "*:\n" + link +
+        "\n\nSe preferir, também posso anotar seu pedido por aqui 😊");
+    } else {
+      await send(p, "Quero te mostrar o cardápio, mas o link não está disponível no momento. Posso anotar seu pedido por aqui.");
+    }
+    return true;
+  }
+  if (serviceIntent === "greeting" && !state.draft.items.length) {
+    const timeGreeting = normalizedTurn.startsWith("bom dia") ? "Bom dia!" :
+      normalizedTurn.startsWith("boa tarde") ? "Boa tarde!" :
+      normalizedTurn.startsWith("boa noite") ? "Boa noite!" : "Olá!";
+    await send(p, timeGreeting + " 😊 Posso te enviar o cardápio digital ou anotar seu pedido por aqui. Como prefere?");
+    return true;
+  }
+
   // Pilot first: let Gemini interpret combined edits, corrections and replies.
   // If unavailable, all existing deterministic field/checkout guards still run.
   // Central Gemini tool orchestration replaces rigid routing for pilot stores;
