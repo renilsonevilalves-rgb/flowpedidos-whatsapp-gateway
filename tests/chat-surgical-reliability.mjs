@@ -172,3 +172,36 @@ test("after gateway restart a saved cart accepts short SIM only to re-preview, n
     await rm(directory,{recursive:true,force:true});
   }
 });
+
+test("large customization summaries are sent in complete chunks with confirmation at the end", async () => {
+  const originalFetch=globalThis.fetch;
+  const outgoing=[],calls=[];
+  const customer="5531999966077";
+  const longName="Hot dog personalizado com adicionais e observacoes detalhadas ".repeat(4);
+  globalThis.fetch=async(url,opts)=>{
+    if(String(url).includes("generativelanguage.googleapis.com")){
+      return send({candidates:[{content:{parts:[{text:JSON.stringify({draft:{
+        ...cart,name:"Ana",paymentMethod:"money",
+      }})}]}}]});
+    }
+    const req=JSON.parse(opts.body); calls.push(req);
+    if(req.action==="catalog")return send(catalog);
+    if(req.action==="preview")return send({ok:true,quoteToken:"long.quote",expires:Date.now()+60000,
+      items:Array.from({length:35},(_,i)=>({quantity:1,name:String(i+1)+" "+longName,total:25.98,selectedOptions:[]})),
+      subtotal:909.3,deliveryFee:0,total:909.3});
+    throw Error("No checkout allowed during preview test");
+  };
+  try{
+    const handled=await handleChatOrderMessage({
+      sessionId:TENANT,customerJid:customer+"@s.whatsapp.net",customerPhone:customer,
+      text:"quero 2 hot dog tradicional para retirada",logger,
+      sendMessage:async(_jid,data)=>outgoing.push(data.text),
+    });
+    assert.equal(handled,true);
+    assert.ok(outgoing.length>=2,"long message must be split, not truncated");
+    assert.ok(outgoing.every(x=>x.length<=3500));
+    assert.match(outgoing.join("\n"),/35 Hot dog personalizado/);
+    assert.match(outgoing.at(-1),/Responda \*SIM\* para confirmar/);
+    assert.equal(calls.filter(x=>x.action==="commit").length,0);
+  }finally{globalThis.fetch=originalFetch}
+});
