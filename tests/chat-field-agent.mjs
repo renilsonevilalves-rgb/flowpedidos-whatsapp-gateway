@@ -62,6 +62,9 @@ test("screenshot regression: Gemini asks ONLY new number, keeps complete deliver
     assert.match(sent.at(-1),/Rua Tereza Cristina/);
     assert.doesNotMatch(sent.at(-1),/preciso da rua e número/);
     assert.equal(calls.filter(c=>c.action==="preview").length,0);
+    await handleChatOrderMessage(p("SIM"));
+    assert.match(sent.at(-1),/novo número/);
+    assert.equal(calls.filter(c=>c.action==="preview" || c.action==="commit").length,0);
     await handleChatOrderMessage(p("Quero mudar só o número"));
     assert.match(sent.at(-1),/Qual é o \*novo número\*/);
     await handleChatOrderMessage(p("2001"));
