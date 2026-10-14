@@ -799,7 +799,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   if (state.quote && !yes(p.text) && !no(p.text)) {
     state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
   }
-  if (!state.quote && state.quoteNeedsReview && yes(p.text)) {
+  if (!state.quote && state.quoteNeedsReview && !state.pendingEdit && yes(p.text)) {
     if (!state.draft.items.length) {
       state.quoteNeedsReview = false;
       await send(p, "Seu carrinho está vazio. O que gostaria de pedir?");
