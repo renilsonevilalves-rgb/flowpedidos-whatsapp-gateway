@@ -37,6 +37,8 @@ function harness({ registered = false, saveGates = [] } = {}) {
     Browsers: { ubuntu: () => ['test'] },
     QRCode: { toDataURL: async () => 'test-qr' },
     handleIncomingMessages: async () => {},
+    // Receipt recovery is tested separately; only mock its side effect here.
+    drainOrderReceipts: async () => 0,
     resolveWhatsAppWebVersion: async () => undefined,
     waitForQrOrConnected: async id => context.sessions.get(id).status,
     setTimeout: callback => { const token = {}; timers.set(token, callback); return token; },
