@@ -613,6 +613,16 @@ async function answerContextualQuestion(p: Params, state: State): Promise<boolea
   const answer = await answerStoreQuestion({
     text: p.text, history: state.history || [], catalog: state.catalog,
     storeInfo: state.storeInfo || null,
+    cart: {
+      items: state.draft.items.map(item => ({
+        name: state.catalog.products.find(product => product.id === item.productId)?.name || "Produto indisponível",
+        quantity: item.quantity, notes: item.notes || "",
+      })),
+      name: state.draft.name, deliveryType: state.draft.deliveryType,
+      address: state.draft.address, number: state.draft.number,
+      neighborhood: state.draft.neighborhood, paymentMethod: state.draft.paymentMethod,
+      finalTotalVerified: false,
+    },
     geminiKey, geminiModel, sessionId: p.sessionId, logger: p.logger,
   });
   await send(p, answer || "Não consegui confirmar essa informação com segurança agora. Pode perguntar novamente? Se precisar, posso encaminhar sua dúvida à loja.");
@@ -784,6 +794,8 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   state.lastCartStatusProductId = undefined;
   // Store-service questions are answered by Gemini using verified, tenant-scoped data.
   // Product-name queries still use deterministic catalog matching below.
+  const smallTalk = /^(?:obrigado|obrigada|obg|valeu|show|legal|bacana|entendi|beleza|perfeito|otimo|bom dia|boa tarde|boa noite|oi|ola)[.!?\\s]*$/.test(normalizedTurn);
+  if (smallTalk) return answerContextualQuestion(p, state);
   const serviceQuery = /\b(?:horario|horas|aberto|aberta|abre|fecha|funcionamento|endereco|localizacao|onde fica|taxa|frete|entrega|entregam|bairro|aceita|aceitam|pagamento|pix|cartao|dinheiro|troco|recomenda|indica|sugestao|ajuda|ingredientes|ingrediente|alergia|alergico)\b/.test(normalizedTurn);
   if (isStoreQuestion(p.text) && (serviceQuery || !readInquiry(p.text))) {
     return answerContextualQuestion(p, state);
