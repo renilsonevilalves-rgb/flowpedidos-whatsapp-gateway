@@ -35,7 +35,7 @@ const newSignature = "async function fetchStoreInfo(sessionId: string, includeAi
 if (source.includes(oldSignature)) source = source.replace(oldSignature, newSignature);
 if (!source.includes(newSignature)) throw new Error("Chat order: fetchStoreInfo signature not found");
 const startStoreInfo = source.indexOf(newSignature);
-const endStoreInfo = source.indexOf("\\n\\nfunction unwrapMessage", startStoreInfo);
+const endStoreInfo = source.indexOf("\n\nfunction unwrapMessage", startStoreInfo);
 if (endStoreInfo < 0) throw new Error("Chat order: fetchStoreInfo ending not found");
 let storeInfoBlock = source.slice(startStoreInfo, endStoreInfo);
 const oldPayload = "body: JSON.stringify({ sessionId }),";
