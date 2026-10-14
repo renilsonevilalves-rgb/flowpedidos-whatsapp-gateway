@@ -220,3 +220,42 @@ test("model-only claims of completed orders are blocked without backend commit",
     assert.equal(calls.filter(x=>x.action==="commit").length,0);
   } finally { globalThis.fetch = oldFetch; }
 });
+
+test("agent selects mandatory paid options only with verified catalog IDs and explicit customer text", async () => {
+  const oldFetch = globalThis.fetch, sent = [], actions = [];
+  let round = 0;
+  const groupId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+  const optionId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+  globalThis.fetch = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      round++;
+      if (round === 1) return response({ candidates: [{ content: { role: "model", parts: [
+        tool("edit_cart", { operation: "add", productId: PRODUCT, quantity: 1,
+          selectedOptions: [{ groupId, id: optionId, quantity: 1 }] }, "opt1"),
+        tool("read_cart", {}, "opt2"),
+      ] } }] });
+      const responses = body.contents[2].parts.map(x => x.functionResponse);
+      assert.equal(responses[0].response.ok, true);
+      assert.equal(responses[1].response.cart.items[0].selectedOptions[0].id, optionId);
+      return response({ candidates: [{ content: { role: "model", parts: [
+        { text: "Anotei seu X Tudo ao ponto. Vai ser para entrega ou retirada?" },
+      ] } }] });
+    }
+    actions.push(body);
+    if (body.action === "catalog") return response({
+      ...catalog,
+      products: [{ id: PRODUCT, name: "X Tudo", price: 24.99, optionGroups: [
+        { id: groupId, name: "Ponto da carne", min: 1, max: 1,
+          options: [{ id: optionId, name: "Ao ponto", price: 3 }] },
+      ] }],
+    });
+    throw new Error("Unexpected backend action: " + body.action);
+  };
+  try {
+    await handleChatOrderMessage(params("5531999955105", "Quero um X Tudo ao ponto", sent));
+    assert.equal(round, 2);
+    assert.match(sent.at(-1), /X Tudo ao ponto/);
+    assert.equal(actions.filter(x => x.action === "commit").length, 0);
+  } finally { globalThis.fetch = oldFetch; }
+});
