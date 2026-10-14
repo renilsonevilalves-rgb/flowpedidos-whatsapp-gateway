@@ -16,7 +16,7 @@ process.env.WHATSAPP_RECEIPT_DIR = join(tmpdir(), "wa-receipt-unit-tests-" + pro
 
 const { runChatCoordinator } = await import("../dist/chatCoordinator.js");
 const { handleChatOrderMessage } = await import("../dist/chatOrder.js");
-const { saveChatSession } = await import("../dist/chatMemory.js");
+const { saveChatSession, loadChatSession } = await import("../dist/chatMemory.js");
 const TENANT = "22222222-2222-4222-8222-222222222222";
 const PRODUCT = "11111111-1111-4111-8111-111111111111";
 const catalog = { ok: true, storeName: "Loja Teste", menuUrl: "https://menu.test",
@@ -259,4 +259,88 @@ test("agent selects mandatory paid options only with verified catalog IDs and ex
     assert.match(sent.at(-1), /X Tudo ao ponto/);
     assert.equal(actions.filter(x => x.action === "commit").length, 0);
   } finally { globalThis.fetch = oldFetch; }
+});
+
+test("pilot Gemini handles combined checkout changes before the old single-field router", async () => {
+  const original = globalThis.fetch;
+  const directory = await mkdtemp(join(tmpdir(), "wa-pilot-combined-"));
+  const previous = process.env.CHAT_MEMORY_DIR;
+  process.env.CHAT_MEMORY_DIR = directory;
+  const phone = "5531999955112";
+  const customerJid = phone + "@s.whatsapp.net";
+  const sent = [];
+  let geminiRequests = 0;
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      geminiRequests++;
+      if (geminiRequests === 1) {
+        assert.equal(body.contents[0].parts[0].text.includes("pendingEdit"), true);
+        return response({ candidates: [{ content: { role: "model", parts: [
+          tool("update_checkout", { field: "name", value: "Julia" }, "name"),
+          tool("update_checkout", { field: "number", value: "105" }, "number"),
+        ] } }] });
+      }
+      return response({ candidates: [{ content: { role: "model", parts: [
+        { text: "Pronto, Julia! Atualizei o nome e o número para 105." },
+      ] } }] });
+    }
+    if (body.action === "catalog") return response(catalog);
+    throw new Error("Unexpected action: " + body.action);
+  };
+  try {
+    await saveChatSession(TENANT, customerJid, [], {
+      draftId: "12345678-1234-4234-8234-123456789abc",
+      items: [{ productId: PRODUCT, quantity: 1, selectedOptions: [], notes: "" }],
+      name: "Maria", deliveryType: "delivery", address: "Rua Tereza Cristina",
+      number: "90", neighborhood: "Fonte Grande", complement: "", reference: "",
+      paymentMethod: "money",
+    });
+    await handleChatOrderMessage(params(phone, "Troca o nome para Julia e o número da casa para 105", sent));
+    const saved = await loadChatSession(TENANT, customerJid);
+    assert.equal(saved.draft.name, "Julia");
+    assert.equal(saved.draft.number, "105");
+    assert.equal(saved.draft.address, "Rua Tereza Cristina");
+    assert.equal(saved.draft.neighborhood, "Fonte Grande");
+    assert.equal(geminiRequests, 2);
+    assert.match(sent.at(-1), /Julia/);
+  } finally {
+    globalThis.fetch = original;
+    if (previous === undefined) delete process.env.CHAT_MEMORY_DIR;
+    else process.env.CHAT_MEMORY_DIR = previous;
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test("one-letter typo adds only the uniquely matched catalog product", async () => {
+  const original = globalThis.fetch;
+  const sent = [], actions = [];
+  const phone = "5531999955113";
+  let modelRequests = 0;
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    if (String(url).includes("generativelanguage.googleapis.com")) {
+      modelRequests++;
+      return response({ candidates: [{ content: { role: "model", parts:
+        modelRequests === 1
+          ? [tool("edit_cart", { operation: "add", productId: PRODUCT, quantity: 1 }, "p1")]
+          : [{ text: "Coloquei um pudim no seu pedido. Vai retirar ou receber?" }],
+      } }] });
+    }
+    actions.push(body);
+    if (body.action === "catalog") return response({
+      ...catalog, products: [
+        { id: PRODUCT, name: "Pudim", price: 8, optionGroups: [] },
+        { id: "33333333-3333-4333-8333-333333333333", name: "Pudim gourmet", price: 12, optionGroups: [] },
+      ],
+    });
+    throw new Error("Unexpected backend action: " + body.action);
+  };
+  try {
+    await handleChatOrderMessage(params(phone, "Quero um pudin", sent));
+    assert.equal(modelRequests, 2);
+    assert.match(sent.at(-1), /pudim/i);
+    assert.equal(actions.filter(action => action.action === "commit").length, 0);
+    assert.equal((await loadChatSession(TENANT, phone + "@s.whatsapp.net")).draft.items[0].productId, PRODUCT);
+  } finally { globalThis.fetch = original; }
 });
