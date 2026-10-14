@@ -1182,7 +1182,15 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     const timeGreeting = normalizedTurn.startsWith("bom dia") ? "Bom dia!" :
       normalizedTurn.startsWith("boa tarde") ? "Boa tarde!" :
       normalizedTurn.startsWith("boa noite") ? "Boa noite!" : "Olá!";
-    await send(p, timeGreeting + " 😊 Posso te enviar o cardápio digital ou anotar seu pedido por aqui. Como prefere?");
+    // Preserve automatic digital-menu delivery for the pilot store too.
+    // Gemini is not needed for a greeting, and chat ordering remains optional.
+    const link = clean(state.catalog.menuUrl, 1200);
+    if (/^https:\/\/[^\s]+$/i.test(link)) {
+      await send(p, timeGreeting + " 😊\n\n📋 Confira nosso *cardápio digital*:\n" +
+        link + "\n\nSe preferir, também posso anotar seu pedido por aqui.");
+    } else {
+      await send(p, timeGreeting + " 😊 Posso anotar seu pedido por aqui. O cardápio digital está temporariamente indisponível.");
+    }
     return true;
   }
 

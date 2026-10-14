@@ -66,8 +66,16 @@ test("explicit menu requests and greetings work when Gemini returns 429/503, wit
     sendMessage: async (_jid, message) => { sent.push(message.text); },
   });
   try {
-    assert.equal(await handleChatOrderMessage(params("bom dia")), true);
-    assert.match(sent.at(-1), /^Bom dia!.*cardápio digital/s);
+    for (const [phrase, responseStart] of [
+      ["bom dia", "Bom dia!"], ["boa tarde", "Boa tarde!"],
+      ["boa noite", "Boa noite!"], ["oi", "Olá!"],
+    ]) {
+      assert.equal(await handleChatOrderMessage(params(phrase)), true, phrase);
+      assert.ok(sent.at(-1).startsWith(responseStart), phrase);
+      assert.match(sent.at(-1), /https:\/\/menu\.test\/cardapio\/loja-teste/, phrase);
+      assert.match(sent.at(-1), /também posso anotar seu pedido por aqui/i, phrase);
+      assert.doesNotMatch(sent.at(-1), /posso te enviar o cardápio/i, phrase);
+    }
     for (const phrase of ["cardapio", "quero o cardápio", "quero o cardápio digital",
       "me passa o link do cardápio", "cardpio", "cardápio digital"]) {
       assert.equal(await handleChatOrderMessage(params(phrase)), true, phrase);
