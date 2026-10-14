@@ -142,7 +142,7 @@ async function waitForQrOrConnected(id: string, timeoutMs = 10000) {
   return session.status;
 }
 
-async function fetchStoreInfo(sessionId: string) {
+async function fetchStoreInfo(sessionId: string, includeAiContext = false) {
   const baseUrls = [VERCEL_API_URL, "https://flowoficial01.vercel.app"]
     .map((value) => value.replace(/\/$/, ""))
     .filter((value, index, all) => Boolean(value) && all.indexOf(value) === index);
@@ -162,7 +162,7 @@ async function fetchStoreInfo(sessionId: string) {
           const response = await fetch(`${baseUrl}/api/webhook/whatsapp/store-info`, {
             method: "POST",
             headers: { "Content-Type": "application/json", "X-API-Key": key },
-            body: JSON.stringify({ sessionId }),
+            body: JSON.stringify({ sessionId, includeAiContext }),
             signal: controller.signal,
           });
           const data = await response.json().catch(() => ({}));
