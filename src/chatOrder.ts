@@ -14,7 +14,7 @@ type Draft = {
   draftId: string; items: Item[]; name: string; deliveryType: string;
   address: string; number: string; neighborhood: string; complement: string; reference: string; paymentMethod: string;
 };
-type Catalog = { menuUrl: string; deliveryMode: string; neighborhoods?: string[]; learnedAliases?: LearnedAlias[]; products: Array<{
+type Catalog = { storeName?: string; menuUrl: string; deliveryMode: string; neighborhoods?: string[]; learnedAliases?: LearnedAlias[]; products: Array<{
   id: string; name: string; price: number; category?: string; description?: string;
   promotionEnabled?: boolean; originalPrice?: number | null;
   optionGroups?: Array<{ id: string; name: string; min: number; max: number; options: Array<{ id: string; name: string; price: number }> }>;
