@@ -90,15 +90,29 @@ function restoreDraft(saved: RememberedDraft | null, catalog: Catalog): Draft | 
   };
 }
 async function send(p: Params, message: string) {
-  // Keep WhatsApp summary lines readable: clean() is only for input fields.
-  const text = String(message || "").replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ").trim().slice(0, 4000);
-  await p.sendMessage(p.customerJid, { text });
+  // Never silently truncate a paid cart/checkout summary. Keep final
+  // confirmation instructions visible even with multiple customizations.
+  const full = String(message || "").replace(/[\u0000-\u0009\u000b-\u001f\u007f]/g, " ").trim();
+  if (!full || full.length > 18000) throw new Error("Chat response exceeds safe WhatsApp limit");
+  const chunks: string[] = [];
+  let remaining = full;
+  while (remaining.length > 3500) {
+    const breakAt = remaining.lastIndexOf("\n", 3500);
+    const length = breakAt > 1500 ? breakAt : 3500;
+    chunks.push(remaining.slice(0, length).trim());
+    remaining = remaining.slice(length).trimStart();
+  }
+  if (remaining) chunks.push(remaining);
+  for (const chunk of chunks) {
+    await p.sendMessage(p.customerJid, { text: chunk });
+  }
   const state = drafts.get(p.sessionId + ":" + p.customerJid);
   if (state) {
-    state.history = [...(state.history || []), { role: "assistant" as const, text: clean(text, 800) }].slice(-80);
+    state.history = [...(state.history || []), ...chunks.map(text =>
+      ({ role: "assistant" as const, text: clean(text, 800) }))].slice(-80);
     await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft);
   }
-  p.logger.info?.({ sessionId: p.sessionId }, "[Chat-Order] WhatsApp response sent");
+  p.logger.info?.({ sessionId: p.sessionId, partCount: chunks.length }, "[Chat-Order] WhatsApp response sent");
 }
 async function requestBackend(p: Params, action: string, data: Record<string, unknown>): Promise<any> {
   let lastError = "Sistema temporariamente indisponível.";
@@ -618,8 +632,9 @@ function recap(d: Draft, catalog: Catalog): string {
   return "Anotei seu pedido:\n" + lines.join("\n") + (d.items.length > 8 ? "\nE mais " + (d.items.length - 8) + " item(ns)." : "");
 }
 function summary(d: Draft, response: any) {
+  const methodPlace = d.deliveryType === "pickup" ? "na retirada" : "na entrega";
   const labels: Record<string, string> = {
-    pix: "Pix na retirada/entrega", credit: "Cartão na retirada/entrega",
+    pix: "Pix " + methodPlace, credit: "Cartão " + methodPlace,
     money: "Dinheiro", online_pix: "Pix online", online_credit: "Cartão online",
     online_debit: "Débito online",
   };
@@ -1150,8 +1165,12 @@ export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   }
   const prev = serialized.get(key) || Promise.resolve(false);
   const task = prev.catch(() => false).then(() => processMessage(p, key)).catch(async (error: any) => {
+    const state = drafts.get(key);
+    if (state) {
+      state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
+    }
     p.logger.warn({ sessionId: p.sessionId, error: error?.message }, "[Chat-Order] Failed");
-    await send(p, "Não consegui continuar. Nenhum pagamento foi feito. Tente novamente.").catch(() => undefined);
+    await send(p, "Não consegui continuar com segurança. Nenhum pedido novo foi confirmado por esta resposta. Tente novamente ou digite *revisar*.").catch(() => undefined);
     return true;
   });
   serialized.set(key, task);
