@@ -1054,7 +1054,12 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 
   // Central Gemini tool orchestration replaces rigid routing for pilot stores;
   // the proven legacy path remains as a fail-closed fallback when unavailable.
-  if (canUseCentralAgent(p.sessionId) && await centralAgentMessage(p, state)) return true;
+  // Signed checkout confirmation must take precedence over Gemini routing.
+  // Never let the model reinterpret a customer's explicit SIM/NAO while a
+  // validated preview is pending; legacy commit remains the sole authority.
+  if (canUseCentralAgent(p.sessionId) &&
+      !(state.quote && (yes(p.text) || no(p.text))) &&
+      await centralAgentMessage(p, state)) return true;
 
   const promotionFollowup = /^(?:nenhum|nenhuma|nenhum mesmo|nenhuma mesmo|serio|tem certeza|nenhum ai|nao tem nenhum|nem um)$/.test(normalizedTurn);
   if (isPromotionQuestion(p.text) || (promotionFollowup && state.lastPromotion &&
