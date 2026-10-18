@@ -10,7 +10,14 @@ export type RememberedDraft = {
   name: string; deliveryType: string; address: string; number: string;
   neighborhood: string; complement: string; reference: string; paymentMethod: string;
 };
-export type ChatSessionMemory = { history: ChatTurn[]; draft: RememberedDraft | null; pendingEdit?: string | null };
+export type RememberedPendingProduct = {
+  productId: string; quantity: number;
+  selectedOptions: Array<{ id: string; groupId: string; quantity: number }>;
+};
+export type ChatSessionMemory = {
+  history: ChatTurn[]; draft: RememberedDraft | null;
+  pendingEdit?: string | null; pendingProduct?: RememberedPendingProduct | null;
+};
 const DRAFT_TTL_MS = 60 * 60 * 1000;
 
 const RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
@@ -71,7 +78,20 @@ export async function loadChatSession(sessionId: string, customerJid: string): P
     const expiry = Number(payload?.draftExpiresAt);
     const draft = expiry > Date.now() && payload?.draft && typeof payload.draft === "object" &&
       Array.isArray(payload.draft.items) ? payload.draft as RememberedDraft : null;
-    return { history: sanitizedHistory(payload?.history || []), draft, pendingEdit: draft && typeof payload?.pendingEdit === "string" ? payload.pendingEdit : null };
+    const pending = draft && payload?.pendingProduct;
+    const pendingProduct: RememberedPendingProduct | null = pending &&
+      typeof pending.productId === "string" &&
+      Number.isSafeInteger(pending.quantity) && pending.quantity >= 1 && pending.quantity <= 40 &&
+      Array.isArray(pending.selectedOptions) && pending.selectedOptions.length <= 30 &&
+      pending.selectedOptions.every((item: any) => item && typeof item.id === "string" &&
+        typeof item.groupId === "string" && Number.isSafeInteger(item.quantity) &&
+        item.quantity >= 1 && item.quantity <= 20)
+      ? pending as RememberedPendingProduct : null;
+    return {
+      history: sanitizedHistory(payload?.history || []), draft,
+      pendingEdit: draft && typeof payload?.pendingEdit === "string" ? payload.pendingEdit : null,
+      pendingProduct,
+    };
   } catch {
     return { history: [], draft: null };
   }
@@ -81,7 +101,11 @@ export async function loadChatMemory(sessionId: string, customerJid: string): Pr
   return (await loadChatSession(sessionId, customerJid)).history;
 }
 
-export async function saveChatSession(sessionId: string, customerJid: string, history: ChatTurn[], draft: RememberedDraft | null, pendingEdit: string | null = null): Promise<void> {
+export async function saveChatSession(
+  sessionId: string, customerJid: string, history: ChatTurn[],
+  draft: RememberedDraft | null, pendingEdit: string | null = null,
+  pendingProduct: RememberedPendingProduct | null = null,
+): Promise<void> {
   const path = memoryPath(sessionId, customerJid);
   if (!path) return;
   let temporary = "";
@@ -92,6 +116,7 @@ export async function saveChatSession(sessionId: string, customerJid: string, hi
       history: sanitizedHistory(history),
       draft: draft && Array.isArray(draft.items) ? draft : null,
       pendingEdit: pendingEdit && ["number","address","neighborhood","name","paymentMethod","deliveryType"].includes(pendingEdit) ? pendingEdit : null,
+      pendingProduct: draft ? pendingProduct : null,
       draftExpiresAt: draft ? Date.now() + DRAFT_TTL_MS : 0,
     }), "utf8");
     const encrypted = Buffer.concat([cipher.update(clear), cipher.final()]);
