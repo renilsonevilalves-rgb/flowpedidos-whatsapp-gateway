@@ -1,6 +1,6 @@
 // src/chatOrder.ts
 import { randomUUID } from "node:crypto";
-import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft } from "./chatMemory.js";
+import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft, type RememberedPendingProduct } from "./chatMemory.js";
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
 import { looksLikeFieldEdit, planFieldEdit, replyValue, type EditableField } from "./chatFieldAgent.js";
 import { runChatCoordinator } from "./chatCoordinator.js";
@@ -168,7 +168,7 @@ async function send(p: Params, message: string) {
   if (state) {
     state.history = [...(state.history || []), ...chunks.map(text =>
       ({ role: "assistant" as const, text: clean(text, 800) }))].slice(-80);
-    await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft, state.pendingEdit || null);
+    await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft, state.pendingEdit || null, state.pendingProduct || null);
   }
   p.logger.info?.({ sessionId: p.sessionId, partCount: chunks.length }, "[Chat-Order] WhatsApp response sent");
 }
@@ -824,6 +824,29 @@ function pendingRequiredGroup(product: Catalog["products"][number], selections: 
     selections.filter(option => option.groupId === group.id)
       .reduce((sum, option) => sum + option.quantity, 0) < Number(group.min || 0));
 }
+function restorePendingProduct(
+  saved: RememberedPendingProduct | null | undefined, catalog: Catalog,
+): State["pendingProduct"] {
+  if (!saved || !Number.isSafeInteger(saved.quantity) || saved.quantity < 1 || saved.quantity > 40 ||
+      !Array.isArray(saved.selectedOptions) || saved.selectedOptions.length > 30) return undefined;
+  const product = catalog.products.find(row => row.id === saved.productId);
+  if (!product || !product.optionGroups?.length) return undefined;
+  const byGroup = new Map<string, number>();
+  const seen = new Set<string>();
+  const selectedOptions: NonNullable<Item["selectedOptions"]> = [];
+  for (const entry of saved.selectedOptions) {
+    const group = product.optionGroups.find(g => g.id === entry.groupId);
+    if (!group || !group.options.some(o => o.id === entry.id) ||
+        !Number.isSafeInteger(entry.quantity) || entry.quantity !== 1 ||
+        seen.has(entry.groupId + ":" + entry.id)) return undefined;
+    seen.add(entry.groupId + ":" + entry.id);
+    byGroup.set(group.id, (byGroup.get(group.id) || 0) + entry.quantity);
+    if (byGroup.get(group.id)! > Number(group.max || 0)) return undefined;
+    selectedOptions.push({ groupId: entry.groupId, id: entry.id, quantity: entry.quantity });
+  }
+  return pendingRequiredGroup(product, selectedOptions)
+    ? { productId: product.id, quantity: saved.quantity, selectedOptions } : undefined;
+}
 function hasIncompleteOptionItems(state: State): boolean {
   return state.draft.items.some(item => {
     const product = state.catalog.products.find(p => p.id === item.productId);
@@ -894,17 +917,43 @@ async function interruptForNewProduct(p: Params, state: State): Promise<boolean>
     return name && (" " + incoming + " ").includes(" " + name + " ") &&
       !(" " + incoming + " ").includes(" sem " + name + " ");
   });
-  if (!selections.length) return false; // An unrelated customer request can proceed.
+  if (!selections.length) {
+    if (yes(p.text) || /^(?:revisar|confirmar|finalizar|total|resumo)$/i.test(norm(p.text))) {
+      await send(p, optionQuestion(product, group));
+      return true;
+    }
+    if (no(p.text)) {
+      state.pendingProduct = undefined;
+      await send(p, "Certo, não adicionei *" + product.name + "*. Seu pedido continua igual.");
+      return true;
+    }
+    return false; // An unrelated customer request can proceed.
+  }
   const maximum = Number(group.max || 0);
   const minimum = Number(group.min || 0);
-  if (selections.length < minimum || (maximum && selections.length > maximum)) {
-    await send(p, "Para *" + group.name + "*, escolha " + minimum +
-      (maximum && maximum !== minimum ? " a " + maximum : "") + " opção(ões): " +
-      group.options.map(option => option.name).join(", ") + ".");
+  const alreadySelected = pending.selectedOptions.filter(option => option.groupId === group.id);
+  const uniqueSelections = selections.filter(option =>
+    !alreadySelected.some(selected => selected.id === option.id));
+  const totalSelected = alreadySelected.length + uniqueSelections.length;
+  if (uniqueSelections.length === 0) {
+    await send(p, "Essa opção já foi anotada. " + optionQuestion(product, group));
     return true;
   }
-  const selectedOptions = [...pending.selectedOptions, ...selections.map(option =>
+  if (maximum && totalSelected > maximum) {
+    await send(p, "Para *" + group.name + "*, escolha no máximo " + maximum +
+      " opção(ões). " + optionQuestion(product, group));
+    return true;
+  }
+  const selectedOptions = [...pending.selectedOptions, ...uniqueSelections.map(option =>
     ({ groupId: group.id, id: option.id, quantity: 1 }))];
+  if (totalSelected < minimum) {
+    state.pendingProduct = { ...pending, selectedOptions };
+    await send(p, "Anotei sua escolha. Falta" + (minimum - totalSelected === 1 ? " 1 opção" :
+      "m " + (minimum - totalSelected) + " opções") + " para *" + group.name + "*: " +
+      group.options.filter(option => !selectedOptions.some(item => item.id === option.id))
+        .map(option => option.name).join(", ") + ".");
+    return true;
+  }
   const nextGroup = pendingRequiredGroup(product, selectedOptions);
   if (nextGroup) {
     state.pendingProduct = { ...pending, selectedOptions };
@@ -1136,6 +1185,12 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
       if (tool === "preview_order") {
         if (previewRequested) return { ok: false, error: "Prévia já consultada nesta mensagem." };
         previewRequested = true;
+        if (state.pendingProduct) {
+          const product = state.catalog.products.find(row => row.id === state.pendingProduct?.productId);
+          const group = product && pendingRequiredGroup(product, state.pendingProduct.selectedOptions);
+          return { ok: false, error: product && group
+            ? optionQuestion(product, group) : "Ainda falta escolher as opções do produto pendente." };
+        }
         const missing = question(state.draft, state.catalog, state.paymentHint);
         if (missing) return { ok: false, error: "Ainda faltam informações: " + missing };
         if (state.draft.deliveryType === "delivery" && norm(state.catalog.deliveryMode) !== "neighborhood")
@@ -1202,6 +1257,15 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
     if (/\b(?:pedido (?:foi )?(?:confirmado|registrado|finalizado|enviado)|pagamento (?:foi )?(?:realizado|confirmado|aprovado)|ja (?:confirmei|finalizei) (?:seu |o )?pedido)\b/i.test(norm(response))) {
       response = "Seu pedido ainda não foi confirmado por esta mensagem. Posso conferir os itens e o total antes de você confirmar.";
     }
+    // A model-only sentence never proves the cart/checkout was changed.
+    if (!agent.mutated && /\b(?:adicionei|acrescentei|coloquei|retirei|removi|exclui|troquei|atualizei|mudei)\b/.test(norm(response)) &&
+        !/\b(?:nao|ainda nao|nao consegui)\s+\w*\s*(?:adicionei|acrescentei|coloquei|retirei|removi|exclui|troquei|atualizei|mudei)\b/.test(norm(response))) {
+      response = "Ainda não fiz essa alteração no pedido. Me confirme o produto e o que deseja mudar para eu fazer corretamente.";
+    }
+    const lastAssistant = [...(state.history || [])].reverse().find(turn => turn.role === "assistant")?.text;
+    if (!agent.mutated && lastAssistant && norm(response) === norm(lastAssistant)) {
+      response = "Entendi sua mensagem. Para não repetir a mesma resposta, me diga qual produto ou opção você quer agora.";
+    }
     if (/R\$\s*\d/.test(response) &&
         !agent.usedTools.some(tool => ["find_products","preview_order","read_store"].includes(tool))) {
       response = "Vou precisar consultar os valores atuais da loja antes de informar um preço.";
@@ -1221,7 +1285,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   let firstTurn = !state;
   if (!state && !canUseCentralAgent(p.sessionId) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) {
     const saved = await loadChatSession(p.sessionId, p.customerJid);
-    if (!saved.draft?.items?.length) return false;
+    if (!saved.draft?.items?.length && !saved.pendingProduct) return false;
   }
   if (!/^55[1-9]{2}\d{8,9}$/.test(String(p.customerPhone || ""))) {
     if (state) { await send(p, "Não consegui identificar seu telefone. Fale com a loja."); return true; }
@@ -1238,15 +1302,23 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
       draft: restored || fresh(), catalog, updatedAt: Date.now(),
       history: stored.history, quoteNeedsReview: Boolean(restored?.items.length),
       pendingEdit: restored && ["number","address","neighborhood","name","paymentMethod","deliveryType"].includes(stored.pendingEdit || "") ? stored.pendingEdit as EditableField : undefined,
+      pendingProduct: restored ? restorePendingProduct(stored.pendingProduct, catalog) : undefined,
     };
-    if (restored?.items.length) firstTurn = false;
+    if (restored?.items.length || state.pendingProduct) firstTurn = false;
     for (const [id, old] of drafts) if (Date.now() - old.updatedAt > 20 * 60_000) drafts.delete(id);
     if (drafts.size >= 1000) drafts.delete(drafts.keys().next().value as string);
     drafts.set(key, state);
   }
   state.updatedAt = Date.now();
   state.history = [...(state.history || []), { role: "user" as const, text: clean(p.text, 800) }].slice(-80);
-  await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft, state.pendingEdit || null);
+  await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft, state.pendingEdit || null, state.pendingProduct || null);
+  if (state.pendingProduct && /^(?:esquece|deixa pra la)$/i.test(norm(p.text))) {
+    const product = state.catalog.products.find(row => row.id === state!.pendingProduct!.productId);
+    state.pendingProduct = undefined;
+    await send(p, "Tudo bem, não adicionei *" + (product?.name || "esse produto") +
+      "*. O restante do seu pedido continua igual.");
+    return true;
+  }
   if (cancel(p.text)) {
     state.pendingProduct = undefined;
     drafts.delete(key);
@@ -1263,7 +1335,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   if (state.quote && !yes(p.text) && !no(p.text)) {
     state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
   }
-  if (!state.quote && state.quoteNeedsReview && !state.pendingEdit && yes(p.text)) {
+  if (!state.quote && state.quoteNeedsReview && !state.pendingEdit && !state.pendingProduct && yes(p.text)) {
     if (!state.draft.items.length) {
       state.quoteNeedsReview = false;
       await send(p, "Seu carrinho está vazio. O que gostaria de pedir?");
@@ -1793,7 +1865,7 @@ export async function handleChatOrderMessage(p: Params): Promise<boolean> {
     // customer message is a short reply such as "SIM", "retirada" or a name.
     if (concernsExistingOrder(p.text)) return false;
     const saved = await loadChatSession(p.sessionId, p.customerJid);
-    if (!saved.draft?.items?.length) return false;
+    if (!saved.draft?.items?.length && !saved.pendingProduct) return false;
   }
   const prev = serialized.get(key) || Promise.resolve(false);
   const task = prev.catch(() => false).then(() => processMessage(p, key)).catch(async (error: any) => {
