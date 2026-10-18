@@ -28,6 +28,8 @@ type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string
   storeInfoAt?: number;
   quoteNeedsReview?: boolean;
   pendingEdit?: EditableField;
+  // A product awaiting mandatory options is separate from checkout questions.
+  pendingProduct?: { productId: string; quantity: number; selectedOptions: NonNullable<Item["selectedOptions"]> };
 };
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
@@ -804,6 +806,130 @@ async function handlePendingFieldEdit(p: Params, state: State, field: EditableFi
   await acknowledgeCartEdit(p, state, label);
   return true;
 }
+
+// Follow-up product requests must be read before the previous product's
+// optional/mandatory-question context. Never interpret questions, negations,
+// swaps, cancellations, or combined cart edits as a simple new addition.
+function explicitlyRequestsProduct(input: string): boolean {
+  const text = norm(input).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  if (!text || /[?？]/.test(input)) return false;
+  if (/\b(?:nao|nem|nunca|sem)\s+(?:quero|queria|adiciona|adicione|adicionar|acrescenta|acrescentar|coloca|colocar|inclui|incluir)\b/.test(text)) return false;
+  if (/\b(?:troca|trocar|substitui|substituir|retira|retire|retirar|tira|tire|tirar|remove|remova|remover|cancela|cancelar|exclui|exclua|excluir|apaga|apague|se tiver|se tem|quanto|preco|valor|saber)\b/.test(text)) return false;
+  // Mixed product + delivery/payment/address requests belong to the coordinator.
+  if (/\b(?:entrega|retirada|pix|cartao|dinheiro|pagar|pagamento|endereco|rua|bairro|numero|nome|me chamo)\b/.test(text)) return false;
+  return /\b(?:adiciona|adicione|adicionar|acrescenta|acrescente|acrescentar|inclui|incluir|coloca|colocar|bota|botar|quero|queria|gostaria|vou querer|me ve)\b/.test(text);
+}
+function pendingRequiredGroup(product: Catalog["products"][number], selections: NonNullable<Item["selectedOptions"]>) {
+  return (product.optionGroups || []).find(group =>
+    selections.filter(option => option.groupId === group.id)
+      .reduce((sum, option) => sum + option.quantity, 0) < Number(group.min || 0));
+}
+function hasIncompleteOptionItems(state: State): boolean {
+  return state.draft.items.some(item => {
+    const product = state.catalog.products.find(p => p.id === item.productId);
+    return Boolean(product && pendingRequiredGroup(product, item.selectedOptions || []));
+  });
+}
+function optionQuestion(product: Catalog["products"][number], group: NonNullable<Catalog["products"][number]["optionGroups"]>[number]): string {
+  const minimum = Number(group.min || 0);
+  return "Para adicionar *" + product.name + "*, escolha *" + group.name + "*" +
+    (minimum > 1 ? " (" + minimum + " opções)" : "") + ": " +
+    group.options.map(option => option.name).join(", ") + ".";
+}
+async function interruptForNewProduct(p: Params, state: State): Promise<boolean> {
+  const incoming = norm(p.text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  // Removals and status questions have a dedicated, higher-priority cart path.
+  if (!resolveCartAction(p.text, state.catalog.products, state.draft.items) &&
+      explicitlyRequestsProduct(p.text)) {
+    const requested = safeCatalogItems(p.text, state.catalog);
+    // Do not split a mixed request into a partial order or guess variants.
+    if (requested.length === 1 && requested[0].quantity <= 40) {
+      const item = requested[0];
+      const product = state.catalog.products.find(candidate => candidate.id === item.productId);
+      if (product) {
+        // Notes and add-ons must still pass the existing AI+backend validators.
+        const optionNames = (product.optionGroups || [])
+          .flatMap(group => group.options.map(option => norm(option.name)));
+        const mentionsOptions = optionNames.some(name =>
+          name && (" " + incoming + " ").includes(" " + name + " "));
+        if (!mentionsOptions) {
+          state.pendingProduct = undefined;
+          const required = pendingRequiredGroup(product, []);
+          if (required) {
+            state.pendingProduct = { productId: product.id, quantity: item.quantity, selectedOptions: [] };
+            await send(p, optionQuestion(product, required));
+            return true;
+          }
+          if (addItemsToDraft(state, [item])) {
+            state.pendingChoice = undefined;
+            state.pendingAdd = undefined;
+            state.pendingSwap = undefined;
+            state.pendingEdit = undefined;
+            state.quoteNeedsReview = true;
+            if (hasIncompleteOptionItems(state)) {
+              await send(p, "Adicionei *" + item.quantity + "x " + product.name +
+                "* ao carrinho 😊 Podemos continuar escolhendo. Antes de finalizar, vamos conferir as opções que ainda faltam.");
+            } else {
+              await acknowledgeCartEdit(p, state, "Adicionei *" + item.quantity + "x " + product.name + "* ao pedido!");
+            }
+            return true;
+          }
+          await send(p, "Não consegui adicionar *" + product.name +
+            "* com segurança. Pode conferir a quantidade ou os itens do carrinho?");
+          return true;
+        }
+      }
+    }
+  }
+  // Short answers to a NEW item's mandatory options must not be interpreted
+  // as an answer about an older, unrelated item or checkout field.
+  const pending = state.pendingProduct;
+  if (!pending) return false;
+  const product = state.catalog.products.find(item => item.id === pending.productId);
+  if (!product) { state.pendingProduct = undefined; return false; }
+  const group = pendingRequiredGroup(product, pending.selectedOptions);
+  if (!group) { state.pendingProduct = undefined; return false; }
+  const selections = group.options.filter(option => {
+    const name = norm(option.name).replace(/[^a-z0-9 ]/g, " ").trim();
+    return name && (" " + incoming + " ").includes(" " + name + " ") &&
+      !(" " + incoming + " ").includes(" sem " + name + " ");
+  });
+  if (!selections.length) return false; // An unrelated customer request can proceed.
+  const maximum = Number(group.max || 0);
+  const minimum = Number(group.min || 0);
+  if (selections.length < minimum || (maximum && selections.length > maximum)) {
+    await send(p, "Para *" + group.name + "*, escolha " + minimum +
+      (maximum && maximum !== minimum ? " a " + maximum : "") + " opção(ões): " +
+      group.options.map(option => option.name).join(", ") + ".");
+    return true;
+  }
+  const selectedOptions = [...pending.selectedOptions, ...selections.map(option =>
+    ({ groupId: group.id, id: option.id, quantity: 1 }))];
+  const nextGroup = pendingRequiredGroup(product, selectedOptions);
+  if (nextGroup) {
+    state.pendingProduct = { ...pending, selectedOptions };
+    await send(p, optionQuestion(product, nextGroup));
+    return true;
+  }
+  if (!addItemsToDraft(state, [{ productId: product.id, quantity: pending.quantity, selectedOptions }])) {
+    await send(p, "Não consegui adicionar o produto ao carrinho. Pode conferir a quantidade?");
+    return true;
+  }
+  state.pendingProduct = undefined;
+  state.pendingChoice = undefined;
+  state.pendingAdd = undefined;
+  state.pendingSwap = undefined;
+  state.pendingEdit = undefined;
+  state.quoteNeedsReview = true;
+  if (hasIncompleteOptionItems(state)) {
+    await send(p, "Adicionei *" + pending.quantity + "x " + product.name +
+      "* ao carrinho 😊 Podemos continuar; antes de finalizar, conferimos as outras opções pendentes.");
+  } else {
+    await acknowledgeCartEdit(p, state, "Adicionei *" + pending.quantity + "x " + product.name + "* ao pedido!");
+  }
+  return true;
+}
+
 async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
   let lastRemoval: { productName: string; quantity: number } | null = null;
   let mutations = 0;
@@ -1122,6 +1248,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   state.history = [...(state.history || []), { role: "user" as const, text: clean(p.text, 800) }].slice(-80);
   await saveChatSession(p.sessionId, p.customerJid, state.history, state.draft, state.pendingEdit || null);
   if (cancel(p.text)) {
+    state.pendingProduct = undefined;
     drafts.delete(key);
     await saveChatSession(p.sessionId, p.customerJid, state.history, null);
     await send(p, "Carrinho descartado. Nenhum pedido foi feito.");
@@ -1193,6 +1320,11 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     }
     return true;
   }
+
+  // Reinterpret an explicit NEW product first, rather than repeating an older
+  // item's mandatory-option question. Skip first-turn and signed confirmations.
+  if (!firstTurn && !(state.quote && (yes(p.text) || no(p.text))) &&
+      await interruptForNewProduct(p, state)) return true;
 
   // Pilot first: let Gemini interpret combined edits, corrections and replies.
   // If unavailable, all existing deterministic field/checkout guards still run.
