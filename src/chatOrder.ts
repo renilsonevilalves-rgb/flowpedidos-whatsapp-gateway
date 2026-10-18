@@ -815,6 +815,8 @@ function explicitlyRequestsProduct(input: string): boolean {
   if (!text || /[?？]/.test(input)) return false;
   if (/\b(?:nao|nem|nunca|sem)\s+(?:quero|queria|adiciona|adicione|adicionar|acrescenta|acrescentar|coloca|colocar|inclui|incluir)\b/.test(text)) return false;
   if (/\b(?:troca|trocar|substitui|substituir|retira|retirar|tira|tirar|remove|remover|cancela|cancelar|exclui|excluir|se tiver|se tem|quanto|preco|valor|saber)\b/.test(text)) return false;
+  // Mixed product + delivery/payment/address requests belong to the coordinator.
+  if (/\b(?:entrega|retirada|pix|cartao|dinheiro|pagar|pagamento|endereco|rua|bairro|numero|nome|me chamo)\b/.test(text)) return false;
   return /\b(?:adiciona|adicione|adicionar|acrescenta|acrescente|acrescentar|inclui|incluir|coloca|colocar|bota|botar|quero|queria|gostaria|vou querer|me ve)\b/.test(text);
 }
 function pendingRequiredGroup(product: Catalog["products"][number], selections: NonNullable<Item["selectedOptions"]>) {
