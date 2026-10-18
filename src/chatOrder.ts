@@ -814,7 +814,7 @@ function explicitlyRequestsProduct(input: string): boolean {
   const text = norm(input).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
   if (!text || /[?？]/.test(input)) return false;
   if (/\b(?:nao|nem|nunca|sem)\s+(?:quero|queria|adiciona|adicione|adicionar|acrescenta|acrescentar|coloca|colocar|inclui|incluir)\b/.test(text)) return false;
-  if (/\b(?:troca|trocar|substitui|substituir|retira|retirar|tira|tirar|remove|remover|cancela|cancelar|exclui|excluir|se tiver|se tem|quanto|preco|valor|saber)\b/.test(text)) return false;
+  if (/\b(?:troca|trocar|substitui|substituir|retira|retire|retirar|tira|tire|tirar|remove|remova|remover|cancela|cancelar|exclui|exclua|excluir|apaga|apague|se tiver|se tem|quanto|preco|valor|saber)\b/.test(text)) return false;
   // Mixed product + delivery/payment/address requests belong to the coordinator.
   if (/\b(?:entrega|retirada|pix|cartao|dinheiro|pagar|pagamento|endereco|rua|bairro|numero|nome|me chamo)\b/.test(text)) return false;
   return /\b(?:adiciona|adicione|adicionar|acrescenta|acrescente|acrescentar|inclui|incluir|coloca|colocar|bota|botar|quero|queria|gostaria|vou querer|me ve)\b/.test(text);
@@ -838,7 +838,9 @@ function optionQuestion(product: Catalog["products"][number], group: NonNullable
 }
 async function interruptForNewProduct(p: Params, state: State): Promise<boolean> {
   const incoming = norm(p.text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
-  if (explicitlyRequestsProduct(p.text)) {
+  // Removals and status questions have a dedicated, higher-priority cart path.
+  if (!resolveCartAction(p.text, state.catalog.products, state.draft.items) &&
+      explicitlyRequestsProduct(p.text)) {
     const requested = safeCatalogItems(p.text, state.catalog);
     // Do not split a mixed request into a partial order or guess variants.
     if (requested.length === 1 && requested[0].quantity <= 40) {
