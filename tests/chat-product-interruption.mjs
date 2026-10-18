@@ -12,6 +12,7 @@ process.env.GEMINI_MODEL = "test-model";
 process.env.VERCEL_API_URL = "https://backend.test";
 process.env.API_KEY = "test-backend";
 process.env.WHATSAPP_RECEIPT_DIR = join(tmpdir(), "wa-product-interruption-" + process.pid);
+process.env.CHAT_MEMORY_DIR = join(tmpdir(), "wa-product-interruption-memory-" + process.pid);
 
 const { handleChatOrderMessage } = await import("../dist/chatOrder.js");
 const { loadChatSession } = await import("../dist/chatMemory.js");
