@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 
-const moduleUrl = new URL("../src/fatimaHandoff.ts", import.meta.url);
+const moduleUrl = new URL("../dist/fatimaHandoff.js", import.meta.url);
 const { FATIMA_TENANT_ID, FATIMA_INACTIVITY_MS, FATIMA_HUMAN_BUTTON_ID,
   extractFatimaChoice, isHumanChoice, handleFatimaMessage } = await import(moduleUrl.href);
 
