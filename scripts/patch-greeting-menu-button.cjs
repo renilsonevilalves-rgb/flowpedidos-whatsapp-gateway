@@ -88,11 +88,31 @@ function buildMenuGreetingBizNode(): any {
   };
 }
 
-async function sendMenuGreetingButton(sock: WASocket, customerJid: string, storeInfo: any) {
+async function sendMenuGreetingButton(sock: WASocket, customerJid: string, storeInfo: any, includeHumanOption = false) {
   const menuUrl = String(storeInfo?.menuUrl || "").trim();
   if (!menuUrl) throw new Error("Store has no menuUrl");
 
   const replyText = buildMenuGreetingText(storeInfo);
+
+  const buttons = [
+    proto.Message.InteractiveMessage.NativeFlowMessage.NativeFlowButton.create({
+      name: "cta_url",
+      buttonParamsJson: JSON.stringify({
+        display_text: "😍 Ver cardápio",
+        url: menuUrl,
+        merchant_url: menuUrl,
+      }),
+    }),
+  ];
+  if (includeHumanOption) {
+    buttons.push(proto.Message.InteractiveMessage.NativeFlowMessage.NativeFlowButton.create({
+      name: "quick_reply",
+      buttonParamsJson: JSON.stringify({
+        display_text: "💬 Conversar com a loja",
+        id: "fatima_human_attendant",
+      }),
+    }));
+  }
 
   try {
     const userJid = sock.user?.id;
@@ -103,16 +123,7 @@ async function sendMenuGreetingButton(sock: WASocket, customerJid: string, store
         text: replyText,
       }),
       nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.create({
-        buttons: [
-          proto.Message.InteractiveMessage.NativeFlowMessage.NativeFlowButton.create({
-            name: "cta_url",
-            buttonParamsJson: JSON.stringify({
-              display_text: "😍 Ver cardápio",
-              url: menuUrl,
-              merchant_url: menuUrl,
-            }),
-          }),
-        ],
+        buttons,
         messageParamsJson: "{}",
         messageVersion: 1,
       }),
