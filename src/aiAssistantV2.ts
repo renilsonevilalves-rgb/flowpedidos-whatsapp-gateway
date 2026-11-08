@@ -592,5 +592,5 @@ export async function proposeOrderChangeForAgent(params: AiAssistantParams, orde
   const canonical = normalizePlan(preview.canonicalChangePlan || normalized);
   const key = `${params.sessionId}:${params.customerJid}`;
   pendingChanges.set(key, { kind: "confirm", order, plan: canonical, preview, originalText, expiresAt: Date.now() + CONVERSATION_TTL_MS });
-  return { ok: true, text: `Pedido #${clean(order.orderNumber)}:\n` + buildPreviewText(order, preview) };
+  return { ok: true, text: buildPreviewText(order, preview) };
 }
