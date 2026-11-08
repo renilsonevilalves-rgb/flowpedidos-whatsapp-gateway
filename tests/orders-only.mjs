@@ -99,3 +99,18 @@ test("nunca pergunta 'resumir a última alteração'", async () => {
     backend: (u) => u.includes("order-self-service") ? res({ ok: true, orders: [] }) : res({ ok: false }, 404) });
   assert.doesNotMatch(r.msgs.join("\n"), /resumir a última alteração/);
 });
+
+test("saudações compostas ('Olá boa tarde') também recebem o botão, sem IA", async () => {
+  for (const [i, text] of ["Olá boa tarde", "oi, bom dia!", "Boa noite, tudo bem?", "oi pessoal tudo bem", "Ola tem alguem ai?"].entries()) {
+    const r = await run("553191111" + String(1000 + i), text, { button: true });
+    assert.equal(r.h, true, text);
+    assert.equal(r.buttons(), 1, text);
+    assert.equal(r.geminiBodies.length, 0, text);
+  }
+});
+
+test("frases que não são só saudação continuam indo para a IA", async () => {
+  const { classifyServiceIntent } = await import("../dist/chatOrder.js");
+  for (const text of ["boa tarde, quero cancelar meu pedido", "oi cadê meu pedido", "olá, vocês abrem domingo?", "boa tarde queria tirar a batata do pedido"])
+    assert.equal(classifyServiceIntent(text), null, text);
+});
