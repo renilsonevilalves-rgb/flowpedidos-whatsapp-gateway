@@ -216,7 +216,7 @@ test("model-only claims of completed orders are blocked without backend commit",
     throw new Error("No checkout expected");
   };
   try {
-    await handleChatOrderMessage(params("5531999955104", "Oi, tudo bem?", sent));
+    await handleChatOrderMessage(params("5531999955104", "Pode me ajudar com uma dúvida sobre o pedido de hoje?", sent));
     assert.match(sent.at(-1), /ainda não foi confirmado/);
     assert.doesNotMatch(sent.at(-1), /pagamento foi realizado/i);
     assert.equal(calls.filter(x=>x.action==="commit").length,0);
