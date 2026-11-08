@@ -1,5 +1,6 @@
 // src/chatOrder.ts
 import { randomUUID } from "node:crypto";
+import { handleRecentOrderEdit, hasPendingOrderChange } from "./aiAssistantV2.js";
 import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft, type RememberedPendingProduct } from "./chatMemory.js";
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
 import { looksLikeFieldEdit, planFieldEdit, replyValue, type EditableField } from "./chatFieldAgent.js";
@@ -81,8 +82,15 @@ const yes = (t: string) => /^(sim|simm+|confirmo|confirmado|pode confirmar|pode 
 const no = (t: string) => /^(nao|quero mudar|alterar|corrigir)[.!?\s]*$/i.test(norm(t));
 const cancel = (t: string) => /^(cancelar rascunho|desistir|esquece|deixa pra la|cancelar esse pedido)[.!?\s]*$/i.test(norm(t));
 function concernsExistingOrder(text: string) {
-  return /(meu pedido|pedido anterior|pedido que fiz|alterar pedido|cancelar pedido|rastrear|acompanhar|trocar pagamento|mudar pagamento|pedido antigo|pedido pronto)/.test(norm(text)) ||
+  const t = norm(text);
+  return /(meu pedido|pedido anterior|pedido que fiz|alterar pedido|cancelar pedido|rastrear|acompanhar|trocar pagamento|mudar pagamento|pedido antigo|pedido pronto)/.test(t) ||
+    // Explicit reference to an order already placed ("nesse pedido que acabei de fazer", "pedido nº 1376").
+    /(pedido que (?:eu )?(?:acabei de |ja )?(?:fiz|fazer|mandei|mandar|pedi|enviei|finalizei)|acabei de (?:fazer|pedir|mandar|finalizar)|ultimo pedido|pedido em producao|pedido\s*(?:#|n[°º.]|numero)\s*\d{2,}|pedido\s+\d{3,}|#\d{3,})/.test(t) ||
     isOrderCancellationRequest(text);
+}
+// Add/remove wording that, with no cart open, refers to an order just placed.
+function editsPlacedOrder(text: string) {
+  return /\b(?:adiciona|adicionar|adicione|acrescenta|acrescentar|acrescente|coloca|colocar|coloque|poe|bota|botar|inclui|incluir|inclua|esqueci|faltou|mais (?:um|uma|\d+)|tira|tirar|retira|retirar|remove|remover|troca|trocar)\b/.test(norm(text));
 }
 function startsOrder(text: string) {
   const t = norm(text);
@@ -1879,6 +1887,23 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (!enabled || !geminiKey || !keys.length || !process.env.VERCEL_API_URL || !p.customerJid || !p.text) return false;
   const key = p.sessionId + ":" + p.customerJid;
+  // An item change of an existing order is in progress (choose order / confirm SIM-NÃO).
+  if (hasPendingOrderChange(p.sessionId, p.customerJid)) return false;
+  // No cart open + "adiciona uma coca" right after ordering: change that order, not a new cart.
+  const open = drafts.get(key);
+  if (!open?.draft.items.length && !open?.pendingProduct && p.getStoreInfo && editsPlacedOrder(p.text) && !concernsExistingOrder(p.text)) {
+    const saved = open ? null : await loadChatSession(p.sessionId, p.customerJid);
+    if (!saved?.draft?.items?.length && !saved?.pendingProduct) {
+      const getStoreInfo = p.getStoreInfo;
+      const handled = await handleRecentOrderEdit({
+        sessionId: p.sessionId, customerJid: p.customerJid, customerPhone: p.customerPhone, text: p.text,
+        getStoreInfo: async () => (await getStoreInfo()) as any,
+        sendMessage: p.sendMessage,
+        logger: { info: (f, m) => p.logger.info?.(f, m), warn: p.logger.warn, error: p.logger.warn },
+      }).catch(() => false);
+      if (handled) return true;
+    }
+  }
   if (!drafts.has(key) && !canUseCentralAgent(p.sessionId) && !startsOrder(p.text) && !readInquiry(p.text) && !isPromotionQuestion(p.text) && !isStoreQuestion(p.text)) {
     // Persisted cart recovery must also work after a restart when the next
     // customer message is a short reply such as "SIM", "retirada" or a name.
