@@ -151,6 +151,8 @@ export function classifyServiceIntent(input: unknown): "menu" | "greeting" | nul
   const text = norm(input).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
   if (!text || text.length > 160) return null;
   if (/^(?:oi|ola|opa|e ai|bom dia|boa tarde|boa noite|tudo bem)(?: pessoal| gente)?$/.test(text)) return "greeting";
+  // Saudações compostas: "olá boa tarde", "oi bom dia tudo bem", "boa noite pessoal".
+  if (text.length <= 60 && /^(?:(?:oi+|ola+|opa|eai|e ai|hey|hello|bom dia|boa tarde|boa noite|tudo bem|tudo bom|td bem|td bom|como vai|como esta|beleza|blz|pessoal|gente|galera|pessoas|voces|vcs|loja|alguem ai|tem alguem|ai|por favor|pfv)(?: |$))+$/.test(text)) return "greeting";
   const topic = /\b(?:cardapio+s?|cardpio|cardapyo|menu|catalogo)\b/;
   if (!topic.test(text)) return null;
 
