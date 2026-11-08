@@ -107,7 +107,7 @@ test('natural cancellation is classified by Gemini but only executed after expli
     if (target.endsWith('/api/webhook/whatsapp/order-self-service')) {
       const body = JSON.parse(init.body);
       if (body.action === 'lookup') {
-        return response(200, { ok: true, orders: [{ id: '11111111-1111-1111-1111-111111111111', orderNumber: '5240', statusLabel: 'novo', totalLabel: 'R$ 50,00' }] });
+        return response(200, { ok: true, orders: [{ id: '11111111-1111-1111-1111-111111111111', orderNumber: '5240', status: 'preparing', statusLabel: 'em preparo', totalLabel: 'R$ 50,00' }] });
       }
       if (body.action === 'cancel') {
         cancelCalls += 1;

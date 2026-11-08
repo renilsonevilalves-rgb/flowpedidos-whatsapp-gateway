@@ -142,7 +142,7 @@ test('V3 accepts a natural explicit confirmation without bypassing the confirmat
     if (target.endsWith('/api/webhook/whatsapp/order-self-service')) {
       const body = JSON.parse(init.body);
       if (body.action === 'lookup') {
-        return response(200, { ok: true, orders: [{ id: '99999999-9999-9999-9999-999999999999', orderNumber: '7001', statusLabel: 'novo' }] });
+        return response(200, { ok: true, orders: [{ id: '99999999-9999-9999-9999-999999999999', orderNumber: '7001', status: 'preparing', statusLabel: 'em preparo' }] });
       }
       if (body.action === 'cancel') {
         cancelCalls += 1;
