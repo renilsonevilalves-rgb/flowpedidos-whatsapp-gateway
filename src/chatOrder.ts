@@ -34,6 +34,7 @@ type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string
 type Params = {
   sessionId: string; customerJid: string; customerPhone?: string | null; text: string;
   sendMessage: (jid: string, data: { text: string }) => Promise<unknown>;
+  sendMenuGreeting?: () => Promise<unknown>;
   getStoreInfo?: () => Promise<ChatStoreInfo>;
   logger: { warn: (fields: Record<string, unknown>, message: string) => void; info?: (fields: Record<string, unknown>, message: string) => void };
 };
@@ -1277,6 +1278,20 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
   return false;
 }
 
+async function trySendInteractiveMenu(p: Params): Promise<boolean> {
+  if (!p.sendMenuGreeting) return false;
+  try {
+    await p.sendMenuGreeting();
+    return true;
+  } catch (error: any) {
+    p.logger.warn(
+      { sessionId: p.sessionId, error: error?.message || String(error) },
+      "[Chat-Order] Interactive menu unavailable; using text fallback",
+    );
+    return false;
+  }
+}
+
 async function processMessage(p: Params, key: string): Promise<boolean> {
   // This flow never intercepts existing-order actions, even with a pending cart.
   if (concernsExistingOrder(p.text)) return false;
@@ -1369,6 +1384,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   if (serviceIntent === "menu") {
     const link = clean(state.catalog.menuUrl, 1200);
     if (/^https:\/\/[^\s]+$/i.test(link)) {
+      if (await trySendInteractiveMenu(p)) return true;
       const name = clean(state.catalog.storeName || "da loja", 80);
       await send(p, "📋 *Cardápio digital " + name + "*:\n" + link +
         "\n\nSe preferir, também posso anotar seu pedido por aqui 😊");
@@ -1385,6 +1401,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     // Gemini is not needed for a greeting, and chat ordering remains optional.
     const link = clean(state.catalog.menuUrl, 1200);
     if (/^https:\/\/[^\s]+$/i.test(link)) {
+      if (await trySendInteractiveMenu(p)) return true;
       await send(p, timeGreeting + " 😊\n\n📋 Confira nosso *cardápio digital*:\n" +
         link + "\n\nSe preferir, também posso anotar seu pedido por aqui.");
     } else {
