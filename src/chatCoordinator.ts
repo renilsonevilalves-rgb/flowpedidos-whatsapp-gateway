@@ -18,7 +18,7 @@ type AgentParams = {
 
 const STR = { type: "STRING" };
 const INT = { type: "INTEGER" };
-const declarations = [
+export const declarations = [
   { name: "find_products", description: "Consultar itens reais do catálogo, preços, categorias e opcionais. Não inventar IDs.",
     parameters: { type: "OBJECT", properties: { search: STR }, required: ["search"] } },
   { name: "read_store", description: "Consultar horário, endereço da loja, meios de entrega e bairros atendidos.",
@@ -50,7 +50,7 @@ const declarations = [
   { name: "cancel_placed_order", description: "Iniciar o cancelamento de um pedido JÁ FEITO. O sistema confere se ainda pode ser cancelado e pede confirmação SIM/NÃO ao cliente.",
     parameters: { type: "OBJECT", properties: { orderNumber: STR } } },
   { name: "change_payment_method", description: "Trocar a forma de pagamento de um pedido JÁ FEITO (pix, credit=cartão, money=dinheiro). O sistema pede confirmação SIM/NÃO.",
-    parameters: { type: "OBJECT", properties: { paymentMethod: { type: "STRING", enum: ["pix", "credit", "money", ""] } } } },
+    parameters: { type: "OBJECT", properties: { paymentMethod: { type: "STRING", enum: ["pix", "credit", "money"] } } } },
   { name: "order_status", description: "Consultar o andamento oficial dos pedidos do cliente (recebido, em preparo, saiu para entrega...).",
     parameters: { type: "OBJECT", properties: {} } },
   { name: "call_human", description: "Passar a conversa para um atendente humano da loja. Use quando o cliente pedir uma pessoa, reclamar seriamente, ou quando você não conseguir resolver após tentar.",
@@ -151,7 +151,10 @@ async function invoke(params: AgentParams, contents: unknown[]): Promise<any> {
         unavailableUntil.set(params.model, Math.max(unavailableUntil.get(params.model) || 0, Date.now() + recommended));
         rateLimits.set(params.model, consecutiveRateLimits);
       }
-      params.log.warn({ sessionId: params.sessionId, status: response.status },
+      // 4xx (other than 429) means the request itself is invalid: log Google's reason.
+      const reason = response.status >= 400 && response.status < 500 && response.status !== 429
+        ? String(await response.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 300) : undefined;
+      params.log.warn({ sessionId: params.sessionId, status: response.status, model: params.model, reason },
         "[Chat-Coordinator] Gemini service unavailable");
       return null;
     }

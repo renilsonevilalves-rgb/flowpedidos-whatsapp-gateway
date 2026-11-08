@@ -23,7 +23,7 @@ if (!v2.includes('capabilities?: { ai_assistant?: boolean } | null;')) {
   v2 = v2.replace(capabilityTypeMarker, `  isOpen?: boolean | null;\n  capabilities?: { ai_assistant?: boolean } | null;\n};`);
 }
 
-const simplePreview = `function buildPreviewText(_order: OrderSummary, preview: ChangePreview) {
+const simplePreview = `function buildPreviewText(order: OrderSummary, preview: ChangePreview) {
   const operations = Array.isArray(preview.operations) ? preview.operations : [];
   const actions = operations.map((operation) => {
     const quantity = Number(operation.quantity) || 1;
@@ -39,6 +39,7 @@ const simplePreview = `function buildPreviewText(_order: OrderSummary, preview: 
       : \`\${actions.slice(0, -1).join(", ")} e \${actions.at(-1)}\`;
   const sentence = description.charAt(0).toUpperCase() + description.slice(1);
   return [
+    \`📋 *Alteração do pedido #\${clean(order?.orderNumber) || "?"}*\`,
     \`\${sentence}.\`,
     "",
     \`*Total: \${money(preview.proposedTotal)}*\`,

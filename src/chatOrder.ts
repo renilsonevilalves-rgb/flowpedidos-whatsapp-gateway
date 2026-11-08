@@ -33,6 +33,7 @@ type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string
   storeInfoAt?: number;
   recentOrders?: { orderNumber: string; status: string; total: string }[];
   recentOrdersAt?: number;
+  draftChangedAt?: number;
   quoteNeedsReview?: boolean;
   pendingEdit?: EditableField;
   // A product awaiting mandatory options is separate from checkout questions.
@@ -1028,12 +1029,23 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
   };
   // Orders already placed by this customer (short cache): lets the agent tell
   // "add to my order" apart from "start a new cart".
-  if (!state.recentOrdersAt || Date.now() - state.recentOrdersAt > 45_000) {
+  // Always fresh when the message talks about changing/an order: it may have
+  // been placed on the digital menu seconds ago.
+  const aboutPlacedOrder = editsPlacedOrder(p.text) || concernsExistingOrder(p.text);
+  if (aboutPlacedOrder || !state.recentOrdersAt || Date.now() - state.recentOrdersAt > 45_000) {
     try {
       const found = await listChangeableOrdersForAgent(v2Params);
       state.recentOrders = found.orders.map(order => ({
         orderNumber: String(order.orderNumber || ""), status: order.statusLabel || order.status || "", total: order.totalLabel || "",
       }));
+      // 3. An order placed after the cart was last changed makes that cart stale
+      // (e.g. customer finished on the digital menu). Never mix it with new requests.
+      const newestOrderAt = Math.max(0, ...found.orders.map(order => Date.parse(String((order as any).createdAt || "")) || 0));
+      if (state.draft.items.length && newestOrderAt > (state.draftChangedAt || 0)) {
+        p.logger.info?.({ sessionId: p.sessionId }, "[Chat-Order] Stale cart discarded after a newer placed order");
+        state.draft = { ...state.draft, items: [] };
+        state.quote = undefined; state.quoteExpiry = undefined; state.pendingProduct = undefined;
+      }
     } catch { state.recentOrders = []; }
     state.recentOrdersAt = Date.now();
   }
@@ -1293,7 +1305,13 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
       return { ok: false, error: "Ferramenta desconhecida" };
     },
   });
-  if (!agent) return false;
+  if (!agent) {
+    // 2. Gemini unavailable: an add/remove right after placing an order still
+    // goes to that order (separate, simpler interpreter), never to an old cart.
+    if (state.recentOrders?.length && !state.draft.items.length && (editsPlacedOrder(p.text) || concernsExistingOrder(p.text)) &&
+        await handleRecentOrderEdit(v2Params).catch(() => false)) return true;
+    return false;
+  }
   // A simple removal deserves a specific acknowledgment and a fresh official
   // total even if Gemini times out after successfully editing the cart.
   // At most one backend preview per message, regardless of extra Gemini calls.
@@ -1990,7 +2008,16 @@ export async function handleChatOrderMessage(p: Params): Promise<boolean> {
     if (!saved.draft?.items?.length && !saved.pendingProduct) return false;
   }
   const prev = serialized.get(key) || Promise.resolve(false);
-  const task = prev.catch(() => false).then(() => processMessage(p, key)).catch(async (error: any) => {
+  // Remember when the cart content last changed (used to detect a stale cart).
+  const cartPrint = () => JSON.stringify(drafts.get(key)?.draft.items.map(item => [item.productId, item.quantity, item.notes || ""]) || []);
+  const trackedProcess = async () => {
+    const before = cartPrint();
+    const handled = await processMessage(p, key);
+    const current = drafts.get(key);
+    if (current && cartPrint() !== before) current.draftChangedAt = Date.now();
+    return handled;
+  };
+  const task = prev.catch(() => false).then(trackedProcess).catch(async (error: any) => {
     const state = drafts.get(key);
     if (state) {
       state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = true;
