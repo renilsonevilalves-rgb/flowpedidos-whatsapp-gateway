@@ -151,7 +151,7 @@ function parseInterpretation(raw: unknown): ChangeInterpretation | null {
   }
 }
 
-function systemInstruction(storeInfo: StoreInfo, draft: PendingChangeConversation | null) {
+function systemInstruction(storeInfo: StoreInfo, draft: PendingChangeConversation | null, recentOrderHint = "") {
   const storeName = clean(storeInfo.storeName) || "a loja";
   const draftContext = draft
     ? JSON.stringify({
@@ -187,13 +187,14 @@ function systemInstruction(storeInfo: StoreInfo, draft: PendingChangeConversatio
     "Não transforme pergunta sobre disponibilidade/cardápio em alteração sem evidência de que a pessoa quer mexer em um pedido existente.",
     "reply pode ficar vazio para propose/ask_status/discard_draft. Para esclarecimento sem plano concreto, reply pode ser uma pergunta curta e natural.",
     `Rascunho/contexto seguro atual: ${draftContext}`,
+    ...(recentOrderHint ? [recentOrderHint] : []),
   ].join("\n");
 }
 
-async function requestInterpretation(params: AiAssistantParams, storeInfo: StoreInfo, draft: PendingChangeConversation | null) {
+async function requestInterpretation(params: AiAssistantParams, storeInfo: StoreInfo, draft: PendingChangeConversation | null, recentOrderHint = "") {
   if (!GEMINI_API_KEY || !GEMINI_MODEL) return null;
   const body = JSON.stringify({
-    system_instruction: { parts: [{ text: systemInstruction(storeInfo, draft) }] },
+    system_instruction: { parts: [{ text: systemInstruction(storeInfo, draft, recentOrderHint) }] },
     contents: [{ role: "user", parts: [{ text: clean(params.text).slice(0, MAX_CUSTOMER_TEXT) }] }],
     generationConfig: {
       thinkingConfig: { thinkingLevel: "minimal" },
@@ -501,6 +502,58 @@ export async function handleAiAssistantMessage(params: AiAssistantParams): Promi
       return true;
     }
     return await handleLegacyAiAssistantMessage(params).catch(() => false);
+  } finally {
+    inFlight.delete(key);
+  }
+}
+
+/** True while an item-change conversation (select/clarify/confirm) is open. */
+export function hasPendingOrderChange(sessionId: string, customerJid: string): boolean {
+  const key = `${sessionId}:${customerJid}`;
+  const current = pendingChanges.get(key);
+  if (current && current.expiresAt <= Date.now()) pendingChanges.delete(key);
+  return pendingChanges.has(key);
+}
+
+/**
+ * Customer has no cart open and says "adiciona uma coca" / "tira a batata"
+ * right after placing an order. If an order can still be changed, treat the
+ * message as a change to that order instead of opening a new cart.
+ * Returns false (nothing sent) when there is no changeable order, so the
+ * normal cart flow keeps working exactly as before.
+ */
+export async function handleRecentOrderEdit(params: AiAssistantParams): Promise<boolean> {
+  const text = clean(params.text);
+  if (!GEMINI_API_KEY || !text || !params.customerJid || !clean(params.customerPhone)) return false;
+  const key = `${params.sessionId}:${params.customerJid}`;
+  if (inFlight.has(key) || pendingChanges.has(key)) return false;
+  inFlight.add(key);
+  try {
+    const storeInfo = await params.getStoreInfo();
+    if ((storeInfo as any)?.capabilities?.ai_assistant === false) return false;
+    const lookup = await lookupOrders(params);
+    const orders = lookup.ok && Array.isArray(lookup?.data?.orders) ? lookup.data.orders as OrderSummary[] : [];
+    if (!orders.length) return false;
+    const hint = `CONTEXTO IMPORTANTE: o cliente NÃO tem carrinho aberto e tem pedido recente ainda alterável (${orders
+      .map((order) => `#${clean(order.orderNumber)}`).join(", ")}). Pedidos para adicionar, colocar, acrescentar, tirar ou trocar itens referem-se a esse pedido existente: use isOrderChange=true e action=propose com os itens citados.`;
+    const interpretation = await requestInterpretation(params, storeInfo || {}, null, hint);
+    if (interpretation && !interpretation.isOrderChange) return false;
+    const plan = interpretation?.action === "propose" ? interpretation.plan : { operations: [] };
+    if (orders.length === 1) {
+      if (!plan.operations.length) {
+        pendingChanges.set(key, { kind: "clarify", order: orders[0], plan: null, expiresAt: Date.now() + CONVERSATION_TTL_MS });
+        await sendText(params, `Você quer alterar o pedido #${orders[0].orderNumber}? Me diga o que devo adicionar, tirar ou trocar que eu confiro os valores antes de enviar à loja.`);
+        return true;
+      }
+      await preparePreview(params, key, orders[0], plan, text);
+      return true;
+    }
+    pendingChanges.set(key, { kind: "select_order", orders, plan, originalText: text, expiresAt: Date.now() + CONVERSATION_TTL_MS });
+    await sendText(params, `Encontrei mais de um pedido recente. Em qual deles devo fazer essa alteração? Responda com o número da lista ou do pedido:\n\n${orderListText(orders)}`);
+    return true;
+  } catch (error: any) {
+    params.logger.warn({ error: error?.message || error, sessionId: params.sessionId }, "[AI-Assistant-V2] Recent order edit routing failed");
+    return pendingChanges.has(key);
   } finally {
     inFlight.delete(key);
   }
