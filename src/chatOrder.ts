@@ -8,6 +8,7 @@ import { deliverOrderReceipt, prepareOrderReceipt } from "./chatReceiptOutbox.js
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
 import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
 import { resolveCartAction } from "./chatCartIntent.js";
+import { isOrderCancellationRequest } from "./cancellationIntent.js";
 import { isPromotionQuestion, promotionsFor, scopeLabel, unresolvedChoice, formatOptions, type ChoiceTopic } from "./chatConversation.js";
 
 type Item = { productId: string; quantity: number; notes?: string; selectedOptions?: Array<{ id: string; groupId: string; quantity: number }> };
@@ -80,7 +81,8 @@ const yes = (t: string) => /^(sim|simm+|confirmo|confirmado|pode confirmar|pode 
 const no = (t: string) => /^(nao|quero mudar|alterar|corrigir)[.!?\s]*$/i.test(norm(t));
 const cancel = (t: string) => /^(cancelar rascunho|desistir|esquece|deixa pra la|cancelar esse pedido)[.!?\s]*$/i.test(norm(t));
 function concernsExistingOrder(text: string) {
-  return /(meu pedido|pedido anterior|pedido que fiz|alterar pedido|cancelar pedido|rastrear|acompanhar|trocar pagamento|mudar pagamento|pedido antigo|pedido pronto)/.test(norm(text));
+  return /(meu pedido|pedido anterior|pedido que fiz|alterar pedido|cancelar pedido|rastrear|acompanhar|trocar pagamento|mudar pagamento|pedido antigo|pedido pronto)/.test(norm(text)) ||
+    isOrderCancellationRequest(text);
 }
 function startsOrder(text: string) {
   const t = norm(text);

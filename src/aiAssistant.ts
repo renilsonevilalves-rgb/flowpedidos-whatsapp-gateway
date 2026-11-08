@@ -1,3 +1,5 @@
+import { isOrderCancellationRequest } from "./cancellationIntent.js";
+
 type Logger = {
   info: (details: Record<string, unknown>, message: string) => void;
   warn: (details: Record<string, unknown>, message: string) => void;
@@ -57,6 +59,15 @@ const CONVERSATION_TTL_MS = 10 * 60 * 1000;
 const inFlight = new Set<string>();
 const lastAttemptAt = new Map<string, number>();
 const pendingConversations = new Map<string, PendingConversation>();
+const cancellationLookupsInFlight = new Set<string>();
+
+export function hasPendingOrderCancellation(sessionId: string, customerJid: string): boolean {
+  const key = `${sessionId}:${customerJid}`;
+  if (cancellationLookupsInFlight.has(key)) return true;
+  const pending = pendingConversations.get(key);
+  if (!pending || pending.expiresAt <= Date.now()) return false;
+  return pending.kind === "cancel_confirm" || (pending.kind === "select_order" && pending.action === "cancel");
+}
 
 function clean(value: unknown) {
   return String(value || "").trim();
@@ -451,8 +462,6 @@ async function handlePendingConversation(params: AiAssistantParams, key: string,
 }
 
 export async function handleAiAssistantMessage(params: AiAssistantParams): Promise<boolean> {
-  if (!GEMINI_API_KEY) return false;
-
   const text = clean(params.text);
   if (!text || !params.customerJid) return false;
 
@@ -470,6 +479,28 @@ export async function handleAiAssistantMessage(params: AiAssistantParams): Promi
     }
     pendingConversations.delete(key);
   }
+
+  // A clear cancellation request must reach the authenticated existing-order
+  // lookup, even when Gemini is slow, unavailable or the cart agent is active.
+  // This branch NEVER performs a cancellation: it asks for confirmation first.
+  if (isOrderCancellationRequest(text)) {
+    if (cancellationLookupsInFlight.has(key)) {
+      await sendText(params, "Estou consultando seu pedido. Aguarde um instante, por favor.");
+      return true;
+    }
+    cancellationLookupsInFlight.add(key);
+    try {
+      await beginOrderAction(params, key, "cancel", text, false, "");
+    } catch (error: any) {
+      params.logger.warn({ sessionId: params.sessionId, error: error?.message || error }, "[AI-Assistant] Secure cancellation lookup failed");
+      await sendText(params, "Não consegui consultar seu pedido para cancelamento agora. Tente novamente ou fale com a loja.").catch(() => undefined);
+    } finally {
+      cancellationLookupsInFlight.delete(key);
+    }
+    return true;
+  }
+
+  if (!GEMINI_API_KEY) return false;
 
   const now = Date.now();
   if (inFlight.has(key)) return false;
