@@ -6,6 +6,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 process.env.WHATSAPP_CHAT_ORDERS_ENABLED = "true";
+// Greeting -> native menu CTA is the behavior of the "ai" attendance mode.
+process.env.WHATSAPP_ATTENDANCE_MODE = "ai";
 process.env.WHATSAPP_GEMINI_AGENT_ENABLED = "true";
 process.env.WHATSAPP_GEMINI_AGENT_TENANTS = "22222222-2222-4222-8222-222222222222";
 process.env.GEMINI_API_KEY = "unit-test-key";
