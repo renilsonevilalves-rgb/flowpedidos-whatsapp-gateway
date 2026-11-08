@@ -66,6 +66,35 @@ export function usesCentralAgent(sessionId: string): boolean {
 // "Falar com atendente": pause is persisted by humanHandoff.ts and checked in
 // the server before any automatic reply.
 const HUMAN_PAUSE_MINUTES = Number(process.env.WHATSAPP_HUMAN_PAUSE_MINUTES || 120);
+function moneyValues(text: string): number[] {
+  return [...String(text).matchAll(/R\$\s*(\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)/g)]
+    .map(match => {
+      const raw = match[1];
+      const normalized = /,\d{1,2}$/.test(raw) ? raw.replace(/\./g, "").replace(",", ".") : raw.replace(/\.(?=\d{3}\b)/g, "");
+      return Math.round(Number(normalized) * 100);
+    }).filter(Number.isFinite);
+}
+/** True when every R$ value in the reply is backed by real data. */
+function pricesAreGrounded(reply: string, state: State): boolean {
+  const known = new Set<number>();
+  const add = (value: unknown) => { const cents = Math.round(Number(value) * 100); if (Number.isFinite(cents) && cents > 0) known.add(cents); };
+  for (const product of state.catalog.products) {
+    const bases = [Number(product.price), Number(product.originalPrice)].filter(value => Number.isFinite(value) && value > 0);
+    for (const base of bases) for (let quantity = 1; quantity <= 10; quantity++) add(base * quantity);
+    for (const group of product.optionGroups || []) for (const option of group.options || []) {
+      add(option.price);
+      for (const base of bases) add(base + Number(option.price || 0));
+    }
+  }
+  // Delivery fees and minimum order configured by the store.
+  const context: any = state.storeInfo?.aiContext || {};
+  for (const area of context.delivery?.neighborhoods || []) add(area?.fee);
+  add(context.delivery?.fee); add(context.service?.minimumOrderValue);
+  // Values the customer already received from verified flows (summaries, fees, orders).
+  for (const turn of (state.history || []).slice(-30)) if (turn.role === "assistant") for (const cents of moneyValues(turn.text)) known.add(cents);
+  for (const order of state.recentOrders || []) for (const cents of moneyValues(order.total)) known.add(cents);
+  return moneyValues(reply).every(cents => known.has(cents));
+}
 const CART_IDLE_RESET_MS = Number(process.env.WHATSAPP_CART_IDLE_RESET_MINUTES || 15) * 60_000;
 const serialized = new Map<string, Promise<boolean>>();
 const clean = (v: unknown, max = 240) => String(v || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max);
@@ -1374,9 +1403,20 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         ? "Seu pedido continua como te mostrei acima 😊 Quer confirmar com *SIM*, mudar algum item ou começar um *pedido novo*?"
         : "Como posso te ajudar agora? 😊 Posso montar um pedido por aqui, acompanhar ou alterar um pedido que você já fez.";
     }
+    // Prices: every R$ value must be a real one (catalog, options, quantities,
+    // fees/totals already shown, placed orders). An invented price is never
+    // sent: the deterministic catalog flow answers with real data instead.
+    if (/R\$\s*\d/.test(response) && !state.storeInfo && p.getStoreInfo) {
+      state.storeInfo = await p.getStoreInfo().catch(() => null) as any; state.storeInfoAt = Date.now();
+    }
     if (/R\$\s*\d/.test(response) &&
-        !agent.usedTools.some(tool => ["find_products","preview_order","read_store","change_placed_order","read_my_orders","cancel_placed_order","change_payment_method","order_status","notify_store"].includes(tool))) {
-      response = "Vou precisar consultar os valores atuais da loja antes de informar um preço.";
+        !agent.usedTools.some(tool => ["preview_order","change_placed_order","read_my_orders","cancel_placed_order","change_payment_method","order_status"].includes(tool)) &&
+        !pricesAreGrounded(response, state)) {
+      p.logger.warn?.({ sessionId: p.sessionId }, "[Chat-Coordinator] Ungrounded price replaced by catalog flow");
+      if (!agent.mutated) return false;
+      response = state.draft.items.length
+        ? recap(state.draft, state.catalog) + "\n\nQuer adicionar mais alguma coisa ou posso fechar o pedido?"
+        : "Me diga o nome do produto que eu confiro no cardápio para você 😊";
     }
     noteTools(p.sessionId, p.customerJid, agent.usedTools);
     await send(p, response);
