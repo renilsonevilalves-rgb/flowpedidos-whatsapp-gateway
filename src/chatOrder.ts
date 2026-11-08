@@ -1034,7 +1034,7 @@ async function interruptForNewProduct(p: Params, state: State): Promise<boolean>
   return true;
 }
 
-async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
+async function centralAgentMessage(p: Params, state: State, ordersOnly = false): Promise<boolean> {
   let lastRemoval: { productName: string; quantity: number } | null = null;
   let mutations = 0;
   let verifiedTotal: number | null = null;
@@ -1083,10 +1083,10 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
   const agent = await runChatCoordinator({
     text: p.text, history: state.history || [], apiKey: geminiKey,
     model: String(process.env.GEMINI_AGENT_MODEL || geminiModel),
-    log: p.logger, sessionId: p.sessionId,
+    log: p.logger, sessionId: p.sessionId, ordersOnly,
     snapshot: {
       storeName: state.catalog.storeName || "",
-      cart: safeCart(),
+      cart: ordersOnly ? null : safeCart(),
       recentOrders: state.recentOrders || [],
       customerProfile: state.catalog.customer || null,
       pendingEdit: state.pendingEdit || null,
@@ -1402,7 +1402,9 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
     if (!agent.mutated && lastAssistant && norm(response) === norm(lastAssistant)) {
       response = state.draft.items.length
         ? "Seu pedido continua como te mostrei acima 😊 Quer confirmar com *SIM*, mudar algum item ou começar um *pedido novo*?"
-        : "Como posso te ajudar agora? 😊 Posso montar um pedido por aqui, acompanhar ou alterar um pedido que você já fez.";
+        : ordersOnly
+          ? "Posso te ajudar a acompanhar, cancelar ou alterar um pedido que você já fez, ou tirar dúvidas da loja 😊"
+          : "Como posso te ajudar agora? 😊 Posso montar um pedido por aqui, acompanhar ou alterar um pedido que você já fez.";
     }
     // Prices: every R$ value must be a real one (catalog, options, quantities,
     // fees/totals already shown, placed orders). An invented price is never
@@ -1428,6 +1430,48 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
 }
 
 // ===========================================================================
+// ATENDIMENTO SÓ DE PEDIDOS JÁ FEITOS (padrão)
+// Saudação/cardápio -> botão do cardápio digital. Cancelar, adicionar item,
+// remover item, status, dúvidas da loja e atendente -> IA com ferramentas
+// restritas. Qualquer outra coisa -> botão do cardápio. Nunca anota pedido novo.
+// ===========================================================================
+async function sendMenuButton(p: Params, state: State, lead: string, explain = false): Promise<boolean> {
+  const link = clean(state.catalog.menuUrl, 1200);
+  if (/^https:\/\/[^\s]+$/i.test(link)) {
+    const sentLead = Boolean(p.sendMenuGreeting && explain);
+    if (sentLead) await send(p, lead);
+    if (await trySendInteractiveMenu(p)) return true;
+    await send(p, (sentLead ? "" : lead + "\n\n") + "📋 Confira nosso *cardápio digital*:\n" + link);
+  } else {
+    await send(p, lead + " O cardápio digital está temporariamente indisponível; fale com a loja.");
+  }
+  return true;
+}
+
+async function ordersOnlyMessage(p: Params, state: State): Promise<boolean> {
+  // Sem carrinho por aqui: descarta qualquer rascunho antigo.
+  state.draft = fresh();
+  state.pendingEdit = undefined; state.pendingProduct = undefined; state.pendingChoice = undefined;
+  state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = false;
+  await saveChatSession(p.sessionId, p.customerJid, state.history || [], null).catch(() => undefined);
+
+  const normalizedTurn = norm(p.text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  const intent = classifyServiceIntent(p.text);
+  const aboutOrder = editsPlacedOrder(p.text) || concernsExistingOrder(p.text);
+  if (!aboutOrder && (intent === "menu" || intent === "greeting")) {
+    const lead = normalizedTurn.startsWith("bom dia") ? "Bom dia! 😊" :
+      normalizedTurn.startsWith("boa tarde") ? "Boa tarde! 😊" :
+      normalizedTurn.startsWith("boa noite") ? "Boa noite! 😊" : "Olá! 😊";
+    return sendMenuButton(p, state, lead);
+  }
+  if (canUseCentralAgent(p.sessionId) && await centralAgentMessage(p, state, true)) return true;
+  // IA indisponível: alterações de pedido seguem pelo interpretador simples.
+  if (aboutOrder) return false;
+  return sendMenuButton(p, state,
+    "Por aqui eu ajudo a acompanhar, cancelar ou alterar um pedido que você já fez. Para pedir, é só usar o cardápio digital 😊", true);
+}
+
+// ===========================================================================
 // ATENDIMENTO GUIADO (sem IA): menu por números que tira o pedido completo,
 // acompanha, altera/cancela, informa a loja e chama atendente. Preços e
 // disponibilidade vêm do cardápio oficial; o pedido só é criado depois do
@@ -1437,7 +1481,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
 //   "guided"            = só menu guiado, nenhuma chamada de IA
 //   "ai"                = só IA (comportamento anterior)
 // ===========================================================================
-type AttendanceMode = "guided_ai" | "guided" | "ai";
+type AttendanceMode = "orders" | "guided_ai" | "guided" | "ai";
 type GuidedStep =
   | "main" | "categories" | "products" | "quantity" | "options" | "after_add" | "remove"
   | "delivery" | "address_saved" | "neighborhood" | "street" | "complement" | "payment" | "name"
@@ -1471,10 +1515,10 @@ async function storeInfoFor(p: Params, state: State): Promise<any> {
 
 async function attendanceMode(p: Params, state: State): Promise<AttendanceMode> {
   const forced = String(process.env.WHATSAPP_ATTENDANCE_MODE || "").trim();
-  if (forced === "guided" || forced === "ai" || forced === "guided_ai") return forced;
-  const info = await storeInfoFor(p, state);
-  const raw = String(info?.aiContext?.attendance?.mode || "");
-  return raw === "guided" || raw === "ai" ? raw : "guided_ai";
+  // Padrão: o WhatsApp só atende pedidos já feitos e envia o cardápio digital.
+  // Os modos antigos só existem por variável de ambiente (testes / reversão).
+  if (forced === "guided" || forced === "ai" || forced === "guided_ai" || forced === "orders") return forced;
+  return "orders";
 }
 
 /** "1", "1️⃣", "opção 2", "dois" -> number. Anything else -> null. */
@@ -2146,6 +2190,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 
   // Guided menu first (no AI). Never intercepts a SIM/NÃO for a validated summary.
   const attendance = await attendanceMode(p, state);
+  if (attendance === "orders") return ordersOnlyMessage(p, state);
   if (attendance === "guided") { state.pendingEdit = undefined; state.pendingProduct = undefined; }
   if (attendance !== "ai" && !(state.quote && (yes(p.text) || no(p.text))) && !state.pendingProduct && !state.pendingEdit) {
     if (await guidedMessage(p, state, attendance)) return true;
