@@ -108,11 +108,11 @@ test("screenshot 09:29: prioritize newly created #3570 instead of listing 25 sta
   const sent = [];
   const actions = [];
   const now = Date.now();
-  const first = { id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570", statusLabel: "em preparo", totalLabel: "R$ 53,96", createdAt: new Date(now - 60_000).toISOString() };
-  const older = { id: "22222222-2222-4222-8222-222222222222", orderNumber: "4813", statusLabel: "em preparo", totalLabel: "R$ 29,00", createdAt: new Date(now - 8 * 60 * 60_000).toISOString() };
+  const first = { id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570", status: "preparing", statusLabel: "em preparo", totalLabel: "R$ 53,96", createdAt: new Date(now - 60_000).toISOString() };
+  const older = { id: "22222222-2222-4222-8222-222222222222", orderNumber: "4813", status: "preparing", statusLabel: "em preparo", totalLabel: "R$ 29,00", createdAt: new Date(now - 8 * 60 * 60_000).toISOString() };
   const stale = Array.from({ length: 23 }, (_, index) => ({
     id: `33333333-3333-4333-8333-${String(index).padStart(12, "0")}`,
-    orderNumber: String(6600 + index), statusLabel: "novo", totalLabel: "R$ 12,00",
+    orderNumber: String(6600 + index), status: "pending", statusLabel: "novo", totalLabel: "R$ 12,00",
     createdAt: new Date(now - (24 + index) * 60 * 60_000).toISOString(),
   }));
   globalThis.fetch = async (url, options) => {
@@ -149,13 +149,56 @@ test("screenshot 09:29: prioritize newly created #3570 instead of listing 25 sta
   }
 });
 
+test("screenshot 09:43: show only #8152, #3570 and #4813 from Em preparo; never 38 Novo orders", async () => {
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  const calls = [];
+  const now = Date.now();
+  const preparing = [
+    { id: "11111111-1111-4111-8111-111111111111", orderNumber: "8152", status: "preparing", statusLabel: "em preparo", totalLabel: "R$ 21,98", createdAt: new Date(now - 9 * 60_000).toISOString() },
+    { id: "22222222-2222-4222-8222-222222222222", orderNumber: "3570", status: "preparing", statusLabel: "em preparo", totalLabel: "R$ 53,96", createdAt: new Date(now - 19 * 60_000).toISOString() },
+    { id: "33333333-3333-4333-8333-333333333333", orderNumber: "4813", status: "preparing", statusLabel: "em preparo", totalLabel: "R$ 29,00", createdAt: new Date(now - 9 * 60 * 60_000).toISOString() },
+  ];
+  const oldPending = Array.from({ length: 38 }, (_, index) => ({
+    id: `44444444-4444-4444-8444-${String(index).padStart(12, "0")}`,
+    orderNumber: String(6000 + index), status: "pending", statusLabel: "novo",
+    createdAt: new Date(now - (10 + index) * 60_000).toISOString(),
+  }));
+  globalThis.fetch = async (url, options) => {
+    assert.ok(String(url).endsWith("/api/webhook/whatsapp/order-self-service"));
+    const body = JSON.parse(options.body);
+    calls.push(body.action);
+    assert.equal(body.action, "lookup", "cancellation requires a separate SIM confirmation");
+    return response(200, { ok: true, orders: [...preparing, ...oldPending] });
+  };
+  const base = {
+    sessionId: "tenant-screenshot-0943", customerJid: "5531999955815@s.whatsapp.net", customerPhone: "5531999955815",
+    getStoreInfo: async () => ({ capabilities: { ai_assistant: true } }),
+    sendMessage: async (_jid, content) => { sent.push(content.text); }, logger,
+  };
+  try {
+    assert.equal(await handleAiV2({ ...base, text: "Quero cancelar" }), true);
+    assert.match(sent.at(-1), /pedido #8152.*R\$ 21,98.*confirma o cancelamento/i);
+    assert.doesNotMatch(sent.at(-1), /#3570|#4813|#6000/);
+    assert.equal(await handleAiV2({ ...base, text: "OUTRO PEDIDO" }), true);
+    assert.match(sent.at(-1), /#3570/);
+    assert.match(sent.at(-1), /#4813/);
+    assert.doesNotMatch(sent.at(-1), /#6000|#6001|#6002|novo/i);
+    assert.equal(await handleAiV2({ ...base, text: "não" }), true);
+    assert.match(sent.at(-1), /nenhuma alteração foi feita/i);
+    assert.deepEqual(calls, ["lookup"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("explicit order number chooses requested older order instead of the latest", async () => {
   const originalFetch = globalThis.fetch;
   const sent = [];
   const now = Date.now();
   const orders = [
-    { id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570", createdAt: new Date(now - 60_000).toISOString() },
-    { id: "22222222-2222-4222-8222-222222222222", orderNumber: "4813", createdAt: new Date(now - 9 * 60 * 60_000).toISOString() },
+    { id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570", status: "preparing", createdAt: new Date(now - 60_000).toISOString() },
+    { id: "22222222-2222-4222-8222-222222222222", orderNumber: "4813", status: "preparing", createdAt: new Date(now - 9 * 60 * 60_000).toISOString() },
   ];
   globalThis.fetch = async (_url, options) => {
     assert.equal(JSON.parse(options.body).action, "lookup");
@@ -176,15 +219,15 @@ test("explicit order number chooses requested older order instead of the latest"
   }
 });
 
-test("two similarly recent active orders require selection instead of guessing", async () => {
+test("two similarly recent orders suggest the newest with explicit confirmation and OUTRO option", async () => {
   const originalFetch = globalThis.fetch;
   const sent = [];
   const now = Date.now();
   globalThis.fetch = async (_url, options) => {
     assert.equal(JSON.parse(options.body).action, "lookup");
     return response(200, { ok: true, orders: [
-      { id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570", createdAt: new Date(now - 60_000).toISOString() },
-      { id: "22222222-2222-4222-8222-222222222222", orderNumber: "4813", createdAt: new Date(now - 3 * 60_000).toISOString() },
+      { id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570", status: "preparing", createdAt: new Date(now - 60_000).toISOString() },
+      { id: "22222222-2222-4222-8222-222222222222", orderNumber: "4813", status: "preparing", createdAt: new Date(now - 3 * 60_000).toISOString() },
     ] });
   };
   const base = {
@@ -194,9 +237,10 @@ test("two similarly recent active orders require selection instead of guessing",
   };
   try {
     assert.equal(await handleAiV2({ ...base, text: "Quero cancelar" }), true);
-    assert.match(sent.at(-1), /mais de um pedido disponível/i);
-    assert.match(sent.at(-1), /#3570/);
-    assert.match(sent.at(-1), /#4813/);
+    assert.match(sent.at(-1), /pedido #3570.*confirma o cancelamento/i);
+    assert.doesNotMatch(sent.at(-1), /#4813/);
+    assert.equal(await handleAiV2({ ...base, text: "OUTRO PEDIDO" }), true);
+    assert.match(sent.at(-1), /pedido #4813/i);
     assert.equal(await handleAiV2({ ...base, text: "Pedido #4813" }), true);
     assert.match(sent.at(-1), /pedido #4813.*confirma o cancelamento/i);
     assert.equal(await handleAiV2({ ...base, text: "não" }), true);
@@ -210,7 +254,7 @@ test("unknown explicit order number never silently falls back to a different ord
   const sent = [];
   globalThis.fetch = async (_url, options) => {
     assert.equal(JSON.parse(options.body).action, "lookup");
-    return response(200, { ok: true, orders: [{ id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570" }] });
+    return response(200, { ok: true, orders: [{ id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570", status: "preparing" }] });
   };
   const base = {
     sessionId: "tenant-missing-number", customerJid: "5531999955703@s.whatsapp.net", customerPhone: "5531999955703",
@@ -235,7 +279,7 @@ test("confirmation is bound to the same WhatsApp contact and denied plans cannot
     requests += 1;
     if (String(url).includes("generativelanguage.googleapis.com")) return response(503, {});
     if (JSON.parse(options.body).action === "lookup") return response(200, {
-      ok: true, orders: [{ id: "11111111-1111-4111-8111-111111111111", orderNumber: "9021" }],
+      ok: true, orders: [{ id: "11111111-1111-4111-8111-111111111111", orderNumber: "9021", status: "preparing" }],
     });
     throw Error("No cancellation was authorized");
   };

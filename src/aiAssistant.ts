@@ -58,7 +58,6 @@ const MAX_REPLY_LENGTH = 1200;
 const MIN_CONTACT_INTERVAL_MS = 1200;
 const CONVERSATION_TTL_MS = 10 * 60 * 1000;
 const RECENT_ORDER_MINUTES = 30;
-const RECENT_ORDER_GAP_MINUTES = 15;
 const MAX_VISIBLE_ORDER_CHOICES = 5;
 const inFlight = new Set<string>();
 const lastAttemptAt = new Map<string, number>();
@@ -280,14 +279,16 @@ function requestedOrderNumber(text: string): string | null {
   return found?.[1] || null;
 }
 
-function mostRecentUnambiguousOrder(orders: OrderSummary[], now = Date.now()): OrderSummary | null {
+function mostRecentCancellableOrder(orders: OrderSummary[], now = Date.now()): OrderSummary | null {
   if (orders.length < 2) return null;
-  const candidates = orders.map((order) => ({ order, at: Date.parse(String(order.createdAt || "")) }));
-  if (candidates.some(({ at }) => !Number.isFinite(at))) return null;
+  const candidates = orders.map((order) => ({ order, at: Date.parse(String(order.createdAt || "")) }))
+    .filter(({ at }) => Number.isFinite(at));
+  if (!candidates.length) return null;
   candidates.sort((a, b) => b.at - a.at);
   const age = now - candidates[0].at;
-  const gap = candidates[0].at - candidates[1].at;
-  if (age < 0 || age > RECENT_ORDER_MINUTES * 60_000 || gap < RECENT_ORDER_GAP_MINUTES * 60_000) return null;
+  // Identifying the exact order number and requiring SIM protects the customer
+  // even if multiple orders were made minutes apart; OUTRO remains available.
+  if (age < 0 || age > RECENT_ORDER_MINUTES * 60_000) return null;
   return candidates[0].order;
 }
 
@@ -387,8 +388,17 @@ async function beginOrderAction(params: AiAssistantParams, key: string, action: 
   }
 
   const orders = Array.isArray(lookup?.data?.orders) ? lookup.data.orders as OrderSummary[] : [];
+  // Fail closed during rolling deployments: never offer Novo/Pendente orders
+  // for cancellation, even if an older Vercel API still returns them.
+  if (action === "cancel") {
+    for (let index = orders.length - 1; index >= 0; index--) {
+      if (String(orders[index]?.status || "").toLowerCase() !== "preparing") orders.splice(index, 1);
+    }
+  }
   if (!orders.length) {
-    await sendText(params, "Não encontrei um pedido que ainda possa ser alterado por aqui.");
+    await sendText(params, action === "cancel"
+      ? "Não encontrei nenhum pedido em preparo que possa ser cancelado por aqui. Se precisar, fale com a loja."
+      : "Não encontrei um pedido que ainda possa ser alterado por aqui.");
     return;
   }
 
@@ -404,7 +414,7 @@ async function beginOrderAction(params: AiAssistantParams, key: string, action: 
       return;
     }
 
-    const mostRecent = mostRecentUnambiguousOrder(orders);
+    const mostRecent = mostRecentCancellableOrder(orders);
     if (mostRecent) {
       await moveToAction(params, key, action, mostRecent, originalText, hasChangeDetails, paymentMethod, orders.filter((order) => order.id !== mostRecent.id));
       return;
