@@ -47,7 +47,7 @@ function harness() {
 
 test("menu 4 → 1: adicionar 2 coxinhas no pedido #7700 com confirmação", async () => {
   const { say, calls } = harness();
-  await say("oi");
+  await say("opções");
   let out = await say("4");  assert.match(out, /Adicionar item em um pedido já feito/);
   out = await say("1");      assert.match(out, /adicionar ao pedido #7700/);
   out = await say("1");      assert.match(out, /Quantas unidades/);
@@ -61,7 +61,7 @@ test("menu 4 → 1: adicionar 2 coxinhas no pedido #7700 com confirmação", asy
 
 test("menu 4 → 2: cancelamento pede confirmação", async () => {
   const { say, calls } = harness();
-  await say("oi"); await say("4");
+  await say("opções"); await say("4");
   const out = await say("2");
   assert.match(out, /7700/); assert.match(out, /SIM/i);
   assert.equal(calls.gemini, 0);

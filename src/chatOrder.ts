@@ -1492,7 +1492,7 @@ function choiceNumbers(text: string): number[] {
   return numbers.every(n => n !== null) ? [...new Set(numbers as number[])] : [];
 }
 const isBack = (text: string) => /^(?:0|voltar|volta|anterior)$/.test(norm(text).replace(/[⃣️.!]/g, "").trim());
-const isMenuWord = (text: string) => /^(?:menu|menu inicial|inicio|opcoes|ver opcoes|comecar|0)$/.test(norm(text).replace(/[⃣️.!]/g, "").trim());
+const isMenuWord = (text: string) => /^(?:menu inicial|inicio|opcoes|ver opcoes|mais opcoes|atendimento|comecar|0)$/.test(norm(text).replace(/[⃣️.!]/g, "").trim());
 
 function customerFirstName(state: State): string {
   const profile: any = state.catalog.customer;
@@ -1770,7 +1770,9 @@ async function guidedMessage(p: Params, state: State, mode: AttendanceMode): Pro
   const n = choiceNumber(text);
 
   if (!guided || guided.step === "main") {
-    if (service === "greeting" && n === null) { await showMainMenu(p, state, mode, greetingOpening(state, text)); return true; }
+    // Greeting keeps the original behavior: the digital-menu button. The
+    // numbered menu opens when the customer asks for "menu"/"opções".
+    if (service === "greeting" && n === null) return false;
     if (isMenuWord(text) && !(guided?.step === "main" && n === 0)) { await showMainMenu(p, state, mode); return true; }
     if (guided?.step === "main" && n !== null) {
       if (n === 1) {
@@ -2147,7 +2149,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   if (attendance === "guided") { state.pendingEdit = undefined; state.pendingProduct = undefined; }
   if (attendance !== "ai" && !(state.quote && (yes(p.text) || no(p.text))) && !state.pendingProduct && !state.pendingEdit) {
     if (await guidedMessage(p, state, attendance)) return true;
-    if (attendance === "guided") return guidedFreeText(p, state, attendance);
+    if (attendance === "guided" && classifyServiceIntent(p.text) !== "greeting") return guidedFreeText(p, state, attendance);
   }
 
   const normalizedTurn = norm(p.text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
