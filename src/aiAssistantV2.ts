@@ -1,4 +1,5 @@
-import { handleAiAssistantMessage as handleLegacyAiAssistantMessage } from "./aiAssistant.js";
+import { handleAiAssistantMessage as handleLegacyAiAssistantMessage, hasPendingOrderCancellation } from "./aiAssistant.js";
+import { isOrderCancellationRequest } from "./cancellationIntent.js";
 
 type Logger = {
   info: (details: Record<string, unknown>, message: string) => void;
@@ -467,7 +468,15 @@ export async function handleAiAssistantMessage(params: AiAssistantParams): Promi
   try {
     const storeInfo = await params.getStoreInfo();
     if (current) {
+      if (isOrderCancellationRequest(text) || hasPendingOrderCancellation(params.sessionId, params.customerJid)) {
+        pendingChanges.delete(key);
+        return await handleLegacyAiAssistantMessage(params);
+      }
       return await handlePending(params, key, current, storeInfo || {});
+    }
+
+    if (isOrderCancellationRequest(text) || hasPendingOrderCancellation(params.sessionId, params.customerJid)) {
+      return await handleLegacyAiAssistantMessage(params);
     }
 
     const interpretation = await requestInterpretation(params, storeInfo || {}, null);

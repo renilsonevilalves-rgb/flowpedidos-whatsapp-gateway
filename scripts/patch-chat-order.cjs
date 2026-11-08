@@ -9,11 +9,29 @@ if (!source.includes(injected)) {
   if (!source.includes(marker)) throw new Error("Chat order routing: base AI assistant import was not patched");
   source = source.replace(marker, injected);
 }
+const cancellationImports = 'import { isOrderCancellationRequest } from "./cancellationIntent.js";\nimport { hasPendingOrderCancellation } from "./aiAssistant.js";';
+if (!source.includes(cancellationImports)) {
+  if (!source.includes(injected)) throw new Error("Cancellation routing: chat handler import missing");
+  source = source.replace(injected, injected + "\n" + cancellationImports);
+}
 const anchor = "      const isTrigger = isAutoReplyTrigger(text);";
 const hook = [
-  "      // Chat checkout is opt-in; existing tracking, changes and menu greeting keep priority.",
+  "      // Existing-order cancellation and its confirmation must precede the cart coordinator.",
   "      const chatCustomerJid = getCustomerJid(msg, remoteJid);",
   "      const chatCustomerPhone = await resolveCustomerPhone(sock, msg, remoteJid);",
+  "      if (isOrderCancellationRequest(text) || hasPendingOrderCancellation(id, chatCustomerJid)) {",
+  "        const cancellationHandled = await handleAiAssistantMessage({",
+  "          sessionId: id, customerJid: chatCustomerJid, customerPhone: chatCustomerPhone, text,",
+  "          getStoreInfo: () => fetchStoreInfo(id, true),",
+  "          sendMessage: async (jid, content) => { await sock.sendMessage(jid, content); },",
+  "          logger,",
+  "        });",
+  "        if (!cancellationHandled) await sock.sendMessage(chatCustomerJid, {",
+  "          text: 'Não consegui consultar seu pedido para cancelamento agora. Tente novamente ou fale com a loja.',",
+  "        });",
+  "        continue;",
+  "      }",
+  "      // Chat checkout is opt-in; existing tracking, changes and menu greeting keep priority.",
   "      const chatHandled = await handleChatOrderMessage({",
   "        sessionId: id, customerJid: chatCustomerJid, customerPhone: chatCustomerPhone, text,",
   "        sendMessage: async (jid, content) => { await sock.sendMessage(jid, content); },",
