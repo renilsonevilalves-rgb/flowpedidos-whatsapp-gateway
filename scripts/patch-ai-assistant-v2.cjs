@@ -43,6 +43,7 @@ const simplePreview = `function buildPreviewText(order: OrderSummary, preview: C
     \`\${sentence}.\`,
     "",
     \`*Total: \${money(preview.proposedTotal)}*\`,
+    ...(clean((preview as any).paymentNote) ? ["", "💳 " + clean((preview as any).paymentNote)] : []),
     "",
     "Está certo?",
     "Responda *SIM* para confirmar ou *NÃO* para cancelar.",
