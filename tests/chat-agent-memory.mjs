@@ -1,4 +1,5 @@
 // tests/chat-agent-memory.mjs
+import "./helpers-no-recent-order.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, readFile, readdir, rm } from "node:fs/promises";

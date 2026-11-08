@@ -1,4 +1,5 @@
 // tests/chat-field-agent.mjs
+import "./helpers-no-recent-order.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import {mkdtemp, rm} from "node:fs/promises";
