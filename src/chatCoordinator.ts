@@ -13,6 +13,8 @@ type AgentParams = {
   model: string;
   log: { warn: (context: Record<string, unknown>, message: string) => void };
   sessionId: string;
+  /** Atendimento só de pedidos já feitos: sem carrinho, sem pedido novo pelo WhatsApp. */
+  ordersOnly?: boolean;
   execute: (tool: string, args: Record<string, unknown>) => Promise<ToolResult>;
 };
 
@@ -118,6 +120,20 @@ const instructions = [
   "Não exponha IDs técnicos, chaves, metadados internos ou dados de outros clientes.",
 ].join("\n");
 
+// Modo "somente pedidos já feitos": a IA nunca anota pedido novo.
+export const ORDERS_ONLY_TOOLS = ["read_store", "find_products", "read_my_orders", "change_placed_order",
+  "cancel_placed_order", "order_status", "call_human", "notify_store"];
+const ORDERS_ONLY_RULES = [
+  "",
+  "=== MODO SOMENTE PEDIDOS JÁ FEITOS (tem prioridade sobre qualquer regra acima) ===",
+  "Esta loja NÃO tira pedido novo pelo WhatsApp. Pedidos novos são feitos só no cardápio digital (menuUrl).",
+  "Se o cliente quiser pedir, montar carrinho, saber 'o que tem' para pedir ou fazer pedido novo: responda em 1 frase curta e simpática que o pedido é feito pelo cardápio digital e envie o menuUrl. Você pode dizer preços e se há um item (snapshot.products), mas não anote nada.",
+  "O que você PODE fazer: acompanhar o pedido (order_status/read_my_orders), cancelar um pedido (cancel_placed_order), ADICIONAR item a um pedido já feito e REMOVER item de um pedido já feito (change_placed_order, depois de achar o nome exato com find_products), tirar dúvidas da loja (read_store) e chamar atendente (call_human).",
+  "Não existem carrinho, endereço, forma de pagamento ou número da casa para editar por aqui: se pedirem para mudar isso, explique que deve falar com a loja e ofereça call_human.",
+  "Nunca use a expressão 'resumir a última alteração'. Se não entendeu, pergunte de forma específica o que a pessoa quer: cancelar, adicionar ou tirar item, ver o status, ou falar com a loja.",
+  "A loja decide se ainda dá para alterar ou cancelar: se a ferramenta recusar, explique o motivo dado por ela e ofereça call_human.",
+].join("\n");
+
 async function invoke(params: AgentParams, contents: unknown[]): Promise<any> {
   // Circuit breaker: fall through to the verified legacy flow while the
   // provider is rate limited, instead of re-querying on every customer turn.
@@ -133,9 +149,9 @@ async function invoke(params: AgentParams, contents: unknown[]): Promise<any> {
       signal: controller.signal,
       headers: { "Content-Type": "application/json", "x-goog-api-key": params.apiKey },
       body: JSON.stringify({
-        system_instruction: { parts: [{ text: instructions }] },
+        system_instruction: { parts: [{ text: params.ordersOnly ? instructions + ORDERS_ONLY_RULES : instructions }] },
         contents,
-        tools: [{ functionDeclarations: declarations }],
+        tools: [{ functionDeclarations: activeDeclarations(params) }],
         toolConfig: { functionCallingConfig: { mode: "AUTO" } },
         generationConfig: { temperature: 0.25, maxOutputTokens: 800,
           thinkingConfig: { thinkingLevel: "low" } },
@@ -175,6 +191,10 @@ async function invoke(params: AgentParams, contents: unknown[]): Promise<any> {
   } finally { clearTimeout(timeout); }
 }
 
+function activeDeclarations(params: { ordersOnly?: boolean }) {
+  return params.ordersOnly ? declarations.filter(item => ORDERS_ONLY_TOOLS.includes(item.name)) : declarations;
+}
+
 export async function runChatCoordinator(params: AgentParams): Promise<AgentResult> {
   if (!params.apiKey || !params.model) return null;
   const initialHistory = params.history.slice(-26, -1).map(turn => ({
@@ -207,14 +227,16 @@ export async function runChatCoordinator(params: AgentParams): Promise<AgentResu
       return mutated ? { reply: "Anotei suas alterações. Gostaria de conferir o pedido?", mutated, usedTools } : null;
     }
     if (usedTools.length + calls.length > 6) {
-      return { reply: forcedReply || "Só para confirmar: pode resumir a última alteração que deseja fazer?", mutated, usedTools };
+      return { reply: forcedReply || (params.ordersOnly
+        ? "Quer cancelar o pedido, adicionar ou tirar algum item, ou ver o status? Me diga qual deles 😊"
+        : "Só para confirmar: pode resumir a última alteração que deseja fazer?"), mutated, usedTools };
     }
     contents.push(candidate); // Keep Gemini thought signatures for multi-step tool calls.
     const responses: any[] = [];
     for (const call of calls) {
       const name = String(call.name || "");
       let result: ToolResult;
-      if (!declarations.some(item => item.name === name) || !call.args || typeof call.args !== "object") {
+      if (!activeDeclarations(params).some(item => item.name === name) || !call.args || typeof call.args !== "object") {
         result = { ok: false, error: "Ferramenta indisponível" };
       } else {
         try {
@@ -234,8 +256,10 @@ export async function runChatCoordinator(params: AgentParams): Promise<AgentResu
     if (forcedReply) return { reply: forcedReply, mutated, usedTools };
     contents.push({ role: "user", parts: responses });
   }
-  return { reply: forcedReply || (mutated
-    ? "Anotei as alterações. Quer conferir o pedido?"
-    : "Pode me explicar um pouquinho mais para eu te ajudar corretamente?"),
+  return { reply: forcedReply || (params.ordersOnly
+    ? "Quer cancelar o pedido, adicionar ou tirar algum item, ou ver o status? Me diga qual deles 😊"
+    : mutated
+      ? "Anotei as alterações. Quer conferir o pedido?"
+      : "Pode me explicar um pouquinho mais para eu te ajudar corretamente?"),
   mutated, usedTools };
 }
