@@ -27,11 +27,12 @@ type OrderSummary = {
   status?: string;
   statusLabel?: string;
   totalLabel?: string;
+  createdAt?: string;
 };
 
 type PendingConversation =
   | { kind: "select_order"; action: "cancel" | "change" | "payment"; orders: OrderSummary[]; originalText: string; hasChangeDetails: boolean; paymentMethod: "pix" | "credit" | "money" | ""; expiresAt: number }
-  | { kind: "cancel_confirm"; order: OrderSummary; expiresAt: number }
+  | { kind: "cancel_confirm"; order: OrderSummary; alternativeOrders?: OrderSummary[]; expiresAt: number }
   | { kind: "change_details"; order: OrderSummary; expiresAt: number }
   | { kind: "payment_method"; order: OrderSummary; expiresAt: number }
   | { kind: "payment_confirm"; order: OrderSummary; paymentMethod: "pix" | "credit" | "money"; expiresAt: number };
@@ -56,6 +57,9 @@ const MAX_CUSTOMER_TEXT = 2000;
 const MAX_REPLY_LENGTH = 1200;
 const MIN_CONTACT_INTERVAL_MS = 1200;
 const CONVERSATION_TTL_MS = 10 * 60 * 1000;
+const RECENT_ORDER_MINUTES = 30;
+const RECENT_ORDER_GAP_MINUTES = 15;
+const MAX_VISIBLE_ORDER_CHOICES = 5;
 const inFlight = new Set<string>();
 const lastAttemptAt = new Map<string, number>();
 const pendingConversations = new Map<string, PendingConversation>();
@@ -263,11 +267,33 @@ async function sendText(params: AiAssistantParams, text: string) {
   await params.sendMessage(params.customerJid, { text });
 }
 
-function orderListText(orders: OrderSummary[]) {
-  return orders.map((order, index) => `${index + 1}. Pedido #${order.orderNumber}${order.statusLabel ? ` — ${order.statusLabel}` : ""}${order.totalLabel ? ` — ${order.totalLabel}` : ""}`).join("\n");
+function orderListText(orders: OrderSummary[], limit = orders.length) {
+  const shown = orders.slice(0, limit);
+  const lines = shown.map((order, index) => `${index + 1}. Pedido #${order.orderNumber}${order.statusLabel ? ` — ${order.statusLabel}` : ""}${order.totalLabel ? ` — ${order.totalLabel}` : ""}`);
+  if (shown.length < orders.length) lines.push("Se for outro pedido, informe o número dele (ex.: *#4813*).");
+  return lines.join("\n");
+}
+
+function requestedOrderNumber(text: string): string | null {
+  const input = normalizeForMatch(text);
+  const found = input.match(/(?:\bpedido\b[^\d]{0,18}|#\s*)(\d{3,8})\b/);
+  return found?.[1] || null;
+}
+
+function mostRecentUnambiguousOrder(orders: OrderSummary[], now = Date.now()): OrderSummary | null {
+  if (orders.length < 2) return null;
+  const candidates = orders.map((order) => ({ order, at: Date.parse(String(order.createdAt || "")) }));
+  if (candidates.some(({ at }) => !Number.isFinite(at))) return null;
+  candidates.sort((a, b) => b.at - a.at);
+  const age = now - candidates[0].at;
+  const gap = candidates[0].at - candidates[1].at;
+  if (age < 0 || age > RECENT_ORDER_MINUTES * 60_000 || gap < RECENT_ORDER_GAP_MINUTES * 60_000) return null;
+  return candidates[0].order;
 }
 
 function chooseOrder(text: string, orders: OrderSummary[]) {
+  const requested = requestedOrderNumber(text);
+  if (requested) return orders.find((order) => normalizeForMatch(order.orderNumber).replace(/^#/, "") === requested) || null;
   const normalized = normalizeForMatch(text).replace(/^#/, "");
   const index = Number.parseInt(normalized, 10);
   if (Number.isInteger(index) && index >= 1 && index <= orders.length && String(index) === normalized) return orders[index - 1];
@@ -318,12 +344,13 @@ async function performPaymentChange(params: AiAssistantParams, order: OrderSumma
   await sendText(params, backendMessage(result, "Não consegui alterar a forma de pagamento agora. Tente novamente ou fale com a loja."));
 }
 
-async function moveToAction(params: AiAssistantParams, key: string, action: "cancel" | "change" | "payment", order: OrderSummary, originalText: string, hasChangeDetails: boolean, paymentMethod: "pix" | "credit" | "money" | "") {
+async function moveToAction(params: AiAssistantParams, key: string, action: "cancel" | "change" | "payment", order: OrderSummary, originalText: string, hasChangeDetails: boolean, paymentMethod: "pix" | "credit" | "money" | "", alternativeOrders?: OrderSummary[]) {
   const expiresAt = Date.now() + CONVERSATION_TTL_MS;
 
   if (action === "cancel") {
-    pendingConversations.set(key, { kind: "cancel_confirm", order, expiresAt });
-    await sendText(params, `Encontrei o pedido #${order.orderNumber}. Confirma o cancelamento? Responda *SIM* ou *NÃO*.`);
+    pendingConversations.set(key, { kind: "cancel_confirm", order, alternativeOrders, expiresAt });
+    const label = `${order.statusLabel ? ` — ${order.statusLabel}` : ""}${order.totalLabel ? ` — ${order.totalLabel}` : ""}`;
+    await sendText(params, `Encontrei o pedido #${order.orderNumber}${label}. Confirma o cancelamento? Responda *SIM* ou *NÃO*.${alternativeOrders?.length ? "\nSe quiser cancelar outro pedido, responda *OUTRO PEDIDO*." : ""}`);
     return;
   }
 
@@ -365,6 +392,25 @@ async function beginOrderAction(params: AiAssistantParams, key: string, action: 
     return;
   }
 
+  if (action === "cancel") {
+    const requested = requestedOrderNumber(originalText);
+    if (requested) {
+      const match = orders.find((order) => normalizeForMatch(order.orderNumber).replace(/^#/, "") === requested);
+      if (!match) {
+        await sendText(params, `Não encontrei o pedido #${requested} entre os pedidos que você pode cancelar por aqui. Confira o número ou fale com a loja.`);
+        return;
+      }
+      await moveToAction(params, key, action, match, originalText, hasChangeDetails, paymentMethod, orders.filter((order) => order.id !== match.id));
+      return;
+    }
+
+    const mostRecent = mostRecentUnambiguousOrder(orders);
+    if (mostRecent) {
+      await moveToAction(params, key, action, mostRecent, originalText, hasChangeDetails, paymentMethod, orders.filter((order) => order.id !== mostRecent.id));
+      return;
+    }
+  }
+
   if (orders.length === 1) {
     await moveToAction(params, key, action, orders[0], originalText, hasChangeDetails, paymentMethod);
     return;
@@ -379,7 +425,7 @@ async function beginOrderAction(params: AiAssistantParams, key: string, action: 
     paymentMethod,
     expiresAt: Date.now() + CONVERSATION_TTL_MS,
   });
-  await sendText(params, `Encontrei mais de um pedido recente. Qual deles você quer usar? Responda com o número da lista ou com o número do pedido:\n\n${orderListText(orders)}`);
+  await sendText(params, `Encontrei mais de um pedido disponível. Qual deles você quer usar? Responda com o número da lista ou com o número do pedido:\n\n${orderListText(orders, action === "cancel" ? MAX_VISIBLE_ORDER_CHOICES : orders.length)}`);
 }
 
 async function handlePendingConversation(params: AiAssistantParams, key: string, state: PendingConversation) {
@@ -393,7 +439,7 @@ async function handlePendingConversation(params: AiAssistantParams, key: string,
     }
     const order = chooseOrder(text, state.orders);
     if (!order) {
-      await sendText(params, `Não consegui identificar qual pedido você escolheu. Responda com o número da lista ou do pedido:\n\n${orderListText(state.orders)}`);
+      await sendText(params, `Não consegui identificar qual pedido você escolheu. Responda com o número da lista ou do pedido:\n\n${orderListText(state.orders, state.action === "cancel" ? MAX_VISIBLE_ORDER_CHOICES : state.orders.length)}`);
       return true;
     }
     pendingConversations.delete(key);
@@ -402,6 +448,15 @@ async function handlePendingConversation(params: AiAssistantParams, key: string,
   }
 
   if (state.kind === "cancel_confirm") {
+    if (/^(outro|outro pedido|outros pedidos|quero outro|pedido diferente)$/i.test(normalizeForMatch(text)) && state.alternativeOrders?.length) {
+      const remaining = state.alternativeOrders;
+      pendingConversations.set(key, {
+        kind: "select_order", action: "cancel", orders: remaining, originalText: "",
+        hasChangeDetails: false, paymentMethod: "", expiresAt: Date.now() + CONVERSATION_TTL_MS,
+      });
+      await sendText(params, `Certo, o pedido #${state.order.orderNumber} não foi cancelado. Qual outro pedido deseja cancelar?\n\n${orderListText(remaining, MAX_VISIBLE_ORDER_CHOICES)}`);
+      return true;
+    }
     if (isAffirmative(text)) {
       pendingConversations.delete(key);
       await performCancel(params, state.order);

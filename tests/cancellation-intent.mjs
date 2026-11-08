@@ -103,6 +103,130 @@ test("Click Testes regression: 'Quero cancelar' identifies active #4813 without 
   }
 });
 
+test("screenshot 09:29: prioritize newly created #3570 instead of listing 25 stale test orders", async () => {
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  const actions = [];
+  const now = Date.now();
+  const first = { id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570", statusLabel: "em preparo", totalLabel: "R$ 53,96", createdAt: new Date(now - 60_000).toISOString() };
+  const older = { id: "22222222-2222-4222-8222-222222222222", orderNumber: "4813", statusLabel: "em preparo", totalLabel: "R$ 29,00", createdAt: new Date(now - 8 * 60 * 60_000).toISOString() };
+  const stale = Array.from({ length: 23 }, (_, index) => ({
+    id: `33333333-3333-4333-8333-${String(index).padStart(12, "0")}`,
+    orderNumber: String(6600 + index), statusLabel: "novo", totalLabel: "R$ 12,00",
+    createdAt: new Date(now - (24 + index) * 60 * 60_000).toISOString(),
+  }));
+  globalThis.fetch = async (url, options) => {
+    assert.ok(String(url).endsWith("/api/webhook/whatsapp/order-self-service"));
+    const request = JSON.parse(options.body);
+    actions.push(request.action);
+    assert.equal(request.action, "lookup", "nothing is cancelled without a confirmed SIM");
+    return response(200, { ok: true, orders: [first, older, ...stale] });
+  };
+  const base = {
+    sessionId: "tenant-screenshot-newest", customerJid: "5531999955700@s.whatsapp.net", customerPhone: "5531999955700",
+    getStoreInfo: async () => ({ capabilities: { ai_assistant: true } }),
+    sendMessage: async (_jid, content) => { sent.push(content.text); }, logger,
+  };
+  try {
+    assert.equal(await handleAiV2({ ...base, text: "Quero cancelar" }), true);
+    assert.deepEqual(actions, ["lookup"]);
+    assert.match(sent.at(-1), /pedido #3570.*R\$ 53,96.*confirma o cancelamento/i);
+    assert.match(sent.at(-1), /OUTRO PEDIDO/);
+    assert.doesNotMatch(sent.at(-1), /#4813|#6600/);
+
+    assert.equal(await handleAiV2({ ...base, text: "Outro pedido" }), true);
+    assert.match(sent.at(-1), /#4813/);
+    assert.doesNotMatch(sent.at(-1), /\d+\. Pedido #3570|#6605/);
+    assert.ok((sent.at(-1).match(/\d+\. Pedido/g) || []).length <= 5, "old orders are never dumped into WhatsApp");
+
+    assert.equal(await handleAiV2({ ...base, text: "Pedido #4813" }), true);
+    assert.match(sent.at(-1), /pedido #4813.*confirma o cancelamento/i);
+    assert.equal(await handleAiV2({ ...base, text: "NÃO" }), true);
+    assert.match(sent.at(-1), /não foi cancelado/i);
+    assert.deepEqual(actions, ["lookup"]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("explicit order number chooses requested older order instead of the latest", async () => {
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  const now = Date.now();
+  const orders = [
+    { id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570", createdAt: new Date(now - 60_000).toISOString() },
+    { id: "22222222-2222-4222-8222-222222222222", orderNumber: "4813", createdAt: new Date(now - 9 * 60 * 60_000).toISOString() },
+  ];
+  globalThis.fetch = async (_url, options) => {
+    assert.equal(JSON.parse(options.body).action, "lookup");
+    return response(200, { ok: true, orders });
+  };
+  const base = {
+    sessionId: "tenant-explicit-number", customerJid: "5531999955701@s.whatsapp.net", customerPhone: "5531999955701",
+    getStoreInfo: async () => ({ capabilities: { ai_assistant: true } }),
+    sendMessage: async (_jid, content) => { sent.push(content.text); }, logger,
+  };
+  try {
+    assert.equal(await handleAiV2({ ...base, text: "Cancela o pedido #4813" }), true);
+    assert.match(sent.at(-1), /pedido #4813.*confirma o cancelamento/i);
+    assert.doesNotMatch(sent.at(-1), /#3570/);
+    assert.equal(await handleAiV2({ ...base, text: "NÃO" }), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("two similarly recent active orders require selection instead of guessing", async () => {
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  const now = Date.now();
+  globalThis.fetch = async (_url, options) => {
+    assert.equal(JSON.parse(options.body).action, "lookup");
+    return response(200, { ok: true, orders: [
+      { id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570", createdAt: new Date(now - 60_000).toISOString() },
+      { id: "22222222-2222-4222-8222-222222222222", orderNumber: "4813", createdAt: new Date(now - 3 * 60_000).toISOString() },
+    ] });
+  };
+  const base = {
+    sessionId: "tenant-two-recent", customerJid: "5531999955702@s.whatsapp.net", customerPhone: "5531999955702",
+    getStoreInfo: async () => ({ capabilities: { ai_assistant: true } }),
+    sendMessage: async (_jid, content) => { sent.push(content.text); }, logger,
+  };
+  try {
+    assert.equal(await handleAiV2({ ...base, text: "Quero cancelar" }), true);
+    assert.match(sent.at(-1), /mais de um pedido disponível/i);
+    assert.match(sent.at(-1), /#3570/);
+    assert.match(sent.at(-1), /#4813/);
+    assert.equal(await handleAiV2({ ...base, text: "Pedido #4813" }), true);
+    assert.match(sent.at(-1), /pedido #4813.*confirma o cancelamento/i);
+    assert.equal(await handleAiV2({ ...base, text: "não" }), true);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("unknown explicit order number never silently falls back to a different order", async () => {
+  const originalFetch = globalThis.fetch;
+  const sent = [];
+  globalThis.fetch = async (_url, options) => {
+    assert.equal(JSON.parse(options.body).action, "lookup");
+    return response(200, { ok: true, orders: [{ id: "11111111-1111-4111-8111-111111111111", orderNumber: "3570" }] });
+  };
+  const base = {
+    sessionId: "tenant-missing-number", customerJid: "5531999955703@s.whatsapp.net", customerPhone: "5531999955703",
+    getStoreInfo: async () => ({ capabilities: { ai_assistant: true } }),
+    sendMessage: async (_jid, content) => { sent.push(content.text); }, logger,
+  };
+  try {
+    assert.equal(await handleAiV2({ ...base, text: "Cancela o pedido 4813" }), true);
+    assert.match(sent.at(-1), /não encontrei o pedido #4813/i);
+    assert.doesNotMatch(sent.at(-1), /#3570/);
+    assert.equal(hasPendingOrderCancellation(base.sessionId, base.customerJid), false);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("confirmation is bound to the same WhatsApp contact and denied plans cannot bypass entitlement", async () => {
   const originalFetch = globalThis.fetch;
   const sent = [];
