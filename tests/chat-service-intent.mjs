@@ -1,4 +1,5 @@
 // tests/chat-service-intent.mjs
+import "./helpers-no-recent-order.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { tmpdir } from "node:os";

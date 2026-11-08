@@ -558,3 +558,37 @@ export async function handleRecentOrderEdit(params: AiAssistantParams): Promise<
     inFlight.delete(key);
   }
 }
+
+/** Agent tool: orders of this customer that can still be changed (no internal IDs). */
+export async function listChangeableOrdersForAgent(params: AiAssistantParams) {
+  if (!clean(params.customerPhone)) return { ok: false, orders: [] as OrderSummary[] };
+  const lookup = await lookupOrders(params);
+  const orders = lookup.ok && Array.isArray(lookup?.data?.orders) ? lookup.data.orders as OrderSummary[] : [];
+  return { ok: true, orders };
+}
+
+/**
+ * Agent tool: validate an item change of an already placed order with the
+ * backend (prices/availability/window) and open the SIM/NÃO confirmation.
+ * Nothing reaches the store until the customer confirms.
+ */
+export async function proposeOrderChangeForAgent(params: AiAssistantParams, orderNumber: string, plan: unknown, originalText: string) {
+  const normalized = normalizePlan(plan);
+  if (!normalized.operations.length) return { ok: false, error: "Informe o produto e a quantidade a adicionar ou retirar." };
+  const { orders } = await listChangeableOrdersForAgent(params);
+  if (!orders.length) return { ok: false, error: "Não há pedido que ainda possa ser alterado (prazo encerrado ou pedido já saiu para entrega). Oriente o cliente a falar com a loja ou fazer um novo pedido." };
+  const wanted = clean(orderNumber).replace(/\D/g, "");
+  const order = wanted ? orders.find((item) => clean(item.orderNumber).replace(/\D/g, "") === wanted) : (orders.length === 1 ? orders[0] : undefined);
+  if (!order) return { ok: false, error: "Pergunte em qual pedido fazer a alteração: " + orders.map((item) => "#" + clean(item.orderNumber)).join(", ") };
+  const result = await postBackend("/api/webhook/whatsapp/order-self-service", {
+    action: "change", previewOnly: true, sessionId: params.sessionId, phone: clean(params.customerPhone),
+    orderId: order.id, changeText: clean(originalText).slice(0, 600) || "Alteração de itens solicitada pelo cliente",
+    changePlan: normalized,
+  }, params);
+  if (!result.ok) return { ok: false, error: backendMessage(result, "Não consegui validar essa alteração no pedido.") };
+  const preview = (result.data || {}) as ChangePreview;
+  const canonical = normalizePlan(preview.canonicalChangePlan || normalized);
+  const key = `${params.sessionId}:${params.customerJid}`;
+  pendingChanges.set(key, { kind: "confirm", order, plan: canonical, preview, originalText, expiresAt: Date.now() + CONVERSATION_TTL_MS });
+  return { ok: true, text: `Pedido #${clean(order.orderNumber)}:\n` + buildPreviewText(order, preview) };
+}

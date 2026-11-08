@@ -1,6 +1,6 @@
 // src/chatOrder.ts
 import { randomUUID } from "node:crypto";
-import { handleRecentOrderEdit, hasPendingOrderChange } from "./aiAssistantV2.js";
+import { handleRecentOrderEdit, hasPendingOrderChange, listChangeableOrdersForAgent, proposeOrderChangeForAgent } from "./aiAssistantV2.js";
 import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft, type RememberedPendingProduct } from "./chatMemory.js";
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
 import { looksLikeFieldEdit, planFieldEdit, replyValue, type EditableField } from "./chatFieldAgent.js";
@@ -28,6 +28,8 @@ type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string
   pendingChoice?: { topic: ChoiceTopic; productIds: string[] };
   storeInfo?: ChatStoreInfo | null;
   storeInfoAt?: number;
+  recentOrders?: { orderNumber: string; status: string; total: string }[];
+  recentOrdersAt?: number;
   quoteNeedsReview?: boolean;
   pendingEdit?: EditableField;
   // A product awaiting mandatory options is separate from checkout questions.
@@ -1008,6 +1010,23 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
     neighborhood: state.draft.neighborhood, complement: state.draft.complement,
     paymentMethod: state.draft.paymentMethod,
   });
+  const v2Params = {
+    sessionId: p.sessionId, customerJid: p.customerJid, customerPhone: p.customerPhone, text: p.text,
+    getStoreInfo: async () => ((p.getStoreInfo ? await p.getStoreInfo() : {}) as any),
+    sendMessage: p.sendMessage,
+    logger: { info: (f: Record<string, unknown>, m: string) => p.logger.info?.(f, m), warn: p.logger.warn, error: p.logger.warn },
+  };
+  // Orders already placed by this customer (short cache): lets the agent tell
+  // "add to my order" apart from "start a new cart".
+  if (!state.recentOrdersAt || Date.now() - state.recentOrdersAt > 45_000) {
+    try {
+      const found = await listChangeableOrdersForAgent(v2Params);
+      state.recentOrders = found.orders.map(order => ({
+        orderNumber: String(order.orderNumber || ""), status: order.statusLabel || order.status || "", total: order.totalLabel || "",
+      }));
+    } catch { state.recentOrders = []; }
+    state.recentOrdersAt = Date.now();
+  }
   const agent = await runChatCoordinator({
     text: p.text, history: state.history || [], apiKey: geminiKey,
     model: String(process.env.GEMINI_AGENT_MODEL || geminiModel),
@@ -1015,6 +1034,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
     snapshot: {
       storeName: state.catalog.storeName || "",
       cart: safeCart(),
+      recentOrders: state.recentOrders || [],
       pendingEdit: state.pendingEdit || null,
       menuUrl: state.catalog.menuUrl,
       products: state.catalog.products.slice(0, 120).map(item => ({
@@ -1048,6 +1068,19 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         })) };
       }
       if (tool === "read_cart") return { ok: true, cart: safeCart() };
+      if (tool === "read_my_orders") {
+        const found = await listChangeableOrdersForAgent(v2Params);
+        return { ok: true, orders: found.orders.map(order => ({
+          orderNumber: order.orderNumber, status: order.statusLabel || order.status, total: order.totalLabel,
+        })) };
+      }
+      if (tool === "change_placed_order") {
+        const proposal = await proposeOrderChangeForAgent(v2Params, String(args.orderNumber || ""),
+          { operations: Array.isArray(args.operations) ? args.operations : [] }, p.text);
+        if (!proposal.ok) return { ok: false, error: proposal.error };
+        state.recentOrdersAt = 0;
+        return { ok: true, mutated: true, finalReply: proposal.text };
+      }
       if (tool === "read_store") {
         if (p.getStoreInfo && (!state.storeInfoAt || Date.now() - state.storeInfoAt > 4 * 60_000)) {
           try { state.storeInfo = await p.getStoreInfo(); state.storeInfoAt = Date.now(); }
@@ -1278,7 +1311,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
       response = "Entendi sua mensagem. Para não repetir a mesma resposta, me diga qual produto ou opção você quer agora.";
     }
     if (/R\$\s*\d/.test(response) &&
-        !agent.usedTools.some(tool => ["find_products","preview_order","read_store"].includes(tool))) {
+        !agent.usedTools.some(tool => ["find_products","preview_order","read_store","change_placed_order","read_my_orders"].includes(tool))) {
       response = "Vou precisar consultar os valores atuais da loja antes de informar um preço.";
     }
     await send(p, response);
@@ -1891,7 +1924,7 @@ export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (hasPendingOrderChange(p.sessionId, p.customerJid)) return false;
   // No cart open + "adiciona uma coca" right after ordering: change that order, not a new cart.
   const open = drafts.get(key);
-  if (!open?.draft.items.length && !open?.pendingProduct && p.getStoreInfo && editsPlacedOrder(p.text) && !concernsExistingOrder(p.text)) {
+  if (!canUseCentralAgent(p.sessionId) && !open?.draft.items.length && !open?.pendingProduct && p.getStoreInfo && editsPlacedOrder(p.text) && !concernsExistingOrder(p.text)) {
     const saved = open ? null : await loadChatSession(p.sessionId, p.customerJid);
     if (!saved?.draft?.items?.length && !saved?.pendingProduct) {
       const getStoreInfo = p.getStoreInfo;

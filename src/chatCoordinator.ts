@@ -38,6 +38,15 @@ const declarations = [
       field: { type: "STRING", enum: ["name", "deliveryType", "address", "number", "neighborhood", "complement", "reference", "paymentMethod"] },
       value: STR,
     }, required: ["field", "value"] } },
+  { name: "read_my_orders", description: "Consultar os pedidos JÁ FEITOS por este cliente que ainda podem ser alterados (número, status, total).",
+    parameters: { type: "OBJECT", properties: {} } },
+  { name: "change_placed_order", description: "Propor alteração de itens em um pedido JÁ FEITO (adicionar/retirar). O sistema valida preço e prazo e pede ao cliente confirmação SIM/NÃO; nada vai para a loja antes disso.",
+    parameters: { type: "OBJECT", properties: {
+      orderNumber: STR,
+      operations: { type: "ARRAY", items: { type: "OBJECT", properties: {
+        action: { type: "STRING", enum: ["add_item", "remove_item"] }, product: STR, quantity: INT,
+      }, required: ["action", "product", "quantity"] } },
+    }, required: ["operations"] } },
   { name: "preview_order", description: "Cotação oficial da compra atual. Só use com dados de entrega/retirada, nome e pagamento completos. Apresenta resumo ao cliente para confirmação explícita posterior.",
     parameters: { type: "OBJECT", properties: {} } },
 ];
@@ -67,6 +76,14 @@ const instructions = [
   "NUNCA execute ou solicite commit/pagamento/cancelamento: a confirmação é tratada em separado mediante autorização explícita.",
   "Para variantes, adicionais pagos, alergias, estoque ou dados não confirmados não assuma: consulte ou peça esclarecimentos.",
   "Ao confirmar uma ação após tool call, considere apenas a resposta da ferramenta, não sua hipótese inicial.",
+  "PEDIDOS JÁ FEITOS: recentOrders no snapshot lista pedidos já feitos por este cliente que ainda podem ser alterados. O carrinho (cart) é só para um pedido NOVO.",
+  "Se existir pedido em recentOrders e o cliente pedir para adicionar, colocar, incluir, tirar ou trocar algo (\"quero adicionar uma coca\", \"esqueci a batata\", \"coloca no meu pedido\"), entenda que é no pedido já feito, salvo se ele disser claramente que quer um pedido novo. Nesse caso NÃO use edit_cart nem peça nome/entrega/pagamento de novo.",
+  "Para isso use find_products para achar o nome exato do produto e depois change_placed_order com o nome exato do cardápio. A ferramenta já envia o resumo com o novo total para o cliente confirmar.",
+  "Se houver itens antigos no carrinho mas o cliente se refere ao pedido que acabou de fazer, ignore o carrinho antigo. Em dúvida real entre pedido novo e pedido feito, pergunte em uma frase curta.",
+  "Se change_placed_order falhar, explique o motivo dado pela ferramenta de forma simples e diga o que o cliente pode fazer.",
+  "Se o cliente perguntar se a alteração foi feita, só diga que foi feita se ele já confirmou com SIM; caso contrário explique que falta a confirmação. Use read_my_orders para status dos pedidos.",
+  "Cancelamento do pedido inteiro e troca de forma de pagamento são tratados em fluxo próprio: não prometa executar, apenas oriente o cliente a pedir isso claramente.",
+  "Nunca peça desculpas genéricas nem responda frases vagas como 'pode explicar melhor'; quando entender a intenção, aja; quando faltar algo, pergunte exatamente o que falta.",
   "Responda em português do Brasil, educado, específico, breve. Evite textos repetitivos e links de cardápio por padrão.",
   "Não exponha IDs técnicos, chaves, metadados internos ou dados de outros clientes.",
 ].join("\n");
