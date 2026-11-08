@@ -77,7 +77,10 @@ test("números: 1, 1️⃣, 'opção 2', 'dois'", () => {
 test("pedido completo pelo menu, sem IA, do 'Oi' ao 'SIM'", async () => {
   const { say, calls } = harness("guided");
   let r = await say("Boa noite");
-  assert.match(r.out, /Boa noite, Renii/); assert.match(r.out, /1️⃣ Fazer um pedido por aqui/); assert.match(r.out, /6️⃣ Falar com um atendente/);
+  assert.match(r.out, /cardápio digital/, "saudação continua enviando o link do cardápio");
+  assert.doesNotMatch(r.out, /1️⃣ Fazer um pedido/);
+  r = await say("opções");
+  assert.match(r.out, /1️⃣ Fazer um pedido por aqui/); assert.match(r.out, /6️⃣ Falar com um atendente/);
   r = await say("1");      assert.match(r.out, /1️⃣ Lanches/); assert.match(r.out, /2️⃣ Bebidas/);
   r = await say("1");      assert.match(r.out, /1️⃣ X-Tudo — R\$\s25,00/); assert.match(r.out, /2️⃣ Coxinha Catupiry/);
   r = await say("1");      assert.match(r.out, /Quantas unidades/);
@@ -113,7 +116,7 @@ test("pedido completo pelo menu, sem IA, do 'Oi' ao 'SIM'", async () => {
 
 test("retirada, endereço salvo e informações da loja", async () => {
   const { say, calls } = harness("guided");
-  await say("oi");
+  await say("opções");
   let r = await say("5");
   assert.match(r.out, /Seg: 18:00 às 23:00/); assert.match(r.out, /Centro — R\$\s5,00/); assert.match(r.out, /Tempo de preparo: 20 a 40 min/);
   await say("0"); await say("1"); await say("1"); await say("2"); await say("1");
@@ -140,7 +143,7 @@ test("sem IA: texto livre acha o produto; texto desconhecido mostra o menu", asy
 
 test("modo guiado + IA: menu por número sem IA; frase livre vai para a IA", async () => {
   const { say, calls } = harness("guided_ai");
-  await say("Oi"); await say("1");
+  await say("opções"); await say("1");
   assert.equal(calls.gemini, 0, "navegar pelo menu não gasta IA");
   await say("na verdade quero ver se vocês entregam no bairro Fonte Grande hoje");
   assert.ok(calls.gemini > 0, "pergunta livre é entendida pela IA");
@@ -148,7 +151,7 @@ test("modo guiado + IA: menu por número sem IA; frase livre vai para a IA", asy
 
 test("falar com atendente pelo menu pausa o robô", async () => {
   const { say } = harness("guided");
-  await say("oi");
+  await say("opções");
   const r = await say("6");
   assert.match(r.out, /avisei a equipe/);
 });
