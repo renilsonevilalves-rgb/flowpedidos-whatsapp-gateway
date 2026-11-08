@@ -66,6 +66,7 @@ export function usesCentralAgent(sessionId: string): boolean {
 // "Falar com atendente": pause is persisted by humanHandoff.ts and checked in
 // the server before any automatic reply.
 const HUMAN_PAUSE_MINUTES = Number(process.env.WHATSAPP_HUMAN_PAUSE_MINUTES || 120);
+const CART_IDLE_RESET_MS = Number(process.env.WHATSAPP_CART_IDLE_RESET_MINUTES || 15) * 60_000;
 const serialized = new Map<string, Promise<boolean>>();
 const clean = (v: unknown, max = 240) => String(v || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max);
 const norm = (v: unknown) => clean(v, 2000).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
@@ -1369,7 +1370,9 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
     }
     const lastAssistant = [...(state.history || [])].reverse().find(turn => turn.role === "assistant")?.text;
     if (!agent.mutated && lastAssistant && norm(response) === norm(lastAssistant)) {
-      response = "Entendi sua mensagem. Para não repetir a mesma resposta, me diga qual produto ou opção você quer agora.";
+      response = state.draft.items.length
+        ? "Seu pedido continua como te mostrei acima 😊 Quer confirmar com *SIM*, mudar algum item ou começar um *pedido novo*?"
+        : "Como posso te ajudar agora? 😊 Posso montar um pedido por aqui, acompanhar ou alterar um pedido que você já fez.";
     }
     if (/R\$\s*\d/.test(response) &&
         !agent.usedTools.some(tool => ["find_products","preview_order","read_store","change_placed_order","read_my_orders","cancel_placed_order","change_payment_method","order_status","notify_store"].includes(tool))) {
@@ -1429,6 +1432,23 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     for (const [id, old] of drafts) if (Date.now() - old.updatedAt > 20 * 60_000) drafts.delete(id);
     if (drafts.size >= 1000) drafts.delete(drafts.keys().next().value as string);
     drafts.set(key, state);
+  }
+  // Start fresh instead of resurrecting an old cart: explicit "novo pedido",
+  // or a cart idle for a while when the customer greets/starts again.
+  if (state.draft.items.length || state.pendingProduct) {
+    const said = norm(p.text);
+    const explicitNew = /\b(?:novo pedido|pedido novo|outro pedido|comecar de novo|comecar do zero|do zero|zerar (?:o )?carrinho|limpar? (?:o )?carrinho|esvaziar? (?:o )?carrinho)\b/.test(said);
+    const restart = /^(?:oi+|ola|opa|eai|e ai|hey|bom dia|boa tarde|boa noite|tudo bem)\b/.test(said) ||
+      /\b(?:fazer (?:um )?pedido|quero pedir|queria pedir|gostaria de pedir|fazer uma encomenda)\b/.test(said);
+    const idleMs = Date.now() - (state.draftChangedAt || 0);
+    if (explicitNew || (restart && idleMs > CART_IDLE_RESET_MS)) {
+      p.logger.info?.({ sessionId: p.sessionId, explicitNew }, "[Chat-Order] Old cart cleared to start a new order");
+      state.draft = { ...fresh(), name: state.draft.name };
+      state.pendingProduct = undefined; state.pendingChoice = undefined; state.pendingEdit = undefined;
+      state.quote = undefined; state.quoteExpiry = undefined; state.quoteNeedsReview = false;
+      state.history = [...(state.history || []), { role: "assistant" as const, text: "(Carrinho anterior descartado: o cliente está começando um pedido novo do zero.)" }].slice(-80);
+      state.draftChangedAt = Date.now();
+    }
   }
   state.updatedAt = Date.now();
   state.history = [...(state.history || []), { role: "user" as const, text: clean(p.text, 800) }].slice(-80);
