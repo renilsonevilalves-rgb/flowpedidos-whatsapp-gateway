@@ -12,6 +12,9 @@ process.env.WHATSAPP_CART_IDLE_RESET_MINUTES = "0";   // every cart counts as id
 process.env.GEMINI_API_KEY = "fake";
 process.env.GEMINI_MODEL = "m";
 process.env.VERCEL_API_URL = "https://backend.test";
+// Writable temp folders (CI cannot write to /data).
+{ const { tmpdir } = await import("node:os"); const base = tmpdir() + "/" + (await import("node:path")).basename(import.meta.url, ".mjs") + "-" + process.pid;
+  process.env.CHAT_MEMORY_DIR = base + "-memory"; process.env.WHATSAPP_RECEIPT_DIR = base + "-receipts"; process.env.DATA_DIR = base + "-data"; }
 process.env.API_KEY = "k";
 const { handleChatOrderMessage } = await import("../dist/chatOrder.js");
 const COX = "e4e4e4e4-e4e4-44e4-84e4-e4e4e4e4e4e4";

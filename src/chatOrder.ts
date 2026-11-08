@@ -10,7 +10,7 @@ import { looksLikeFieldEdit, planFieldEdit, replyValue, type EditableField } fro
 import { runChatCoordinator } from "./chatCoordinator.js";
 import { deliverOrderReceipt, prepareOrderReceipt } from "./chatReceiptOutbox.js";
 import { applyApprovedAliases, explicitProductCorrection, type AliasCandidate, type LearnedAlias } from "./chatLearning.js";
-import { readInquiry, searchCatalog, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
+import { readInquiry, searchCatalog, similarWord, mayBeCartAddition, type Inquiry } from "./chatDialogue.js";
 import { resolveCartAction } from "./chatCartIntent.js";
 import { isOrderCancellationRequest } from "./cancellationIntent.js";
 import { isPromotionQuestion, promotionsFor, scopeLabel, unresolvedChoice, formatOptions, type ChoiceTopic } from "./chatConversation.js";
@@ -34,6 +34,7 @@ type State = { draft: Draft; catalog: Catalog; updatedAt: number; quote?: string
   recentOrders?: { orderNumber: string; status: string; total: string }[];
   recentOrdersAt?: number;
   draftChangedAt?: number;
+  guided?: Guided;
   quoteNeedsReview?: boolean;
   pendingEdit?: EditableField;
   // A product awaiting mandatory options is separate from checkout questions.
@@ -66,6 +67,35 @@ export function usesCentralAgent(sessionId: string): boolean {
 // "Falar com atendente": pause is persisted by humanHandoff.ts and checked in
 // the server before any automatic reply.
 const HUMAN_PAUSE_MINUTES = Number(process.env.WHATSAPP_HUMAN_PAUSE_MINUTES || 120);
+function moneyValues(text: string): number[] {
+  return [...String(text).matchAll(/R\$\s*(\d{1,3}(?:\.\d{3})+(?:,\d{1,2})?|\d+(?:[.,]\d{1,2})?)/g)]
+    .map(match => {
+      const raw = match[1];
+      const normalized = /,\d{1,2}$/.test(raw) ? raw.replace(/\./g, "").replace(",", ".") : raw.replace(/\.(?=\d{3}\b)/g, "");
+      return Math.round(Number(normalized) * 100);
+    }).filter(Number.isFinite);
+}
+/** True when every R$ value in the reply is backed by real data. */
+function pricesAreGrounded(reply: string, state: State): boolean {
+  const known = new Set<number>();
+  const add = (value: unknown) => { const cents = Math.round(Number(value) * 100); if (Number.isFinite(cents) && cents > 0) known.add(cents); };
+  for (const product of state.catalog.products) {
+    const bases = [Number(product.price), Number(product.originalPrice)].filter(value => Number.isFinite(value) && value > 0);
+    for (const base of bases) for (let quantity = 1; quantity <= 10; quantity++) add(base * quantity);
+    for (const group of product.optionGroups || []) for (const option of group.options || []) {
+      add(option.price);
+      for (const base of bases) add(base + Number(option.price || 0));
+    }
+  }
+  // Delivery fees and minimum order configured by the store.
+  const context: any = state.storeInfo?.aiContext || {};
+  for (const area of context.delivery?.neighborhoods || []) add(area?.fee);
+  add(context.delivery?.fee); add(context.service?.minimumOrderValue);
+  // Values the customer already received from verified flows (summaries, fees, orders).
+  for (const turn of (state.history || []).slice(-30)) if (turn.role === "assistant") for (const cents of moneyValues(turn.text)) known.add(cents);
+  for (const order of state.recentOrders || []) for (const cents of moneyValues(order.total)) known.add(cents);
+  return moneyValues(reply).every(cents => known.has(cents));
+}
 const CART_IDLE_RESET_MS = Number(process.env.WHATSAPP_CART_IDLE_RESET_MINUTES || 15) * 60_000;
 const serialized = new Map<string, Promise<boolean>>();
 const clean = (v: unknown, max = 240) => String(v || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max);
@@ -1374,9 +1404,20 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
         ? "Seu pedido continua como te mostrei acima 😊 Quer confirmar com *SIM*, mudar algum item ou começar um *pedido novo*?"
         : "Como posso te ajudar agora? 😊 Posso montar um pedido por aqui, acompanhar ou alterar um pedido que você já fez.";
     }
+    // Prices: every R$ value must be a real one (catalog, options, quantities,
+    // fees/totals already shown, placed orders). An invented price is never
+    // sent: the deterministic catalog flow answers with real data instead.
+    if (/R\$\s*\d/.test(response) && !state.storeInfo && p.getStoreInfo) {
+      state.storeInfo = await p.getStoreInfo().catch(() => null) as any; state.storeInfoAt = Date.now();
+    }
     if (/R\$\s*\d/.test(response) &&
-        !agent.usedTools.some(tool => ["find_products","preview_order","read_store","change_placed_order","read_my_orders","cancel_placed_order","change_payment_method","order_status","notify_store"].includes(tool))) {
-      response = "Vou precisar consultar os valores atuais da loja antes de informar um preço.";
+        !agent.usedTools.some(tool => ["preview_order","change_placed_order","read_my_orders","cancel_placed_order","change_payment_method","order_status"].includes(tool)) &&
+        !pricesAreGrounded(response, state)) {
+      p.logger.warn?.({ sessionId: p.sessionId }, "[Chat-Coordinator] Ungrounded price replaced by catalog flow");
+      if (!agent.mutated) return false;
+      response = state.draft.items.length
+        ? recap(state.draft, state.catalog) + "\n\nQuer adicionar mais alguma coisa ou posso fechar o pedido?"
+        : "Me diga o nome do produto que eu confiro no cardápio para você 😊";
     }
     noteTools(p.sessionId, p.customerJid, agent.usedTools);
     await send(p, response);
@@ -1384,6 +1425,606 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
     return true;
   }
   return false;
+}
+
+// ===========================================================================
+// ATENDIMENTO GUIADO (sem IA): menu por números que tira o pedido completo,
+// acompanha, altera/cancela, informa a loja e chama atendente. Preços e
+// disponibilidade vêm do cardápio oficial; o pedido só é criado depois do
+// resumo validado pelo backend e do SIM do cliente (fluxo de confirmação
+// já existente). Modo da loja: settings.whatsappAttendanceMode
+//   "guided_ai" (padrão) = menu guiado + IA só quando o cliente escreve livre
+//   "guided"            = só menu guiado, nenhuma chamada de IA
+//   "ai"                = só IA (comportamento anterior)
+// ===========================================================================
+type AttendanceMode = "guided_ai" | "guided" | "ai";
+type GuidedStep =
+  | "main" | "categories" | "products" | "quantity" | "options" | "after_add" | "remove"
+  | "delivery" | "address_saved" | "neighborhood" | "street" | "complement" | "payment" | "name"
+  | "manage" | "manage_order";
+type Guided = {
+  step: GuidedStep; mode: "cart" | "order"; at: number;
+  category?: string; productIds?: string[]; productId?: string; quantity?: number;
+  groupIndex?: number; selected?: NonNullable<Item["selectedOptions"]>;
+  orderNumber?: string; orders?: string[]; neighborhoods?: string[];
+  payments?: string[]; askedComplement?: boolean; askedSavedAddress?: boolean;
+};
+const GUIDED_TTL_MS = 30 * 60_000;
+const KEY_NUMBERS = ["0️⃣", "1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣"];
+const numberLabel = (n: number) => n < 10 ? KEY_NUMBERS[n] : n + ".";
+
+function v2ParamsFor(p: Params) {
+  return {
+    sessionId: p.sessionId, customerJid: p.customerJid, customerPhone: p.customerPhone, text: p.text,
+    getStoreInfo: async () => ((p.getStoreInfo ? await p.getStoreInfo() : {}) as any),
+    sendMessage: p.sendMessage,
+    logger: { info: (f: Record<string, unknown>, m: string) => p.logger.info?.(f, m), warn: p.logger.warn, error: p.logger.warn },
+  };
+}
+
+async function storeInfoFor(p: Params, state: State): Promise<any> {
+  if (p.getStoreInfo && (!state.storeInfo || Date.now() - (state.storeInfoAt || 0) > 5 * 60_000)) {
+    try { state.storeInfo = await p.getStoreInfo(); state.storeInfoAt = Date.now(); } catch { /* keep cached */ }
+  }
+  return state.storeInfo || null;
+}
+
+async function attendanceMode(p: Params, state: State): Promise<AttendanceMode> {
+  const forced = String(process.env.WHATSAPP_ATTENDANCE_MODE || "").trim();
+  if (forced === "guided" || forced === "ai" || forced === "guided_ai") return forced;
+  const info = await storeInfoFor(p, state);
+  const raw = String(info?.aiContext?.attendance?.mode || "");
+  return raw === "guided" || raw === "ai" ? raw : "guided_ai";
+}
+
+/** "1", "1️⃣", "opção 2", "dois" -> number. Anything else -> null. */
+export function choiceNumber(text: string): number | null {
+  const t = norm(text).replace(/[⃣️]/g, "").replace(/^(?:opcao|numero|n[o°º]?\.?)\s*/, "")
+    .replace(/[.)!?\s]+$/, "").replace(/^[#(\s]+/, "").trim();
+  if (/^\d{1,2}$/.test(t)) return Number(t);
+  const words: Record<string, number> = { zero: 0, um: 1, uma: 1, dois: 2, duas: 2, tres: 3, quatro: 4,
+    cinco: 5, seis: 6, sete: 7, oito: 8, nove: 9, dez: 10 };
+  return t in words ? words[t] : null;
+}
+function choiceNumbers(text: string): number[] {
+  const parts = norm(text).replace(/[⃣️]/g, "").split(/\s*(?:,|e|\s)\s*/).filter(Boolean);
+  const numbers = parts.map(part => choiceNumber(part));
+  return numbers.every(n => n !== null) ? [...new Set(numbers as number[])] : [];
+}
+const isBack = (text: string) => /^(?:0|voltar|volta|anterior)$/.test(norm(text).replace(/[⃣️.!]/g, "").trim());
+const isMenuWord = (text: string) => /^(?:menu|menu inicial|inicio|opcoes|ver opcoes|comecar|0)$/.test(norm(text).replace(/[⃣️.!]/g, "").trim());
+
+function customerFirstName(state: State): string {
+  const profile: any = state.catalog.customer;
+  const name = clean(state.draft.name || profile?.name || "", 60).split(/\s+/)[0] || "";
+  return /^[\p{L}][\p{L}'-]{1,30}$/u.test(name) ? name : "";
+}
+
+function mainMenuText(state: State, mode: AttendanceMode, opening = ""): string {
+  const items = state.draft.items.reduce((sum, item) => sum + item.quantity, 0);
+  return [
+    opening || "Como posso te ajudar? 😊",
+    "",
+    items ? "1️⃣ Continuar meu pedido (" + items + (items === 1 ? " item" : " itens") + ")" : "1️⃣ Fazer um pedido por aqui",
+    "2️⃣ Ver o cardápio digital",
+    "3️⃣ Acompanhar meu pedido",
+    "4️⃣ Alterar ou cancelar um pedido",
+    "5️⃣ Horário, entrega e pagamento",
+    "6️⃣ Falar com um atendente",
+    "",
+    mode === "guided" ? "Responda com o *número* da opção." : "É só responder com o *número*. Se preferir, escreva o que precisa 😉",
+  ].join("\n");
+}
+
+async function showMainMenu(p: Params, state: State, mode: AttendanceMode, opening = "") {
+  state.guided = { step: "main", mode: "cart", at: Date.now() };
+  await send(p, mainMenuText(state, mode, opening));
+}
+
+function greetingOpening(state: State, text: string): string {
+  const t = norm(text);
+  const hello = t.startsWith("bom dia") ? "Bom dia" : t.startsWith("boa tarde") ? "Boa tarde" : t.startsWith("boa noite") ? "Boa noite" : "Olá";
+  const name = customerFirstName(state);
+  const store = clean(state.catalog.storeName || "", 80);
+  return hello + (name ? ", " + name : "") + "! 😊" + (store ? " Bem-vindo(a) à *" + store + "*." : "");
+}
+
+function categoriesOf(state: State, mode: "cart" | "order"): string[] {
+  const seen: string[] = [];
+  for (const product of guidedProducts(state, mode)) {
+    const category = clean(product.category || "Outros", 60) || "Outros";
+    if (!seen.includes(category)) seen.push(category);
+  }
+  return seen;
+}
+// Adding to an already placed order supports products without mandatory options.
+function guidedProducts(state: State, mode: "cart" | "order") {
+  return state.catalog.products.filter(product => mode === "cart" ||
+    !(product.optionGroups || []).some(group => Number(group.min || 0) > 0));
+}
+function priceLabel(product: Catalog["products"][number]): string {
+  const original = Number(product.originalPrice);
+  return product.promotionEnabled && Number.isFinite(original) && original > product.price
+    ? "~" + currency(original) + "~ *" + currency(product.price) + "* 🔥"
+    : currency(product.price);
+}
+
+async function showCategories(p: Params, state: State, mode: "cart" | "order") {
+  const categories = categoriesOf(state, mode);
+  if (!categories.length) {
+    state.guided = undefined;
+    await send(p, "No momento não há produtos disponíveis para pedir por aqui 😕\nConfira o cardápio digital: " + state.catalog.menuUrl);
+    return;
+  }
+  if (categories.length === 1) return showProducts(p, state, mode, categories[0]);
+  state.guided = { ...(state.guided || { at: 0 }), step: "categories", mode, at: Date.now(), category: undefined } as Guided;
+  await send(p, (mode === "order" ? "O que você quer *adicionar ao pedido #" + (state.guided.orderNumber || "") + "*?\n\n" : "📋 *Escolha uma categoria:*\n\n") +
+    categories.map((category, index) => numberLabel(index + 1) + " " + category).join("\n") +
+    "\n\n0️⃣ Voltar");
+}
+
+async function showProducts(p: Params, state: State, mode: "cart" | "order", category: string) {
+  const products = guidedProducts(state, mode).filter(product => (clean(product.category || "Outros", 60) || "Outros") === category).slice(0, 40);
+  state.guided = { ...(state.guided || { at: 0 }), step: "products", mode, at: Date.now(), category, productIds: products.map(product => product.id) } as Guided;
+  await send(p, (mode === "order" ? "O que você quer *adicionar ao pedido #" + (state.guided?.orderNumber || "") + "*?\n\n" : "") + "*" + category + "*\n\n" +
+    products.map((product, index) => numberLabel(index + 1) + " " + product.name + " — " + priceLabel(product)).join("\n") +
+    "\n\nResponda com o *número* do produto.\n0️⃣ Voltar");
+}
+
+async function askQuantity(p: Params, state: State, productId: string, mode: "cart" | "order") {
+  const product = state.catalog.products.find(row => row.id === productId)!;
+  state.guided = { ...(state.guided || { at: 0 }), step: "quantity", mode, at: Date.now(), productId, selected: [], groupIndex: 0 } as Guided;
+  await send(p, "*" + product.name + "* — " + priceLabel(product) +
+    (product.description ? "\n" + clean(product.description, 200) : "") +
+    "\n\nQuantas unidades? Responda com o número (ex.: *1*).\n0️⃣ Voltar");
+}
+
+async function askOption(p: Params, state: State) {
+  const guided = state.guided!;
+  const product = state.catalog.products.find(row => row.id === guided.productId)!;
+  const group = (product.optionGroups || [])[guided.groupIndex || 0];
+  const min = Number(group.min || 0), max = Math.max(1, Number(group.max || 1));
+  guided.step = "options"; guided.at = Date.now();
+  await send(p, "*" + group.name + "* — " + product.name +
+    (min > 0 ? (min === max ? " (escolha " + min + ")" : " (escolha de " + min + " a " + max + ")") : " (opcional, até " + max + ")") + "\n\n" +
+    group.options.map((option, index) => numberLabel(index + 1) + " " + option.name + (Number(option.price) > 0 ? " (+" + currency(Number(option.price)) + ")" : "")).join("\n") +
+    (min === 0 ? "\n\n0️⃣ Nenhum" : "") +
+    (max > 1 ? "\n\nPode escolher mais de um separando por vírgula (ex.: *1, 3*)." : ""));
+}
+
+function cartLines(state: State): { lines: string[]; subtotal: number } {
+  let subtotal = 0;
+  const lines = state.draft.items.map(item => {
+    const product = state.catalog.products.find(row => row.id === item.productId);
+    const options = (item.selectedOptions || []).map(selected => {
+      const group = product?.optionGroups?.find(g => g.id === selected.groupId);
+      return group?.options.find(option => option.id === selected.id);
+    }).filter(Boolean) as Array<{ name: string; price: number }>;
+    const unit = Number(product?.price || 0) + options.reduce((sum, option) => sum + Number(option.price || 0), 0);
+    subtotal += unit * item.quantity;
+    return "• " + item.quantity + "x " + (product?.name || "Produto") + " — " + currency(unit * item.quantity) +
+      (options.length ? "\n   + " + options.map(option => option.name).join(", ") : "") +
+      (item.notes ? "\n   Obs.: " + item.notes : "");
+  });
+  return { lines, subtotal };
+}
+
+async function showAfterAdd(p: Params, state: State, added = "") {
+  const { lines, subtotal } = cartLines(state);
+  state.guided = { step: "after_add", mode: "cart", at: Date.now() };
+  await send(p, (added ? "✅ Adicionei *" + added + "*.\n\n" : "") +
+    "🛒 *Seu pedido*\n" + lines.join("\n") + "\n\nSubtotal: *" + currency(subtotal) + "* (sem taxa de entrega)\n\n" +
+    "1️⃣ Adicionar mais itens\n2️⃣ Finalizar pedido\n3️⃣ Remover um item\n0️⃣ Menu inicial");
+}
+
+function savedAddress(state: State): { address: string; number: string; neighborhood: string; complement: string; reference: string } | null {
+  const saved: any = (state.catalog.customer as any)?.savedAddress;
+  if (!saved?.address || !saved?.number || !saved?.neighborhood) return null;
+  const allowed = state.catalog.neighborhoods || [];
+  if (allowed.length && !allowed.some(name => norm(name) === norm(saved.neighborhood))) return null;
+  return { address: clean(saved.address, 250), number: clean(saved.number, 30), neighborhood: clean(saved.neighborhood, 100),
+    complement: clean(saved.complement, 160), reference: clean(saved.reference, 160) };
+}
+
+function neighborhoodFee(state: State, name: string): number | null {
+  const areas: any[] = (state.storeInfo as any)?.aiContext?.delivery?.neighborhoods || [];
+  const area = areas.find(row => norm(row?.name) === norm(name));
+  return area && Number.isFinite(Number(area.fee)) ? Number(area.fee) : null;
+}
+
+function paymentChoices(state: State): Array<{ id: string; label: string }> {
+  const online: any = (state.storeInfo as any)?.aiContext?.payments?.online || {};
+  const place = state.draft.deliveryType === "pickup" ? "na retirada" : "na entrega";
+  const choices = [
+    { id: "pix", label: "Pix " + place },
+    { id: "credit", label: "Cartão " + place },
+    { id: "money", label: "Dinheiro" },
+  ];
+  if (online.pix === true) choices.push({ id: "online_pix", label: "Pix agora (link de pagamento)" });
+  if (online.credit === true) choices.push({ id: "online_credit", label: "Cartão de crédito agora (link)" });
+  if (online.debit === true) choices.push({ id: "online_debit", label: "Cartão de débito agora (link)" });
+  return choices;
+}
+
+/** Next checkout question; when nothing is missing, sends the validated summary. */
+async function guidedCheckout(p: Params, state: State) {
+  await storeInfoFor(p, state); // fees and online payment options
+  const d = state.draft;
+  const guided: Guided = { ...(state.guided || { step: "delivery", mode: "cart", at: 0 }), mode: "cart", at: Date.now() } as Guided;
+  state.guided = guided;
+  if (!d.name) {
+    const profileName = clean((state.catalog.customer as any)?.name, 60);
+    if (profileName) d.name = profileName;
+  }
+  if (!d.deliveryType) {
+    const canDeliver = norm(state.catalog.deliveryMode) === "neighborhood";
+    guided.step = "delivery";
+    await send(p, canDeliver
+      ? "Vai ser para:\n\n1️⃣ Entrega\n2️⃣ Retirada no local"
+      : "Por aqui consigo fazer pedidos para *retirada*. Para entrega, finalize pelo cardápio: " + state.catalog.menuUrl +
+        "\n\n1️⃣ Retirada no local\n0️⃣ Menu inicial");
+    return;
+  }
+  if (d.deliveryType === "delivery" && (!d.address || !d.number || !d.neighborhood)) {
+    const saved = savedAddress(state);
+    if (saved && !guided.askedSavedAddress && !d.address && !d.neighborhood) {
+      guided.step = "address_saved";
+      await send(p, "Entrego no mesmo endereço da última vez?\n📍 " + saved.address + ", " + saved.number + " — " + saved.neighborhood +
+        (saved.complement ? " (" + saved.complement + ")" : "") + "\n\n1️⃣ Sim, nesse endereço\n2️⃣ Outro endereço");
+      return;
+    }
+    if (!d.neighborhood) {
+      const list = (state.catalog.neighborhoods || []).slice(0, 60);
+      guided.step = "neighborhood"; guided.neighborhoods = list;
+      await send(p, list.length
+        ? "Qual o seu *bairro*?\n\n" + list.map((name, index) => {
+            const fee = neighborhoodFee(state, name);
+            return numberLabel(index + 1) + " " + name + (fee !== null ? " — taxa " + currency(fee) : "");
+          }).join("\n") + "\n\nResponda com o número ou o nome do bairro."
+        : "Qual o seu *bairro*?");
+      return;
+    }
+    guided.step = "street";
+    await send(p, "Qual a *rua e o número*? (ex.: Rua Tereza Cristina, 144)");
+    return;
+  }
+  if (d.deliveryType === "delivery" && !guided.askedComplement && !d.complement && !d.reference) {
+    guided.step = "complement";
+    await send(p, "Tem *complemento ou ponto de referência*? (ex.: apto 101, em frente ao mercado)\nSe não tiver, responda *0*.");
+    return;
+  }
+  if (!d.name) {
+    guided.step = "name";
+    await send(p, "Qual o seu *nome* para identificar o pedido?");
+    return;
+  }
+  if (!d.paymentMethod) {
+    const choices = paymentChoices(state);
+    guided.step = "payment"; guided.payments = choices.map(choice => choice.id);
+    await send(p, "Como prefere *pagar*?\n\n" + choices.map((choice, index) => numberLabel(index + 1) + " " + choice.label).join("\n"));
+    return;
+  }
+  // Everything filled: backend validates prices/fees/availability and sends
+  // the summary; the existing confirmation path creates the order on "SIM".
+  state.guided = undefined;
+  await acknowledgeCartEdit(p, state, "Tudo certo");
+}
+
+async function storeInfoText(p: Params, state: State): Promise<string> {
+  const info: any = await storeInfoFor(p, state);
+  const ctx: any = info?.aiContext || {};
+  const lines: string[] = ["🏪 *" + clean(info?.storeName || state.catalog.storeName || "Nossa loja", 80) + "*"];
+  if (info?.isOpen === true) lines.push("🟢 Aberto agora");
+  if (info?.isOpen === false) lines.push("🔴 Fechado agora");
+  const business = ctx.business || {};
+  const place = [business.address, business.city, business.state].map((part: unknown) => clean(part, 120)).filter(Boolean).join(", ");
+  if (place) lines.push("📍 " + place);
+  const days: Array<[string, string]> = [["monday", "Seg"], ["tuesday", "Ter"], ["wednesday", "Qua"], ["thursday", "Qui"], ["friday", "Sex"], ["saturday", "Sáb"], ["sunday", "Dom"]];
+  const hours = info?.openingHours && typeof info.openingHours === "object" ? info.openingHours : null;
+  if (hours) {
+    const rows = days.map(([key, label]) => {
+      const slot = hours[key];
+      return label + ": " + (slot?.enabled && slot.open && slot.close ? slot.open + " às " + slot.close : "fechado");
+    });
+    lines.push("", "🕒 *Horário*", ...rows);
+  }
+  const service = ctx.service || {};
+  if (service.preparationTimeMin || service.preparationTimeMax) {
+    lines.push("", "⏱️ Tempo de preparo: " + [service.preparationTimeMin, service.preparationTimeMax].filter(Boolean).join(" a ") + " min");
+  }
+  if (Number(service.minimumOrderValue) > 0) lines.push("🧾 Pedido mínimo: " + currency(Number(service.minimumOrderValue)));
+  const areas: any[] = ctx.delivery?.neighborhoods || [];
+  if (norm(state.catalog.deliveryMode) === "neighborhood" && areas.length) {
+    lines.push("", "🛵 *Entrega* (bairro — taxa)", ...areas.slice(0, 30).map(area => "• " + clean(area?.name, 60) +
+      (Number.isFinite(Number(area?.fee)) ? " — " + currency(Number(area.fee)) : "")));
+    if (areas.length > 30) lines.push("• e mais " + (areas.length - 30) + " bairros");
+  }
+  const online: any = ctx.payments?.online || {};
+  const onlineList = [online.pix && "Pix", online.credit && "crédito", online.debit && "débito"].filter(Boolean);
+  lines.push("", "💳 *Pagamento*: Pix, cartão ou dinheiro na entrega/retirada" +
+    (onlineList.length ? "\nOnline (link): " + onlineList.join(", ") : ""));
+  lines.push("", "0️⃣ Menu inicial");
+  return lines.join("\n");
+}
+
+async function guidedAddToPlacedOrder(p: Params, state: State, productId: string, quantity: number) {
+  const product = state.catalog.products.find(row => row.id === productId)!;
+  const guided = state.guided!;
+  state.guided = undefined;
+  const proposal = await proposeOrderChangeForAgent(v2ParamsFor(p), guided.orderNumber || "",
+    { operations: [{ action: "add_item", product: product.name, quantity }] }, "Adicionar " + quantity + "x " + product.name);
+  if (proposal.ok) { await send(p, proposal.text || ""); return; }
+  await send(p, clean(proposal.error, 400) + "\n\n0️⃣ Menu inicial");
+  state.guided = { step: "main", mode: "cart", at: Date.now() };
+}
+
+/**
+ * Returns true when the guided flow answered. False lets the message continue
+ * (AI when allowed, deterministic fallback otherwise).
+ */
+async function guidedMessage(p: Params, state: State, mode: AttendanceMode): Promise<boolean> {
+  const text = p.text;
+  const service = classifyServiceIntent(text);
+  if (state.guided && Date.now() - state.guided.at > GUIDED_TTL_MS) state.guided = undefined;
+  const guided = state.guided;
+  const n = choiceNumber(text);
+
+  if (!guided || guided.step === "main") {
+    if (service === "greeting" && n === null) { await showMainMenu(p, state, mode, greetingOpening(state, text)); return true; }
+    if (isMenuWord(text) && !(guided?.step === "main" && n === 0)) { await showMainMenu(p, state, mode); return true; }
+    if (guided?.step === "main" && n !== null) {
+      if (n === 1) {
+        if (state.draft.items.length) { await showAfterAdd(p, state); return true; }
+        await showCategories(p, state, "cart"); return true;
+      }
+      if (n === 2) {
+        state.guided = undefined;
+        if (!(await trySendInteractiveMenu(p))) await send(p, "📋 *Cardápio digital*:\n" + state.catalog.menuUrl + "\n\nSe preferir, também tiro seu pedido por aqui: responda *1*.");
+        state.guided = { step: "main", mode: "cart", at: Date.now() };
+        return true;
+      }
+      if (n === 3) {
+        state.guided = { step: "main", mode: "cart", at: Date.now() };
+        const status = await orderStatusForAgent(v2ParamsFor(p));
+        await send(p, status.message + "\n\n0️⃣ Menu inicial");
+        return true;
+      }
+      if (n === 4) {
+        state.guided = { step: "manage", mode: "cart", at: Date.now() };
+        await send(p, "O que você quer fazer?\n\n1️⃣ Adicionar item em um pedido já feito\n2️⃣ Cancelar um pedido\n3️⃣ Trocar a forma de pagamento\n0️⃣ Voltar");
+        return true;
+      }
+      if (n === 5) {
+        state.guided = { step: "main", mode: "cart", at: Date.now() };
+        await send(p, await storeInfoText(p, state));
+        return true;
+      }
+      if (n === 6) {
+        state.guided = undefined;
+        await pauseAi(p.sessionId, p.customerJid, HUMAN_PAUSE_MINUTES, "customer_request");
+        logAiEvent({ sessionId: p.sessionId, customerPhone: p.customerPhone, customerName: state.draft.name || null,
+          kind: "human_request", role: "system", flagged: true, body: "Cliente escolheu falar com atendente no menu" });
+        await send(p, "Certo! Já avisei a equipe da loja. 🙋 Um atendente vai continuar com você por aqui assim que possível.\nSe quiser voltar ao atendimento automático, escreva *voltar ao robô*.");
+        return true;
+      }
+      if (n === 0) { await showMainMenu(p, state, mode); return true; }
+      await send(p, "Essa opção não existe 😅 Responda com um número de 1 a 6.");
+      return true;
+    }
+    return false;
+  }
+
+  // From here on there is an active guided step.
+  guided.at = Date.now();
+  if (isMenuWord(text) && n === null) { await showMainMenu(p, state, mode); return true; }
+  const retry = async (hint: string) => {
+    if (mode === "guided_ai" && n === null && text.trim().split(/\s+/).length > 2) { state.guided = undefined; return false; }
+    await send(p, hint); return true;
+  };
+
+  switch (guided.step) {
+    case "categories": {
+      if (isBack(text)) { await showMainMenu(p, state, mode); return true; }
+      const categories = categoriesOf(state, guided.mode);
+      if (n !== null && n >= 1 && n <= categories.length) { await showProducts(p, state, guided.mode, categories[n - 1]); return true; }
+      const typed = categories.find(category => norm(category) === norm(text));
+      if (typed) { await showProducts(p, state, guided.mode, typed); return true; }
+      return retry("Responda com o número da categoria (1 a " + categories.length + ") ou *0* para voltar.");
+    }
+    case "products": {
+      if (isBack(text)) { await showCategories(p, state, guided.mode); return true; }
+      const ids = guided.productIds || [];
+      if (n !== null && n >= 1 && n <= ids.length) { await askQuantity(p, state, ids[n - 1], guided.mode); return true; }
+      return retry("Responda com o número do produto (1 a " + ids.length + ") ou *0* para voltar.");
+    }
+    case "quantity": {
+      if (isBack(text)) { await showProducts(p, state, guided.mode, guided.category || categoriesOf(state, guided.mode)[0] || "Outros"); return true; }
+      if (n === null || n < 1 || n > 20) return retry("Me diga a quantidade com um número de 1 a 20 (ex.: *2*).");
+      const product = state.catalog.products.find(row => row.id === guided.productId);
+      if (!product) { await showCategories(p, state, guided.mode); return true; }
+      guided.quantity = n;
+      if (guided.mode === "order") { await guidedAddToPlacedOrder(p, state, product.id, n); return true; }
+      if ((product.optionGroups || []).length) { guided.groupIndex = 0; guided.selected = []; await askOption(p, state); return true; }
+      addItemsToDraft(state, [{ productId: product.id, quantity: n }]);
+      await showAfterAdd(p, state, n + "x " + product.name);
+      return true;
+    }
+    case "options": {
+      const product = state.catalog.products.find(row => row.id === guided.productId);
+      const group = product?.optionGroups?.[guided.groupIndex || 0];
+      if (!product || !group) { await showCategories(p, state, "cart"); return true; }
+      const min = Number(group.min || 0), max = Math.max(1, Number(group.max || 1));
+      let picks = choiceNumbers(text);
+      if (!picks.length) {
+        const named = group.options.findIndex(option => norm(option.name) === norm(text));
+        if (named >= 0) picks = [named + 1];
+      }
+      if (picks.length === 1 && picks[0] === 0 && min === 0) picks = [];
+      else if (!picks.length || picks.some(pick => pick < 1 || pick > group.options.length) || picks.length < min || picks.length > max) {
+        return retry("Escolha " + (min === max ? min : "de " + min + " a " + max) + " opção(ões) pelo número" + (min === 0 ? " ou *0* para nenhum" : "") + ".");
+      }
+      guided.selected = [...(guided.selected || []), ...picks.map(pick => ({ groupId: group.id, id: group.options[pick - 1].id, quantity: 1 }))];
+      guided.groupIndex = (guided.groupIndex || 0) + 1;
+      if (guided.groupIndex < (product.optionGroups || []).length) { await askOption(p, state); return true; }
+      const ok = addItemsToDraft(state, [{ productId: product.id, quantity: guided.quantity || 1, selectedOptions: guided.selected }]);
+      if (!ok) { await send(p, "Não consegui adicionar esse item com essas opções. Vamos tentar de novo?"); await showCategories(p, state, "cart"); return true; }
+      await showAfterAdd(p, state, (guided.quantity || 1) + "x " + product.name);
+      return true;
+    }
+    case "after_add": {
+      if (n === 0) { await showMainMenu(p, state, mode); return true; }
+      if (n === 1) { await showCategories(p, state, "cart"); return true; }
+      if (n === 2) {
+        if (!state.draft.items.length) { await showCategories(p, state, "cart"); return true; }
+        await guidedCheckout(p, state); return true;
+      }
+      if (n === 3) {
+        if (!state.draft.items.length) { await showMainMenu(p, state, mode); return true; }
+        guided.step = "remove";
+        await send(p, "Qual item você quer remover?\n\n" + cartLines(state).lines.map((line, index) => numberLabel(index + 1) + " " + line.replace(/^• /, "")).join("\n") + "\n\n0️⃣ Voltar");
+        return true;
+      }
+      return retry("Responda *1* para adicionar mais, *2* para finalizar, *3* para remover ou *0* para o menu.");
+    }
+    case "remove": {
+      if (isBack(text)) { await showAfterAdd(p, state); return true; }
+      if (n !== null && n >= 1 && n <= state.draft.items.length) {
+        const [removed] = state.draft.items.splice(n - 1, 1);
+        state.quote = undefined; state.quoteExpiry = undefined;
+        const name = state.catalog.products.find(row => row.id === removed.productId)?.name || "item";
+        if (!state.draft.items.length) { await showMainMenu(p, state, mode, "Removi *" + name + "*. Seu carrinho ficou vazio."); return true; }
+        await send(p, "🗑️ Removi *" + removed.quantity + "x " + name + "*.");
+        await showAfterAdd(p, state);
+        return true;
+      }
+      return retry("Responda com o número do item (1 a " + state.draft.items.length + ") ou *0* para voltar.");
+    }
+    case "delivery": {
+      const canDeliver = norm(state.catalog.deliveryMode) === "neighborhood";
+      const said = norm(text);
+      if (n === 0) { await showMainMenu(p, state, mode); return true; }
+      if ((canDeliver && (n === 1 || /\bentrega\b/.test(said)))) { state.draft.deliveryType = "delivery"; await guidedCheckout(p, state); return true; }
+      if ((canDeliver && n === 2) || (!canDeliver && n === 1) || /\b(?:retirada|retirar|buscar)\b/.test(said)) {
+        state.draft.deliveryType = "pickup";
+        state.draft.address = ""; state.draft.number = ""; state.draft.neighborhood = "";
+        await guidedCheckout(p, state); return true;
+      }
+      return retry(canDeliver ? "Responda *1* para entrega ou *2* para retirada." : "Responda *1* para retirada.");
+    }
+    case "address_saved": {
+      guided.askedSavedAddress = true;
+      const saved = savedAddress(state);
+      if (n === 1 && saved) {
+        Object.assign(state.draft, { address: saved.address, number: saved.number, neighborhood: saved.neighborhood,
+          complement: saved.complement, reference: saved.reference });
+        guided.askedComplement = true;
+        await guidedCheckout(p, state); return true;
+      }
+      if (n === 2) { await guidedCheckout(p, state); return true; }
+      return retry("Responda *1* para usar o mesmo endereço ou *2* para informar outro.");
+    }
+    case "neighborhood": {
+      const list = guided.neighborhoods || [];
+      let chosen = n !== null && n >= 1 && n <= list.length ? list[n - 1] : "";
+      if (!chosen && n === null) {
+        chosen = list.find(name => norm(name) === norm(text)) ||
+          list.find(name => similarWord(norm(text).replace(/\s+/g, ""), norm(name).replace(/\s+/g, ""))) || "";
+        if (!chosen && !list.length) chosen = clean(text, 100);
+      }
+      if (!chosen) return retry(list.length ? "Não encontrei esse bairro na área de entrega 😕 Responda com o número da lista." : "Qual o seu bairro?");
+      state.draft.neighborhood = chosen;
+      await guidedCheckout(p, state); return true;
+    }
+    case "street": {
+      const raw = clean(text, 260).replace(/\s+/g, " ");
+      // "Rua 7 de Setembro, 100, apto 2" -> number right after the comma;
+      // without comma, the last number ("Rua Tereza Cristina 144").
+      const parsed = raw.match(/^(.+?),\s*(?:n[o°º.]?\s*)?(\d{1,6}[a-zA-Z]?)\b\s*[,-]?\s*(.*)$/) ||
+        raw.match(/^(.*\D)\s(?:n[o°º.]?\s*)?(\d{1,6}[a-zA-Z]?)()$/);
+      if (!parsed || parsed[1].trim().length < 3) return retry("Me passa a *rua e o número* juntos (ex.: Rua Tereza Cristina, 144).");
+      state.draft.address = clean(parsed[1].replace(/[,-]\s*$/, ""), 250);
+      state.draft.number = clean(parsed[2], 30);
+      const extra = clean(String(parsed[3] || "").replace(/^[\s,–-]+/, ""), 160);
+      if (extra) { state.draft.complement = extra; guided.askedComplement = true; }
+      await guidedCheckout(p, state); return true;
+    }
+    case "complement": {
+      guided.askedComplement = true;
+      if (n !== 0 && !/^(?:nao|nao tem|nenhum|sem|nada)$/.test(norm(text))) state.draft.complement = clean(text, 160);
+      await guidedCheckout(p, state); return true;
+    }
+    case "name": {
+      const name = clean(text, 60).replace(/^(?:meu nome e|me chamo|sou o|sou a|e)\s+/i, "");
+      if (!/^[\p{L}][\p{L} .'-]{1,59}$/u.test(name)) return retry("Me diga só o seu *nome* (ex.: Maria).");
+      state.draft.name = name;
+      await guidedCheckout(p, state); return true;
+    }
+    case "payment": {
+      const ids = guided.payments || [];
+      let chosen = n !== null && n >= 1 && n <= ids.length ? ids[n - 1] : "";
+      if (!chosen) {
+        const said = norm(text);
+        if (/\bdinheiro\b/.test(said)) chosen = "money";
+        else if (/\bpix\b/.test(said)) chosen = /\b(?:online|agora|link)\b/.test(said) && ids.includes("online_pix") ? "online_pix" : "pix";
+        else if (/\b(?:cartao|credito|debito)\b/.test(said)) chosen = "credit";
+      }
+      if (!chosen) return retry("Responda com o número da forma de pagamento (1 a " + ids.length + ").");
+      state.draft.paymentMethod = chosen;
+      await guidedCheckout(p, state); return true;
+    }
+    case "manage": {
+      if (isBack(text)) { await showMainMenu(p, state, mode); return true; }
+      if (n === 1) {
+        const { orders } = await listChangeableOrdersForAgent(v2ParamsFor(p));
+        if (!orders.length) {
+          await showMainMenu(p, state, mode, "Não encontrei pedido seu que ainda possa ser alterado 😕 (o prazo pode ter acabado ou o pedido já saiu).");
+          return true;
+        }
+        if (orders.length === 1) {
+          state.guided = { step: "categories", mode: "order", at: Date.now(), orderNumber: String(orders[0].orderNumber || "") };
+          await showCategories(p, state, "order"); return true;
+        }
+        state.guided = { step: "manage_order", mode: "order", at: Date.now(), orders: orders.map(order => String(order.orderNumber || "")) };
+        await send(p, "Em qual pedido?\n\n" + orders.map((order, index) => numberLabel(index + 1) + " Pedido #" + order.orderNumber +
+          (order.totalLabel ? " — " + order.totalLabel : "")).join("\n") + "\n\n0️⃣ Voltar");
+        return true;
+      }
+      if (n === 2 || n === 3) {
+        state.guided = undefined;
+        await send(p, await startOrderActionForAgent(v2ParamsFor(p), n === 2 ? "cancel" : "payment", ""));
+        return true;
+      }
+      return retry("Responda *1*, *2*, *3* ou *0* para voltar.");
+    }
+    case "manage_order": {
+      if (isBack(text)) { await showMainMenu(p, state, mode); return true; }
+      const orders = guided.orders || [];
+      if (n !== null && n >= 1 && n <= orders.length) {
+        state.guided = { step: "categories", mode: "order", at: Date.now(), orderNumber: orders[n - 1] };
+        await showCategories(p, state, "order"); return true;
+      }
+      return retry("Responda com o número do pedido ou *0* para voltar.");
+    }
+  }
+  return false;
+}
+
+/** Guided-only stores: free text without AI. Catalog hit -> offer; else menu. */
+async function guidedFreeText(p: Params, state: State, mode: AttendanceMode): Promise<boolean> {
+  const query = norm(p.text).replace(/\b(?:tem|voces tem|vcs tem|quero|queria|gostaria de|me ve|me da|um|uma|o|a|de|do|da|por favor|pfv|pf)\b/g, " ").replace(/[?!.,]/g, " ").replace(/\s+/g, " ").trim();
+  const found = (query ? searchCatalog(query, state.catalog.products).products : [])
+    .map(entry => state.catalog.products.find(product => product.id === (entry as any).id))
+    .filter((product): product is Catalog["products"][number] => Boolean(product));
+  if (found.length === 1) { await askQuantity(p, state, found[0].id, "cart"); return true; }
+  if (found.length > 1) {
+    const shown = found.slice(0, 9);
+    state.guided = { step: "products", mode: "cart", at: Date.now(), category: shown[0].category || "Outros", productIds: shown.map(row => row.id) };
+    await send(p, "Encontrei estas opções:\n\n" + shown.map((product, index) => numberLabel(index + 1) + " " + product.name + " — " + priceLabel(product)).join("\n") +
+      "\n\nResponda com o *número* do produto.\n0️⃣ Voltar");
+    return true;
+  }
+  await showMainMenu(p, state, mode, "Não entendi muito bem 😅 Escolha uma opção:");
+  return true;
 }
 
 async function trySendInteractiveMenu(p: Params): Promise<boolean> {
@@ -1501,6 +2142,14 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     return true;
   }
 
+  // Guided menu first (no AI). Never intercepts a SIM/NÃO for a validated summary.
+  const attendance = await attendanceMode(p, state);
+  if (attendance === "guided") { state.pendingEdit = undefined; state.pendingProduct = undefined; }
+  if (attendance !== "ai" && !(state.quote && (yes(p.text) || no(p.text))) && !state.pendingProduct && !state.pendingEdit) {
+    if (await guidedMessage(p, state, attendance)) return true;
+    if (attendance === "guided") return guidedFreeText(p, state, attendance);
+  }
+
   const normalizedTurn = norm(p.text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
 
   // Explicit requests for the digital menu and simple greetings must work
@@ -1548,7 +2197,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   // Signed checkout confirmation must take precedence over Gemini routing.
   // Never let the model reinterpret a customer's explicit SIM/NAO while a
   // validated preview is pending; legacy commit remains the sole authority.
-  if (canUseCentralAgent(p.sessionId) &&
+  if (canUseCentralAgent(p.sessionId) && attendance !== "guided" &&
       !(state.quote && (yes(p.text) || no(p.text))) &&
       await centralAgentMessage(p, state)) return true;
 

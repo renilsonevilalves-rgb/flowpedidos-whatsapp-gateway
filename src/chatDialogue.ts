@@ -53,10 +53,41 @@ export function searchCatalog(query: string, products: CatalogEntry[]): {
     const words = normalizedText(name).split(" ");
     return tokens.every(token => words.includes(token));
   };
-  const matches = products.filter(p => match(p.name));
+  let matches = products.filter(p => match(p.name));
+  // Typos are normal on WhatsApp ("chapaa", "coxinah", "refri"s): only when the
+  // exact search finds nothing, accept words with one/two small differences.
+  if (!matches.length) {
+    const fuzzy = (name: string) => {
+      const words = normalizedText(name).split(" ");
+      return tokens.every(token => words.some(word => similarWord(token, word)));
+    };
+    matches = products.filter(p => fuzzy(p.name));
+  }
   const optionProducts = products.filter(p =>
     !matches.includes(p) && (p.optionGroups || []).some(g => g.options.some(o => match(o.name))));
   return { products: matches, optionProducts };
+}
+const squeeze = (word: string) => word.replace(/(.)\1+/g, "$1");
+function editDistance(a: string, b: string): number {
+  if (Math.abs(a.length - b.length) > 2) return 3;
+  const row = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i++) {
+    let previous = row[0]; row[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const saved = row[j];
+      row[j] = Math.min(row[j] + 1, row[j - 1] + 1, previous + (a[i - 1] === b[j - 1] ? 0 : 1));
+      previous = saved;
+    }
+  }
+  return row[b.length];
+}
+export function similarWord(token: string, word: string): boolean {
+  if (token === word) return true;
+  if (token.length < 3 || word.length < 3) return false;
+  const a = squeeze(token), b = squeeze(word);
+  if (a === b || a + "s" === b || a === b + "s") return true;
+  if (a.length < 4 || b.length < 4) return false;
+  return editDistance(a, b) <= (Math.max(a.length, b.length) >= 8 ? 2 : 1);
 }
 export function mayBeCartAddition(text: string): boolean {
   const t = normalizedText(text);

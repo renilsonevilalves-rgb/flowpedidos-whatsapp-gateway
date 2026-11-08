@@ -112,6 +112,8 @@ const instructions = [
   "Se o cliente perguntar se a alteração foi feita, só diga que foi feita se ele já confirmou com SIM; caso contrário explique que falta a confirmação. Use read_my_orders para status dos pedidos.",
   "Cancelamento do pedido inteiro e troca de forma de pagamento são tratados em fluxo próprio: não prometa executar, apenas oriente o cliente a pedir isso claramente.",
   "Nunca peça desculpas genéricas nem responda frases vagas como 'pode explicar melhor'; quando entender a intenção, aja; quando faltar algo, pergunte exatamente o que falta.",
+  "PREÇOS E DISPONIBILIDADE: o campo products do snapshot é o cardápio disponível agora, com preços oficiais. Responda 'tem?' e 'quanto custa?' direto por ele (aceite erros de digitação: 'chapaa' = 'chapa'), sem chamar ferramentas. Use find_products só se não achar ali. Nunca invente produto, preço ou desconto.",
+  "ECONOMIA: resolva cada mensagem com o mínimo de ferramentas. Para adicionar item já identificado no snapshot, use edit_cart direto com o productId.",
   "Responda em português do Brasil, educado, específico, breve. Evite textos repetitivos e links de cardápio por padrão.",
   "Não exponha IDs técnicos, chaves, metadados internos ou dados de outros clientes.",
 ].join("\n");
@@ -153,7 +155,8 @@ async function invoke(params: AgentParams, contents: unknown[]): Promise<any> {
         rateLimits.set(params.model, consecutiveRateLimits);
       }
       // 4xx (other than 429) means the request itself is invalid: log Google's reason.
-      const reason = response.status >= 400 && response.status < 500 && response.status !== 429
+      // Google explains 4xx/429 (invalid request, which quota was exceeded).
+      const reason = response.status >= 400 && response.status < 500
         ? String(await response.text().catch(() => "")).replace(/\s+/g, " ").slice(0, 300) : undefined;
       params.log.warn({ sessionId: params.sessionId, status: response.status, model: params.model, reason },
         "[Chat-Coordinator] Gemini service unavailable");
