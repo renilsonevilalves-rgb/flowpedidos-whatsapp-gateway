@@ -10,6 +10,8 @@ process.env.VERCEL_API_URL = "https://backend.test";
 process.env.API_KEY = "k";
 const { handleChatOrderMessage } = await import("../dist/chatOrder.js");
 const { hasPendingOrderAction } = await import("../dist/aiAssistant.js");
+const { isAiPaused, resetHumanHandoffForTests } = await import("../dist/humanHandoff.js");
+process.env.HUMAN_HANDOFF_FILE = (await import("node:os")).tmpdir() + "/handoff-test-" + process.pid + ".json";
 const logger = { info() {}, warn() {}, error() {} };
 const res = (d, s = 200) => new Response(JSON.stringify(d), { status: s, headers: { "Content-Type": "application/json" } });
 const gem = (parts) => res({ candidates: [{ content: { role: "model", parts } }] });
@@ -52,11 +54,14 @@ test("'cadê meu pedido' devolve o status oficial", async () => {
   assert.match(msgs.join("\n"), /9002 saiu para entrega/);
 });
 
-test("pedir atendente pausa a IA para o cliente até ele pedir o robô de volta", async () => {
-  const phone = "5531900000003";
+test("pedir atendente pausa a IA (salvo em disco) até o cliente pedir o robô de volta", async () => {
+  resetHumanHandoffForTests();
+  const phone = "5531900000003"; const jid = phone + "@s.whatsapp.net";
   const first = await run(phone, "quero falar com uma pessoa", { name: "call_human", args: { reason: "pediu" } }, () => res({ ok: false }, 404));
-  assert.match(first.msgs[0], /atendente/i);
-  const silent = await run(phone, "oi?", { name: "read_cart", args: {} }, () => res({ ok: false }, 404));
-  assert.equal(silent.h, true);
-  assert.equal(silent.msgs.length, 0);
+  assert.match(first.msgs[0], /equipe/i);
+  assert.equal(await isAiPaused(SID, jid, "oi?"), true);
+  const saved = JSON.parse(await (await import("node:fs/promises")).readFile(process.env.HUMAN_HANDOFF_FILE, "utf8"));
+  assert.ok(Object.keys(saved).some((key) => key.includes(jid)));
+  assert.equal(await isAiPaused(SID, jid, "quero voltar ao robô"), false);
+  assert.equal(await isAiPaused(SID, jid, "oi"), false);
 });

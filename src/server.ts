@@ -5,7 +5,10 @@ import cors from "cors";
 import QRCode from "qrcode";
 import pino from "pino";
 import { rm } from "node:fs/promises";
-import { hasAudio, transcribeIncomingAudio } from "./audioTranscription.js";
+import { describeIncomingImage, hasAudio, hasImage, transcribeIncomingAudio } from "./audioTranscription.js";
+import { isAiPaused, pauseAi } from "./humanHandoff.js";
+import { flushAiEvents, logAiEvent, phoneForJid, rememberCustomerPhone, takeTools } from "./aiEvents.js";
+import { usesCentralAgent } from "./chatOrder.js";
 import { join } from "node:path";
 import {
   Browsers,
@@ -273,12 +276,72 @@ function isAutoReplyTrigger(text: string) {
   return explicitRequest.test(normalized);
 }
 
+// ---------------------------------------------------------------------------
+// Manual takeover: when the store answers a customer from the phone, the AI
+// pauses for that customer. Messages sent by this gateway are told apart by
+// their IDs; WhatsApp Business auto-replies (seconds after the customer
+// message) are ignored.
+const MANUAL_PAUSE_MINUTES = Number(process.env.WHATSAPP_MANUAL_PAUSE_MINUTES || 30);
+const ownSentIds = new Set<string>();
+const lastCustomerMessageAt = new Map<string, number>();
+const trackedSockets = new WeakSet<object>();
+
+function rememberOwnSend(messageId: unknown) {
+  if (!messageId) return;
+  ownSentIds.add(String(messageId));
+  if (ownSentIds.size > 20000) ownSentIds.delete(ownSentIds.values().next().value as string);
+}
+
+function trackOwnSends(sessionId: string, sock: WASocket) {
+  if (!sock || typeof (sock as any).sendMessage !== "function" || trackedSockets.has(sock as any)) return;
+  trackedSockets.add(sock as any);
+  const original = (sock as any).sendMessage.bind(sock);
+  (sock as any).sendMessage = async (jid: string, content: any, options?: any) => {
+    const sent = await original(jid, content, options);
+    rememberOwnSend(sent?.key?.id);
+    const text = typeof content?.text === "string" ? content.text : "";
+    if (text && typeof jid === "string" && !jid.endsWith("@g.us")) {
+      logAiEvent({ sessionId, customerPhone: phoneForJid(sessionId, jid), role: "assistant", body: text, tools: takeTools(sessionId, jid) });
+    }
+    return sent;
+  };
+}
+
+function hasRealContent(message: any) {
+  const unwrapped = unwrapMessage(message) || {};
+  return Boolean(extractMessageText(message) || unwrapped.imageMessage || unwrapped.audioMessage ||
+    unwrapped.videoMessage || unwrapped.documentMessage || unwrapped.stickerMessage || unwrapped.locationMessage);
+}
+
+function handleStoreOwnMessage(sessionId: string, msg: any) {
+  if (process.env.WHATSAPP_MANUAL_TAKEOVER === "false") return;
+  const remoteJid = String(msg?.key?.remoteJid || "");
+  if (!remoteJid || remoteJid === "status@broadcast" || remoteJid.endsWith("@g.us") || remoteJid.endsWith("@newsletter")) return;
+  if (!hasRealContent(msg.message)) return;
+  const messageId = String(msg?.key?.id || "");
+  // sendMessage resolves after Baileys emits the echo; check after a short delay.
+  setTimeout(() => {
+    if (messageId && ownSentIds.has(messageId)) return;
+    const customerJid = getCustomerJid(msg, remoteJid);
+    const lastCustomer = Math.max(lastCustomerMessageAt.get(`${sessionId}:${customerJid}`) || 0,
+      lastCustomerMessageAt.get(`${sessionId}:${remoteJid}`) || 0);
+    if (Date.now() - lastCustomer < 8000) return; // WhatsApp Business greeting/away message
+    void pauseAi(sessionId, customerJid, MANUAL_PAUSE_MINUTES, "manual_reply");
+    if (remoteJid !== customerJid) void pauseAi(sessionId, remoteJid, MANUAL_PAUSE_MINUTES, "manual_reply");
+    logAiEvent({ sessionId, customerPhone: phoneForJid(sessionId, customerJid) || phoneForJid(sessionId, remoteJid),
+      kind: "manual_takeover", role: "store", body: extractMessageText(msg.message) || "[mídia enviada pela loja]" });
+    logger.info({ sessionId }, "[Handoff] Store replied manually; AI paused for this customer");
+  }, 2500);
+}
+
 async function handleIncomingMessages(id: string, sock: WASocket, messages: any[], type: string) {
+  trackOwnSends(id, sock);
   if (type !== "notify") return;
 
   for (const msg of messages) {
     try {
-      if (!msg.message || msg.key.fromMe) continue;
+      if (!msg.message) continue;
+      if (msg.key.fromMe) { handleStoreOwnMessage(id, msg); continue; }
       const remoteJid = msg.key.remoteJid;
       if (!remoteJid || remoteJid === "status@broadcast" || remoteJid.endsWith("@g.us")) continue;
 
@@ -300,9 +363,31 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
           continue;
         }
       }
+      // Photos (receipts, menu prints) for stores with the central AI.
+      if (hasImage(msg.message) && usesCentralAgent(id) && process.env.GEMINI_API_KEY) {
+        const seen = await describeIncomingImage(msg, logger, id);
+        if (seen) text = [text, seen].filter(Boolean).join("\n");
+      }
       if (!text) continue;
 
       logger.info({ sessionId: id, remoteJid, text }, "[Incoming] WhatsApp message received");
+
+      // Conversation log, manual/human pause and per-customer timing.
+      {
+        const pauseJid = getCustomerJid(msg, remoteJid);
+        const pausePhone = await resolveCustomerPhone(sock, msg, remoteJid);
+        rememberCustomerPhone(id, pauseJid, pausePhone);
+        rememberCustomerPhone(id, remoteJid, pausePhone);
+        lastCustomerMessageAt.set(`${id}:${pauseJid}`, Date.now());
+        lastCustomerMessageAt.set(`${id}:${remoteJid}`, Date.now());
+        if (lastCustomerMessageAt.size > 20000) lastCustomerMessageAt.delete(lastCustomerMessageAt.keys().next().value as string);
+        const customerName = typeof msg.pushName === "string" ? msg.pushName.slice(0, 120) : null;
+        logAiEvent({ sessionId: id, customerPhone: pausePhone, customerName, role: "customer", body: text });
+        if (await isAiPaused(id, pauseJid, text) || (remoteJid !== pauseJid && await isAiPaused(id, remoteJid, text))) {
+          logger.info({ sessionId: id }, "[Handoff] Human attendance active; automatic reply skipped");
+          continue;
+        }
+      }
 
       const isTrackingTrigger = isTrackOrderTrigger(text);
       if (isTrackingTrigger) {
@@ -398,6 +483,8 @@ async function connectSession(id: string, forceFresh = false): Promise<void> {
     });
 
     session.sock = sock;
+    // Guarded: isolated lifecycle tests load this function without the helper.
+    if (typeof trackOwnSends === "function") trackOwnSends(id, sock);
     sock.ev.on("creds.update", saveCreds);
     sock.ev.on("messages.upsert", async ({ messages, type }) => {
       await handleIncomingMessages(id, sock, messages, type);

@@ -658,8 +658,17 @@ export async function startOrderActionForAgent(params: AiAssistantParams, action
 
 /** Agent tool: official order status text from the backend. */
 export async function orderStatusForAgent(params: AiAssistantParams) {
-  if (!clean(params.customerPhone)) return "Não consegui identificar o telefone deste contato para consultar o pedido.";
+  if (!clean(params.customerPhone)) return { message: "Não consegui identificar o telefone deste contato para consultar o pedido.", found: false, orderNumber: null, timing: null };
   const result = await postBackend("/api/webhook/whatsapp/order-status",
     { sessionId: params.sessionId, phone: clean(params.customerPhone) }, params.logger, params.sessionId);
-  return backendMessage(result, "Não consegui consultar o andamento do pedido agora.");
+  const data: any = (result as any)?.data || {};
+  return {
+    message: backendMessage(result, "Não consegui consultar o andamento do pedido agora."),
+    found: Boolean(result?.ok),
+    orderNumber: data.orderNumber ? String(data.orderNumber) : null,
+    timing: result?.ok && data.timing && typeof data.timing === "object" ? data.timing as {
+      statusLabel?: string; deliveryType?: string; minutesSinceCreated?: number | null;
+      estimateMinMinutes?: number | null; estimateMaxMinutes?: number | null; late?: boolean;
+    } : null,
+  };
 }

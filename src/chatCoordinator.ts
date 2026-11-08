@@ -55,6 +55,10 @@ const declarations = [
     parameters: { type: "OBJECT", properties: {} } },
   { name: "call_human", description: "Passar a conversa para um atendente humano da loja. Use quando o cliente pedir uma pessoa, reclamar seriamente, ou quando você não conseguir resolver após tentar.",
     parameters: { type: "OBJECT", properties: { reason: STR } } },
+  { name: "notify_store", description: "Avisar a equipe da loja no painel (sem pausar a conversa). kind=receipt quando o cliente enviar comprovante de pagamento; kind=complaint para reclamação (produto errado, faltando, frio, mau atendimento).",
+    parameters: { type: "OBJECT", properties: {
+      kind: { type: "STRING", enum: ["receipt", "complaint"] }, summary: STR,
+    }, required: ["kind", "summary"] } },
   { name: "preview_order", description: "Cotação oficial da compra atual. Só use com dados de entrega/retirada, nome e pagamento completos. Apresenta resumo ao cliente para confirmação explícita posterior.",
     parameters: { type: "OBJECT", properties: {} } },
 ];
@@ -73,6 +77,11 @@ const instructions = [
   "Pagamento online (Pix/cartão pelo link) só existe se payments.online estiver habilitado em read_store; caso contrário ofereça pagar na entrega. Após o pedido com pagamento online o sistema envia o link de pagamento.",
   "Para cancelar pedido já feito use cancel_placed_order; trocar forma de pagamento: change_payment_method; status/andamento/'cadê meu pedido': order_status; pedir pessoa/atendente/reclamação séria: call_human. Essas ferramentas já mandam a mensagem oficial ao cliente.",
   "Se o cliente estiver irritado, reconheça o problema com empatia em uma frase, resolva o que puder e ofereça call_human. Nunca discuta com o cliente.",
+  "CLIENTE CONHECIDO: customerProfile (quando existir) traz nome, último pedido e endereço salvo DESTE número. Cumprimente pelo primeiro nome. Se pedir 'o mesmo de sempre', 'igual da última vez' ou 'repete o pedido', use os itens de customerProfile.lastOrder com available=true via edit_cart (productId) e avise quais não estão disponíveis hoje.",
+  "Endereço salvo: ao chegar na etapa de entrega, PERGUNTE se pode entregar no mesmo endereço (diga rua, número e bairro). Só use update_checkout com ele depois que o cliente confirmar. Nunca preencha nome/endereço sem confirmação.",
+  "FOTOS: mensagens com '[Foto enviada pelo cliente: ...]' são a descrição de uma imagem. [COMPROVANTE]: agradeça, diga que a loja vai conferir o pagamento e use notify_store(kind=receipt) com valor e dados visíveis. NUNCA diga que o pagamento foi confirmado/aprovado. [CARDAPIO]: identifique os produtos com find_products e ofereça adicionar. [OUTRO]: responda com naturalidade.",
+  "ATRASO: se o cliente reclamar de demora ('tá demorando', 'cadê', 'já faz 1 hora'), use order_status. Se vier instruction de atraso, siga-a usando os minutos reais. Se não estiver atrasado, explique o status com calma.",
+  "Reclamação de produto (veio errado, faltando, frio, estragado): peça desculpas, pergunte o necessário em uma frase, use notify_store(kind=complaint) com resumo e ofereça call_human. Nunca prometa reembolso ou brinde por conta própria.",
   "Assuntos fora da loja: responda brevemente e com simpatia e traga a conversa de volta para o atendimento.",
   "Converse naturalmente; compreenda correções, mensagens curtas, pedidos em várias etapas, erros de digitação e contexto.",
   "Você decide quando chamar ferramentas. NUNCA afirme que consultou ou alterou dados sem a ferramenta retornar sucesso.",
