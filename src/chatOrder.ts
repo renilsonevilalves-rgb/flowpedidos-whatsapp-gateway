@@ -1,6 +1,7 @@
 // src/chatOrder.ts
 import { randomUUID } from "node:crypto";
 import { handleRecentOrderEdit, hasPendingOrderChange, listChangeableOrdersForAgent, proposeOrderChangeForAgent } from "./aiAssistantV2.js";
+import { hasPendingOrderAction, orderStatusForAgent, startOrderActionForAgent } from "./aiAssistant.js";
 import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft, type RememberedPendingProduct } from "./chatMemory.js";
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
 import { looksLikeFieldEdit, planFieldEdit, replyValue, type EditableField } from "./chatFieldAgent.js";
@@ -53,7 +54,19 @@ const agentTenants = new Set(String(process.env.WHATSAPP_GEMINI_AGENT_TENANTS ||
   .split(",").map(v => v.trim()).filter(Boolean));
 function canUseCentralAgent(sessionId: string): boolean {
   // Allowlisted pilot only. Empty allowlist is deliberately disabled.
-  return agentEnabled && agentTenants.has(sessionId);
+  return agentEnabled && (agentTenants.has("*") || agentTenants.has(sessionId));
+}
+// "Falar com atendente": the AI stays silent for this customer so the store
+// can answer from the phone. Ends after the period or with "voltar ao robô".
+const HUMAN_PAUSE_MS = Number(process.env.WHATSAPP_HUMAN_PAUSE_MINUTES || 120) * 60_000;
+const humanPause = new Map<string, number>();
+function humanPaused(key: string, text: string): boolean {
+  const until = humanPause.get(key);
+  if (!until) return false;
+  if (until <= Date.now() || /\b(?:voltar (?:ao|pro|para o) (?:robo|bot|automatico|atendimento automatico)|falar com (?:o )?(?:robo|bot|ia))\b/.test(norm(text))) {
+    humanPause.delete(key); return false;
+  }
+  return true;
 }
 const serialized = new Map<string, Promise<boolean>>();
 const clean = (v: unknown, max = 240) => String(v || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max);
@@ -1074,6 +1087,19 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
           orderNumber: order.orderNumber, status: order.statusLabel || order.status, total: order.totalLabel,
         })) };
       }
+      if (tool === "cancel_placed_order" || tool === "change_payment_method") {
+        const text = await startOrderActionForAgent(v2Params, tool === "cancel_placed_order" ? "cancel" : "payment", args.paymentMethod);
+        state.recentOrdersAt = 0;
+        return { ok: true, mutated: true, finalReply: text };
+      }
+      if (tool === "order_status") {
+        return { ok: true, mutated: true, finalReply: await orderStatusForAgent(v2Params) };
+      }
+      if (tool === "call_human") {
+        humanPause.set(p.sessionId + ":" + p.customerJid, Date.now() + HUMAN_PAUSE_MS);
+        if (humanPause.size > 5000) humanPause.delete(humanPause.keys().next().value as string);
+        return { ok: true, mutated: true, finalReply: "Certo! Vou chamar alguém da equipe para continuar com você por aqui. 🙋 Assim que possível, um atendente responde." };
+      }
       if (tool === "change_placed_order") {
         const proposal = await proposeOrderChangeForAgent(v2Params, String(args.orderNumber || ""),
           { operations: Array.isArray(args.operations) ? args.operations : [] }, p.text);
@@ -1096,6 +1122,9 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
           phone: info.aiContext?.business?.phone || null,
           deliveryMode: state.catalog.deliveryMode,
           neighborhoods: info.aiContext?.delivery?.neighborhoods?.slice(0, 80) || state.catalog.neighborhoods || [],
+          service: (info.aiContext as any)?.service || null,
+          payments: (info.aiContext as any)?.payments || null,
+          menuUrl: state.catalog.menuUrl,
         } };
       }
       if (tool === "edit_cart") {
@@ -1311,7 +1340,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
       response = "Entendi sua mensagem. Para não repetir a mesma resposta, me diga qual produto ou opção você quer agora.";
     }
     if (/R\$\s*\d/.test(response) &&
-        !agent.usedTools.some(tool => ["find_products","preview_order","read_store","change_placed_order","read_my_orders"].includes(tool))) {
+        !agent.usedTools.some(tool => ["find_products","preview_order","read_store","change_placed_order","read_my_orders","cancel_placed_order","change_payment_method","order_status"].includes(tool))) {
       response = "Vou precisar consultar os valores atuais da loja antes de informar um preço.";
     }
     await send(p, response);
@@ -1336,8 +1365,9 @@ async function trySendInteractiveMenu(p: Params): Promise<boolean> {
 }
 
 async function processMessage(p: Params, key: string): Promise<boolean> {
-  // This flow never intercepts existing-order actions, even with a pending cart.
-  if (concernsExistingOrder(p.text)) return false;
+  // Without the central agent this flow never intercepts existing-order actions.
+  // With it, the agent handles them through its order tools (status/cancel/change).
+  if (concernsExistingOrder(p.text) && !canUseCentralAgent(p.sessionId)) return false;
   let state = drafts.get(key);
   if (state && Date.now() - state.updatedAt > 20 * 60_000) { drafts.delete(key); state = undefined; }
   let firstTurn = !state;
@@ -1920,8 +1950,10 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (!enabled || !geminiKey || !keys.length || !process.env.VERCEL_API_URL || !p.customerJid || !p.text) return false;
   const key = p.sessionId + ":" + p.customerJid;
-  // An item change of an existing order is in progress (choose order / confirm SIM-NÃO).
-  if (hasPendingOrderChange(p.sessionId, p.customerJid)) return false;
+  // Customer asked for a human: stay silent (message is consumed, nobody else auto-replies).
+  if (humanPaused(key, p.text)) return true;
+  // An item change / cancel / payment change waits for the customer's answer (choose order / SIM-NÃO).
+  if (hasPendingOrderChange(p.sessionId, p.customerJid) || hasPendingOrderAction(p.sessionId, p.customerJid)) return false;
   // No cart open + "adiciona uma coca" right after ordering: change that order, not a new cart.
   const open = drafts.get(key);
   if (!canUseCentralAgent(p.sessionId) && !open?.draft.items.length && !open?.pendingProduct && p.getStoreInfo && editsPlacedOrder(p.text) && !concernsExistingOrder(p.text)) {

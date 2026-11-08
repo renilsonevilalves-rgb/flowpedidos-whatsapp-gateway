@@ -87,7 +87,7 @@ test("pudim removal replies with exact product and backend-verified total, witho
     assert.doesNotMatch(sent.at(-1),/Atualizei os dados disponíveis/);
     assert.equal(backend.filter(x=>x.action==="preview").length,1);
     assert.equal(backend.filter(x=>x.action==="commit").length,0);
-    assert.equal(apiCalls,2);
+    assert.equal(apiCalls,3); // primário 429 + modelo reserva
     await handleChatOrderMessage(params("Sim"));
     assert.equal(backend.filter(x=>x.action==="commit").length,1);
     assert.match(sent.at(-1),/Pedido #3245 confirmado/);

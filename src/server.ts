@@ -5,6 +5,7 @@ import cors from "cors";
 import QRCode from "qrcode";
 import pino from "pino";
 import { rm } from "node:fs/promises";
+import { hasAudio, transcribeIncomingAudio } from "./audioTranscription.js";
 import { join } from "node:path";
 import {
   Browsers,
@@ -290,7 +291,15 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
         }
       }
 
-      const text = extractMessageText(msg.message).trim();
+      let text = extractMessageText(msg.message).trim();
+      if (!text && hasAudio(msg.message) && process.env.GEMINI_API_KEY && process.env.WHATSAPP_AUDIO_TRANSCRIPTION !== "false") {
+        const heard = await transcribeIncomingAudio(msg, logger, id);
+        if (heard) text = heard;
+        else {
+          await sock.sendMessage(remoteJid, { text: "Não consegui ouvir seu áudio direitinho 😅 Pode me mandar por escrito?" }).catch(() => undefined);
+          continue;
+        }
+      }
       if (!text) continue;
 
       logger.info({ sessionId: id, remoteJid, text }, "[Incoming] WhatsApp message received");
