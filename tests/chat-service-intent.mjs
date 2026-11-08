@@ -88,3 +88,41 @@ test("explicit menu requests and greetings work when Gemini returns 429/503, wit
     globalThis.fetch = originalFetch;
   }
 });
+
+test("pilot routes greetings and menu requests to the native CTA, with a safe text fallback", async () => {
+  const originalFetch = globalThis.fetch;
+  const backendActions = [], sent = [], nativeCalls = [];
+  globalThis.fetch = async (_url, options) => {
+    const request = JSON.parse(options.body);
+    backendActions.push(request.action);
+    if (request.action === "catalog") return ok(catalog);
+    throw Error("Unexpected mutation or checkout: " + request.action);
+  };
+  const customer = "5531999951942";
+  let nativeUnavailable = false;
+  const params = text => ({
+    sessionId: tenant, customerJid: customer + "@s.whatsapp.net",
+    customerPhone: customer, text, logger,
+    sendMessage: async (_jid, message) => { sent.push(message.text); },
+    sendMenuGreeting: async () => {
+      nativeCalls.push(text);
+      if (nativeUnavailable) throw Error("native flow unsupported");
+    },
+  });
+  try {
+    assert.equal(await handleChatOrderMessage(params("Boa noite")), true);
+    assert.deepEqual(nativeCalls, ["Boa noite"]);
+    assert.deepEqual(sent, [], "The native CTA must not also send a blue URL");
+
+    assert.equal(await handleChatOrderMessage(params("Me manda o cardápio")), true);
+    assert.deepEqual(nativeCalls, ["Boa noite", "Me manda o cardápio"]);
+    assert.deepEqual(sent, [], "Explicit menu requests also use the CTA");
+
+    nativeUnavailable = true;
+    assert.equal(await handleChatOrderMessage(params("cardápio")), true);
+    assert.match(sent.at(-1), /https:\/\/menu\.test\/cardapio\/loja-teste/);
+    assert.ok(backendActions.every(action => action === "catalog"), "The CTA must not modify any order");
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
