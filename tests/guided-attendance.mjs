@@ -12,6 +12,9 @@ process.env.WHATSAPP_GEMINI_AGENT_TENANTS = SID;
 process.env.GEMINI_API_KEY = "fake";
 process.env.GEMINI_MODEL = "m";
 process.env.VERCEL_API_URL = "https://backend.test";
+// Writable temp folders (CI cannot write to /data).
+{ const { tmpdir } = await import("node:os"); const base = tmpdir() + "/" + (await import("node:path")).basename(import.meta.url, ".mjs") + "-" + process.pid;
+  process.env.CHAT_MEMORY_DIR = base + "-memory"; process.env.WHATSAPP_RECEIPT_DIR = base + "-receipts"; process.env.DATA_DIR = base + "-data"; }
 process.env.API_KEY = "k";
 process.env.HUMAN_HANDOFF_FILE = (await import("node:os")).tmpdir() + "/guided-handoff-" + process.pid + ".json";
 const { handleChatOrderMessage, choiceNumber } = await import("../dist/chatOrder.js");
