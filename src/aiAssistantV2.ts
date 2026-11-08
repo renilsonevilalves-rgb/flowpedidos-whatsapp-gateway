@@ -1,4 +1,4 @@
-import { handleAiAssistantMessage as handleLegacyAiAssistantMessage, hasPendingOrderCancellation } from "./aiAssistant.js";
+import { handleAiAssistantMessage as handleLegacyAiAssistantMessage, hasPendingOrderAction, hasPendingOrderCancellation } from "./aiAssistant.js";
 import { isOrderCancellationRequest } from "./cancellationIntent.js";
 
 type Logger = {
@@ -458,6 +458,8 @@ export async function handleAiAssistantMessage(params: AiAssistantParams): Promi
   if (!GEMINI_API_KEY) return handleLegacyAiAssistantMessage(params);
   const text = clean(params.text);
   if (!text || !params.customerJid) return false;
+  // A cancel/payment confirmation opened by the central agent answers here.
+  if (hasPendingOrderAction(params.sessionId, params.customerJid)) return handleLegacyAiAssistantMessage(params);
 
   const key = `${params.sessionId}:${params.customerJid}`;
   const active = pendingChanges.get(key) || null;

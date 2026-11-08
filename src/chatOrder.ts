@@ -1,6 +1,9 @@
 // src/chatOrder.ts
 import { randomUUID } from "node:crypto";
 import { handleRecentOrderEdit, hasPendingOrderChange, listChangeableOrdersForAgent, proposeOrderChangeForAgent } from "./aiAssistantV2.js";
+import { hasPendingOrderAction, orderStatusForAgent, startOrderActionForAgent } from "./aiAssistant.js";
+import { pauseAi } from "./humanHandoff.js";
+import { logAiEvent, noteTools } from "./aiEvents.js";
 import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft, type RememberedPendingProduct } from "./chatMemory.js";
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
 import { looksLikeFieldEdit, planFieldEdit, replyValue, type EditableField } from "./chatFieldAgent.js";
@@ -17,7 +20,7 @@ type Draft = {
   draftId: string; items: Item[]; name: string; deliveryType: string;
   address: string; number: string; neighborhood: string; complement: string; reference: string; paymentMethod: string;
 };
-type Catalog = { storeName?: string; menuUrl: string; deliveryMode: string; neighborhoods?: string[]; learnedAliases?: LearnedAlias[]; products: Array<{
+type Catalog = { customer?: unknown; storeName?: string; menuUrl: string; deliveryMode: string; neighborhoods?: string[]; learnedAliases?: LearnedAlias[]; products: Array<{
   id: string; name: string; price: number; category?: string; description?: string;
   promotionEnabled?: boolean; originalPrice?: number | null;
   optionGroups?: Array<{ id: string; name: string; min: number; max: number; options: Array<{ id: string; name: string; price: number }> }>;
@@ -53,8 +56,15 @@ const agentTenants = new Set(String(process.env.WHATSAPP_GEMINI_AGENT_TENANTS ||
   .split(",").map(v => v.trim()).filter(Boolean));
 function canUseCentralAgent(sessionId: string): boolean {
   // Allowlisted pilot only. Empty allowlist is deliberately disabled.
-  return agentEnabled && agentTenants.has(sessionId);
+  return agentEnabled && (agentTenants.has("*") || agentTenants.has(sessionId));
 }
+/** Used by the server to enable photo understanding only where the central AI runs. */
+export function usesCentralAgent(sessionId: string): boolean {
+  return enabled && canUseCentralAgent(sessionId);
+}
+// "Falar com atendente": pause is persisted by humanHandoff.ts and checked in
+// the server before any automatic reply.
+const HUMAN_PAUSE_MINUTES = Number(process.env.WHATSAPP_HUMAN_PAUSE_MINUTES || 120);
 const serialized = new Map<string, Promise<boolean>>();
 const clean = (v: unknown, max = 240) => String(v || "").replace(/[\u0000-\u001f\u007f]/g, " ").trim().slice(0, max);
 const norm = (v: unknown) => clean(v, 2000).normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
@@ -1035,6 +1045,7 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
       storeName: state.catalog.storeName || "",
       cart: safeCart(),
       recentOrders: state.recentOrders || [],
+      customerProfile: state.catalog.customer || null,
       pendingEdit: state.pendingEdit || null,
       menuUrl: state.catalog.menuUrl,
       products: state.catalog.products.slice(0, 120).map(item => ({
@@ -1074,6 +1085,35 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
           orderNumber: order.orderNumber, status: order.statusLabel || order.status, total: order.totalLabel,
         })) };
       }
+      if (tool === "cancel_placed_order" || tool === "change_payment_method") {
+        const text = await startOrderActionForAgent(v2Params, tool === "cancel_placed_order" ? "cancel" : "payment", args.paymentMethod);
+        state.recentOrdersAt = 0;
+        return { ok: true, mutated: true, finalReply: text };
+      }
+      if (tool === "order_status") {
+        const status = await orderStatusForAgent(v2Params);
+        // Late order: the model answers with empathy using real times, and the store is alerted.
+        if (status.timing?.late) {
+          logAiEvent({ sessionId: p.sessionId, customerPhone: p.customerPhone, customerName: state.draft.name || null,
+            kind: "delay", role: "system", flagged: true,
+            body: `Pedido #${status.orderNumber || "?"} com ${status.timing.minutesSinceCreated} min (estimativa ${status.timing.estimateMaxMinutes} min), status: ${status.timing.statusLabel}` });
+          return { ok: true, mutated: true, orderNumber: status.orderNumber, timing: status.timing,
+            instruction: "Pedido ATRASADO em relação à estimativa da loja. Peça desculpas com empatia, diga o status real e há quantos minutos foi feito, avise que a loja já foi notificada para priorizar, e ofereça falar com um atendente. Não prometa horário exato." };
+        }
+        return { ok: true, mutated: true, finalReply: status.message };
+      }
+      if (tool === "call_human") {
+        await pauseAi(p.sessionId, p.customerJid, HUMAN_PAUSE_MINUTES, "customer_request");
+        logAiEvent({ sessionId: p.sessionId, customerPhone: p.customerPhone, customerName: state.draft.name || null,
+          kind: "human_request", role: "system", flagged: true, body: clean(args.reason, 300) || "Cliente pediu atendente" });
+        return { ok: true, mutated: true, finalReply: "Certo! Já avisei a equipe da loja para continuar com você por aqui. 🙋 Assim que possível, um atendente responde. Se quiser voltar a falar comigo, é só escrever *voltar ao robô*." };
+      }
+      if (tool === "notify_store") {
+        const kind = args.kind === "receipt" ? "receipt" : "complaint";
+        logAiEvent({ sessionId: p.sessionId, customerPhone: p.customerPhone, customerName: state.draft.name || null,
+          kind, role: "system", flagged: true, body: clean(args.summary, 500) || (kind === "receipt" ? "Comprovante enviado" : "Reclamação") });
+        return { ok: true, mutated: true, notified: true };
+      }
       if (tool === "change_placed_order") {
         const proposal = await proposeOrderChangeForAgent(v2Params, String(args.orderNumber || ""),
           { operations: Array.isArray(args.operations) ? args.operations : [] }, p.text);
@@ -1096,6 +1136,9 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
           phone: info.aiContext?.business?.phone || null,
           deliveryMode: state.catalog.deliveryMode,
           neighborhoods: info.aiContext?.delivery?.neighborhoods?.slice(0, 80) || state.catalog.neighborhoods || [],
+          service: (info.aiContext as any)?.service || null,
+          payments: (info.aiContext as any)?.payments || null,
+          menuUrl: state.catalog.menuUrl,
         } };
       }
       if (tool === "edit_cart") {
@@ -1311,9 +1354,10 @@ async function centralAgentMessage(p: Params, state: State): Promise<boolean> {
       response = "Entendi sua mensagem. Para não repetir a mesma resposta, me diga qual produto ou opção você quer agora.";
     }
     if (/R\$\s*\d/.test(response) &&
-        !agent.usedTools.some(tool => ["find_products","preview_order","read_store","change_placed_order","read_my_orders"].includes(tool))) {
+        !agent.usedTools.some(tool => ["find_products","preview_order","read_store","change_placed_order","read_my_orders","cancel_placed_order","change_payment_method","order_status","notify_store"].includes(tool))) {
       response = "Vou precisar consultar os valores atuais da loja antes de informar um preço.";
     }
+    noteTools(p.sessionId, p.customerJid, agent.usedTools);
     await send(p, response);
     p.logger.info?.({ sessionId: p.sessionId, toolCalls: agent.usedTools }, "[Chat-Coordinator] response");
     return true;
@@ -1336,8 +1380,9 @@ async function trySendInteractiveMenu(p: Params): Promise<boolean> {
 }
 
 async function processMessage(p: Params, key: string): Promise<boolean> {
-  // This flow never intercepts existing-order actions, even with a pending cart.
-  if (concernsExistingOrder(p.text)) return false;
+  // Without the central agent this flow never intercepts existing-order actions.
+  // With it, the agent handles them through its order tools (status/cancel/change).
+  if (concernsExistingOrder(p.text) && !canUseCentralAgent(p.sessionId)) return false;
   let state = drafts.get(key);
   if (state && Date.now() - state.updatedAt > 20 * 60_000) { drafts.delete(key); state = undefined; }
   let firstTurn = !state;
@@ -1351,7 +1396,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   }
   if (!state) {
     let catalog: Catalog | null;
-    try { catalog = await requestBackend(p, "catalog", {}); }
+    try { catalog = await requestBackend(p, "catalog", { phone: p.customerPhone || "" }); }
     catch (e: any) { await send(p, "Não consegui consultar os produtos agora. Tente novamente ou use o cardápio."); return true; }
     if (!catalog) return false;
     const stored = await loadChatSession(p.sessionId, p.customerJid);
@@ -1508,7 +1553,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
     // Re-read canonical catalog for availability and promotion status instead of
     // answering from a possibly stale in-memory cart draft.
     let freshCatalog: Catalog | null;
-    try { freshCatalog = await requestBackend(p, "catalog", {}); }
+    try { freshCatalog = await requestBackend(p, "catalog", { phone: p.customerPhone || "" }); }
     catch { freshCatalog = null; }
     if (!freshCatalog) {
       await send(p, "Não consegui conferir as promoções da loja agora. Posso tentar novamente?");
@@ -1920,8 +1965,8 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
 export async function handleChatOrderMessage(p: Params): Promise<boolean> {
   if (!enabled || !geminiKey || !keys.length || !process.env.VERCEL_API_URL || !p.customerJid || !p.text) return false;
   const key = p.sessionId + ":" + p.customerJid;
-  // An item change of an existing order is in progress (choose order / confirm SIM-NÃO).
-  if (hasPendingOrderChange(p.sessionId, p.customerJid)) return false;
+  // An item change / cancel / payment change waits for the customer's answer (choose order / SIM-NÃO).
+  if (hasPendingOrderChange(p.sessionId, p.customerJid) || hasPendingOrderAction(p.sessionId, p.customerJid)) return false;
   // No cart open + "adiciona uma coca" right after ordering: change that order, not a new cart.
   const open = drafts.get(key);
   if (!canUseCentralAgent(p.sessionId) && !open?.draft.items.length && !open?.pendingProduct && p.getStoreInfo && editsPlacedOrder(p.text) && !concernsExistingOrder(p.text)) {

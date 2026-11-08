@@ -626,3 +626,49 @@ export async function handleAiAssistantMessage(params: AiAssistantParams): Promi
     inFlight.delete(key);
   }
 }
+
+/** True while cancel / payment-change / order selection waits for the customer. */
+export function hasPendingOrderAction(sessionId: string, customerJid: string): boolean {
+  const key = `${sessionId}:${customerJid}`;
+  if (cancellationLookupsInFlight.has(key)) return true;
+  const pending = pendingConversations.get(key);
+  if (!pending) return false;
+  if (pending.expiresAt <= Date.now()) { pendingConversations.delete(key); return false; }
+  return true;
+}
+
+// The central agent receives the text instead of the customer receiving two
+// messages (tool output + model reply). Store rules stay in the existing flow.
+function capture(params: AiAssistantParams) {
+  const parts: string[] = [];
+  const captured: AiAssistantParams = { ...params, sendMessage: async (_jid, content) => { parts.push(clean(content?.text)); } };
+  return { captured, text: () => parts.filter(Boolean).join("\n\n") };
+}
+
+/** Agent tool: start cancellation or payment change (customer still confirms with SIM). */
+export async function startOrderActionForAgent(params: AiAssistantParams, action: "cancel" | "payment", paymentMethod: unknown) {
+  const key = `${params.sessionId}:${params.customerJid}`;
+  const { captured, text } = capture(params);
+  if (action === "cancel") cancellationLookupsInFlight.add(key);
+  try {
+    await beginOrderAction(captured, key, action, clean(params.text), false, action === "payment" ? normalizePaymentMethod(paymentMethod) : "");
+  } finally { cancellationLookupsInFlight.delete(key); }
+  return text() || "Não consegui consultar seus pedidos agora. Tente novamente em instantes.";
+}
+
+/** Agent tool: official order status text from the backend. */
+export async function orderStatusForAgent(params: AiAssistantParams) {
+  if (!clean(params.customerPhone)) return { message: "Não consegui identificar o telefone deste contato para consultar o pedido.", found: false, orderNumber: null, timing: null };
+  const result = await postBackend("/api/webhook/whatsapp/order-status",
+    { sessionId: params.sessionId, phone: clean(params.customerPhone) }, params.logger, params.sessionId);
+  const data: any = (result as any)?.data || {};
+  return {
+    message: backendMessage(result, "Não consegui consultar o andamento do pedido agora."),
+    found: Boolean(result?.ok),
+    orderNumber: data.orderNumber ? String(data.orderNumber) : null,
+    timing: result?.ok && data.timing && typeof data.timing === "object" ? data.timing as {
+      statusLabel?: string; deliveryType?: string; minutesSinceCreated?: number | null;
+      estimateMinMinutes?: number | null; estimateMaxMinutes?: number | null; late?: boolean;
+    } : null,
+  };
+}
