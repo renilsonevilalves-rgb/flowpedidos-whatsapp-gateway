@@ -90,7 +90,7 @@ function buildMenuGreetingBizNode(): any {
 
 // Anti-repetição: não reenvia o mesmo botão de cardápio ao mesmo cliente em poucos segundos
 // (cliente mandando "oi" várias vezes, ou outro robô respondendo em loop).
-const MENU_GREETING_REPEAT_MS = Number(process.env.WHATSAPP_MENU_REPEAT_SECONDS || 45) * 1000;
+const MENU_GREETING_REPEAT_MS = Number(process.env.WHATSAPP_MENU_REPEAT_SECONDS || 20) * 1000;
 const recentMenuGreetings = new Map<string, number>();
 
 async function sendMenuGreetingButton(sock: WASocket, customerJid: string, storeInfo: any, includeHumanOption = false) {
@@ -163,6 +163,9 @@ async function sendMenuGreetingButton(sock: WASocket, customerJid: string, store
       ],
     });
 
+    rememberOwnSend(message.key.id);
+    rememberSentMessage({ key: message.key, message: message.message });
+    logger.info({ remoteJid: customerJid, messageId: message.key.id }, "[Auto-Reply] Botão do cardápio enviado");
     markSent();
     return "button";
   } catch (error: any) {

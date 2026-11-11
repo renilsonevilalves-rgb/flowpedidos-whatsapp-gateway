@@ -289,6 +289,25 @@ const ownSentIds = new Set<string>();
 const lastCustomerMessageAt = new Map<string, number>();
 const trackedSockets = new WeakSet<object>();
 
+// Mensagens enviadas recentemente, para atender pedidos de reenvio (retry) do WhatsApp.
+const sentMessageCache = new Map<string, { message: any; at: number }>();
+const SENT_CACHE_MS = 30 * 60 * 1000;
+
+function rememberSentMessage(sent: any) {
+  const id = sent?.key?.id;
+  if (!id || !sent?.message) return;
+  sentMessageCache.set(String(id), { message: sent.message, at: Date.now() });
+  if (sentMessageCache.size > 5000) sentMessageCache.delete(sentMessageCache.keys().next().value as string);
+}
+
+function getCachedSentMessage(key: any) {
+  const id = key?.id ? String(key.id) : "";
+  const cached = id ? sentMessageCache.get(id) : undefined;
+  if (!cached) return undefined;
+  if (Date.now() - cached.at > SENT_CACHE_MS) { sentMessageCache.delete(id); return undefined; }
+  return cached.message;
+}
+
 function rememberOwnSend(messageId: unknown) {
   if (!messageId) return;
   ownSentIds.add(String(messageId));
@@ -298,6 +317,18 @@ function rememberOwnSend(messageId: unknown) {
 function trackOwnSends(sessionId: string, sock: WASocket) {
   if (!sock || typeof (sock as any).sendMessage !== "function" || trackedSockets.has(sock as any)) return;
   trackedSockets.add(sock as any);
+  // Diagnóstico de entrega das mensagens do robô (2 = servidor, 3 = entregue, 4 = lida, 0 = erro).
+  try {
+    (sock as any).ev?.on?.("messages.update", (updates: any[]) => {
+      for (const item of updates || []) {
+        const id = String(item?.key?.id || "");
+        const status = item?.update?.status;
+        if (!id || status === undefined || !ownSentIds.has(id)) continue;
+        if (status === 0) logger.warn({ sessionId, messageId: id }, "[Delivery] WhatsApp recusou a mensagem do robô");
+        else if (status === 3) logger.info({ sessionId, messageId: id }, "[Delivery] Mensagem do robô entregue");
+      }
+    });
+  } catch {}
   const original = (sock as any).sendMessage.bind(sock);
   (sock as any).sendMessage = async (jid: string, content: any, options?: any) => {
     // Respostas a um cliente que escreveu há pouco mostram "digitando..." antes de sair.
@@ -309,6 +340,7 @@ function trackOwnSends(sessionId: string, sock: WASocket) {
     }
     const sent = await original(jid, content, options);
     rememberOwnSend(sent?.key?.id);
+    rememberSentMessage(sent);
     const text = typeof content?.text === "string" ? content.text : "";
     if (text && typeof jid === "string" && !jid.endsWith("@g.us")) {
       logAiEvent({ sessionId, customerPhone: phoneForJid(sessionId, jid), role: "assistant", body: text, tools: takeTools(sessionId, jid) });
@@ -490,6 +522,10 @@ async function connectSession(id: string, forceFresh = false): Promise<void> {
       syncFullHistory: false,
       shouldSyncHistoryMessage: () => false,
       shouldIgnoreJid: (jid) => jid === "status@broadcast",
+      // Quando o celular do cliente não consegue abrir a mensagem (sessão de
+      // criptografia nova, ex.: logo após reconectar), ele pede reenvio. Sem
+      // getMessage o reenvio falha e a mensagem some sem erro.
+      getMessage: async (key: any) => getCachedSentMessage(key),
     });
 
     session.sock = sock;
