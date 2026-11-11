@@ -36,10 +36,18 @@ test("falha de presença nunca impede o envio e grupos são ignorados", async ()
   const calls = [];
   const sock = { sendPresenceUpdate: async (state, jid) => { calls.push([state, jid]); throw new Error("boom"); } };
   await showTypingThenWait(sock, "5511999999999@s.whatsapp.net", "");
+  await new Promise((r) => setTimeout(r, 0));
   assert.deepEqual(calls.map((c) => c[0]), ["composing", "paused"]);
   calls.length = 0;
   await showTypingThenWait(sock, "123@g.us", "oi");
   assert.equal(calls.length, 0);
+});
+
+test("presença travada não segura a resposta", async () => {
+  const sock = { sendPresenceUpdate: () => new Promise(() => {}) };
+  const started = Date.now();
+  await showTypingThenWait(sock, "5511999999999@s.whatsapp.net", "");
+  assert.ok(Date.now() - started < 4500);
 });
 
 test("o gateway aplica digitando, saudação por período e anti-repetição", () => {

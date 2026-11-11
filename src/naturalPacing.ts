@@ -15,17 +15,26 @@ export function typingDelayMs(text: string, random = Math.random) {
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
-export async function showTypingThenWait(sock: any, jid: string, text: string) {
-  if (!ENABLED || !sock || !jid || jid.endsWith("@g.us")) return;
+// Presença nunca pode segurar a resposta: se o WhatsApp não confirmar em 1,5s, segue.
+async function presence(sock: any, state: "composing" | "paused", jid: string) {
+  if (typeof sock?.sendPresenceUpdate !== "function") return;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    await sock.sendPresenceUpdate?.("composing", jid);
+    await Promise.race([
+      Promise.resolve().then(() => sock.sendPresenceUpdate(state, jid)),
+      new Promise((resolve) => { timer = setTimeout(resolve, 1500); }),
+    ]);
   } catch {
     // Presença é cosmética; nunca bloqueia o envio.
+  } finally {
+    if (timer) clearTimeout(timer);
   }
+}
+
+export async function showTypingThenWait(sock: any, jid: string, text: string) {
+  if (!ENABLED || !sock || !jid || jid.endsWith("@g.us")) return;
+  await presence(sock, "composing", jid);
   await sleep(typingDelayMs(text));
-  try {
-    await sock.sendPresenceUpdate?.("paused", jid);
-  } catch {
-    // idem
-  }
+  // "paused" não precisa ser aguardado: a mensagem sai em seguida.
+  void presence(sock, "paused", jid);
 }
