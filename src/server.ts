@@ -9,6 +9,7 @@ import { describeIncomingImage, hasAudio, hasImage, transcribeIncomingAudio } fr
 import { isAiPaused, pauseAi } from "./humanHandoff.js";
 import { flushAiEvents, logAiEvent, phoneForJid, rememberCustomerPhone, takeTools } from "./aiEvents.js";
 import { usesCentralAgent } from "./chatOrder.js";
+import { isGreetingMessage } from "./greeting.js";
 import { join } from "node:path";
 import {
   Browsers,
@@ -271,6 +272,7 @@ function isAutoReplyTrigger(text: string) {
 
   const greetingOnly = /^(oi|ola|bom dia|boa tarde|boa noite|tudo bem)[!,.?\s]*$/i;
   if (greetingOnly.test(normalized)) return true;
+  if (isGreetingMessage(text)) return true;
 
   const explicitRequest = /\b(cardapio|menu|fazer\s+um\s+pedido|quero\s+(pedir|fazer\s+um\s+pedido)|gostaria\s+de\s+(pedir|ver\s+o\s+cardapio)|como\s+fac(o|a)\s+um\s+pedido)\b/i;
   return explicitRequest.test(normalized);

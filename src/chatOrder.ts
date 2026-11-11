@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { handleRecentOrderEdit, hasPendingOrderChange, listChangeableOrdersForAgent, proposeOrderChangeForAgent } from "./aiAssistantV2.js";
 import { hasPendingOrderAction, orderStatusForAgent, startOrderActionForAgent } from "./aiAssistant.js";
 import { pauseAi } from "./humanHandoff.js";
+import { isGreetingMessage } from "./greeting.js";
 import { logAiEvent, noteTools } from "./aiEvents.js";
 import { loadChatSession, saveChatSession, type ChatTurn, type RememberedDraft, type RememberedPendingProduct } from "./chatMemory.js";
 import { answerStoreQuestion, isStoreQuestion, type ChatStoreInfo } from "./chatAgent.js";
@@ -153,6 +154,7 @@ export function classifyServiceIntent(input: unknown): "menu" | "greeting" | nul
   if (/^(?:oi|ola|opa|e ai|bom dia|boa tarde|boa noite|tudo bem)(?: pessoal| gente)?$/.test(text)) return "greeting";
   // Saudações compostas: "olá boa tarde", "oi bom dia tudo bem", "boa noite pessoal".
   if (text.length <= 60 && /^(?:(?:oi+|ola+|opa|eai|e ai|hey|hello|bom dia|boa tarde|boa noite|tudo bem|tudo bom|td bem|td bom|como vai|como esta|beleza|blz|pessoal|gente|galera|pessoas|voces|vcs|loja|alguem ai|tem alguem|ai|por favor|pfv)(?: |$))+$/.test(text)) return "greeting";
+  if (isGreetingMessage(input)) return "greeting";
   const topic = /\b(?:cardapio+s?|cardpio|cardapyo|menu|catalogo)\b/;
   if (!topic.test(text)) return null;
 
@@ -2127,7 +2129,7 @@ async function processMessage(p: Params, key: string): Promise<boolean> {
   if (state.draft.items.length || state.pendingProduct) {
     const said = norm(p.text);
     const explicitNew = /\b(?:novo pedido|pedido novo|outro pedido|comecar de novo|comecar do zero|do zero|zerar (?:o )?carrinho|limpar? (?:o )?carrinho|esvaziar? (?:o )?carrinho)\b/.test(said);
-    const restart = /^(?:oi+|ola|opa|eai|e ai|hey|bom dia|boa tarde|boa noite|tudo bem)\b/.test(said) ||
+    const restart = /^(?:oi+|ola|opa|eai|e ai|hey|bom dia|boa tarde|boa noite|tudo bem)\b/.test(said) || isGreetingMessage(p.text) ||
       /\b(?:fazer (?:um )?pedido|quero pedir|queria pedir|gostaria de pedir|fazer uma encomenda)\b/.test(said);
     const idleMs = Date.now() - (state.draftChangedAt || 0);
     if (explicitNew || (restart && idleMs > CART_IDLE_RESET_MS)) {
