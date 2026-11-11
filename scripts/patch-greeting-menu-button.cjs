@@ -15,6 +15,12 @@ function replaceOnce(original, replacement, label) {
 }
 
 replaceOnce(
+  `import { showTypingThenWait } from "./naturalPacing.js";\n`,
+  `import { showTypingThenWait } from "./naturalPacing.js";\nimport { buttonsRecentlyUndelivered, markButtonDelivered, markButtonUndelivered, watchDeviceReceipt } from "./buttonDelivery.js";\n`,
+  "button delivery import",
+);
+
+replaceOnce(
   `  fetchLatestWaWebVersion,\n  makeWASocket,`,
   `  fetchLatestWaWebVersion,\n  generateWAMessageFromContent,\n  makeWASocket,\n  proto,`,
   "Baileys imports",
@@ -130,6 +136,8 @@ async function sendMenuGreetingButton(sock: WASocket, customerJid: string, store
   }
 
   try {
+    // Conta onde o botão não chegou a nenhum aparelho há pouco: vai direto o texto com link.
+    if (buttonsRecentlyUndelivered(sock)) throw new Error("menu button recently undelivered on this connection");
     const userJid = sock.user?.id;
     if (!userJid) throw new Error("WhatsApp socket has no connected user id");
 
@@ -155,6 +163,7 @@ async function sendMenuGreetingButton(sock: WASocket, customerJid: string, store
     }
 
     await showTypingThenWait(sock, customerJid, replyText);
+    const receipt = watchDeviceReceipt(sock, message.key.id);
     await sock.relayMessage(customerJid, message.message, {
       messageId: message.key.id,
       additionalNodes: [
@@ -165,7 +174,16 @@ async function sendMenuGreetingButton(sock: WASocket, customerJid: string, store
 
     rememberOwnSend(message.key.id);
     rememberSentMessage({ key: message.key, message: message.message });
-    logger.info({ remoteJid: customerJid, messageId: message.key.id }, "[Auto-Reply] Botão do cardápio enviado");
+    // O servidor aceitar não basta: sem recibo de algum aparelho, o botão foi descartado.
+    if (!(await receipt.wait())) {
+      markButtonUndelivered(sock);
+      logger.warn({ remoteJid: customerJid, messageId: message.key.id }, "[Auto-Reply] Botão sem confirmação de entrega; enviando texto com link");
+      await sock.sendMessage(customerJid, { text: \`\${replyText}\\n\\n\${menuUrl}\` });
+      markSent();
+      return "text-fallback-undelivered";
+    }
+    markButtonDelivered(sock);
+    logger.info({ remoteJid: customerJid, messageId: message.key.id }, "[Auto-Reply] Botão do cardápio entregue");
     markSent();
     return "button";
   } catch (error: any) {
