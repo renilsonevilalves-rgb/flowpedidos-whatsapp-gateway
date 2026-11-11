@@ -641,6 +641,12 @@ app.post("/session/:sessionId/pairing-code", authMiddleware, async (req, res) =>
 
   pairingRequestsInFlight.add(sessionId);
   try {
+    // Um QR antigo (aberto e abandonado) pode expirar em segundos e levar o código
+    // junto. Como a loja ainda não está pareada, começa uma conexão limpa para o
+    // código ter a validade inteira.
+    if (session.sock && session.status === "qr" && !(session.sock as any).authState?.creds?.registered) {
+      await logoutSession(sessionId);
+    }
     await startSessionWithRecovery(sessionId);
     const activeSession = getOrCreateSession(sessionId);
 
