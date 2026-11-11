@@ -11,7 +11,7 @@ import { flushAiEvents, logAiEvent, phoneForJid, rememberCustomerPhone, takeTool
 import { usesCentralAgent } from "./chatOrder.js";
 import { applyPeriodGreeting, isGreetingMessage, periodGreeting } from "./greeting.js";
 import { showTypingThenWait } from "./naturalPacing.js";
-import { attachDeliveryDiag, getDiagEvents, inspectRecipient, trackDiagSend } from "./deliveryDiag.js";
+import { attachDeliveryDiag, attachDiagTrigger, getDiagEvents, inspectRecipient, trackDiagSend } from "./deliveryDiag.js";
 import { join } from "node:path";
 import {
   Browsers,
@@ -319,7 +319,11 @@ function trackOwnSends(sessionId: string, sock: WASocket) {
   if (!sock || typeof (sock as any).sendMessage !== "function" || trackedSockets.has(sock as any)) return;
   trackedSockets.add(sock as any);
   // DIAGNÓSTICO TEMPORÁRIO: ACK/recibos das mensagens do robô.
-  if (typeof attachDeliveryDiag === "function") { try { attachDeliveryDiag(sock, sessionId, logger, (id) => ownSentIds.has(id)); } catch {} }
+  if (typeof attachDeliveryDiag === "function") { try { attachDeliveryDiag(sock, sessionId, logger, (id) => ownSentIds.has(id));
+    attachDiagTrigger(sock, async (digits) => {
+      const out = await runDeliveryProbe(sock, digits, {});
+      logger.info({ sessionId, report: JSON.stringify(out) }, "[Delivery-Diag] relatório");
+    }); } catch {} }
   // Diagnóstico de entrega das mensagens do robô (2 = servidor, 3 = entregue, 4 = lida, 0 = erro).
   try {
     (sock as any).ev?.on?.("messages.update", (updates: any[]) => {
@@ -657,15 +661,9 @@ function normalizePairingPhone(value: unknown) {
 
 // DIAGNÓSTICO TEMPORÁRIO (remover): envia 1) texto p/ PN, 2) texto p/ LID, 3) botão,
 // e devolve ACK/recibos de cada um.
-app.post("/session/:sessionId/diag/delivery", authMiddleware, async (req, res) => {
-  const sessionId = req.params.sessionId as string;
-  if (!safeSessionId(sessionId)) { res.status(400).json({ ok: false, error: "Invalid sessionId" }); return; }
-  const session = getOrCreateSession(sessionId);
-  const sock: any = session.sock;
-  const digits = String(req.body?.phone || "").replace(/\D/g, "");
-  if (!sock || session.status !== "connected" || !digits) { res.status(400).json({ ok: false, error: "not connected or no phone" }); return; }
-  const steps = String(req.body?.steps || "pn,lid,button").split(",");
-  const waitMs = Math.min(60000, Number(req.body?.waitMs || 25000));
+async function runDeliveryProbe(sock: any, digits: string, body: any) {
+  const steps = String(body?.steps || "pn,lid,button").split(",");
+  const waitMs = Math.min(60000, Number(body?.waitMs || 25000));
   const pnJid = `${digits}@s.whatsapp.net`;
   const before = await inspectRecipient(sock, pnJid);
   const sent: any[] = [];
@@ -679,7 +677,7 @@ app.post("/session/:sessionId/diag/delivery", authMiddleware, async (req, res) =
     return (await sock.sendMessage(before.lid, { text: "Teste de entrega 2/3 (texto para LID)" }))?.key?.id;
   });
   if (steps.includes("button")) await run("button-pn", async () => {
-    const url = String(req.body?.menuUrl || "https://example.com");
+    const url = String(body?.menuUrl || "https://example.com");
     const interactiveMessage = proto.Message.InteractiveMessage.create({
       body: proto.Message.InteractiveMessage.Body.create({ text: "Teste de entrega 3/3 (botão)" }),
       nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.create({
@@ -687,15 +685,25 @@ app.post("/session/:sessionId/diag/delivery", authMiddleware, async (req, res) =
         messageParamsJson: "{}", messageVersion: 1,
       }),
     });
-    const target = req.body?.buttonToLid && before.lid ? before.lid : pnJid;
+    const target = body?.buttonToLid && before.lid ? before.lid : pnJid;
     const message = generateWAMessageFromContent(target, { interactiveMessage }, { userJid: sock.user?.id });
-    const extra: any[] = req.body?.noBizNodes ? [] : [{ tag: "bot", attrs: { biz_bot: "1" } }, buildMenuGreetingBizNode()];
+    const extra: any[] = body?.noBizNodes ? [] : [{ tag: "bot", attrs: { biz_bot: "1" } }, buildMenuGreetingBizNode()];
     await sock.relayMessage(target, message.message, { messageId: message.key.id, additionalNodes: extra });
     return message.key.id || undefined;
   });
   await new Promise((r) => setTimeout(r, waitMs));
   const after = await inspectRecipient(sock, pnJid);
-  res.json({ ok: true, before, after, results: sent.map((s) => ({ ...s, events: s.id ? getDiagEvents(s.id) : [] })) });
+  return { before, after, results: sent.map((s) => ({ ...s, events: s.id ? getDiagEvents(s.id) : [] })) };
+}
+
+// DIAGNÓSTICO TEMPORÁRIO (remover): envia 1) texto p/ PN, 2) texto p/ LID, 3) botão.
+app.post("/session/:sessionId/diag/delivery", authMiddleware, async (req, res) => {
+  const sessionId = req.params.sessionId as string;
+  if (!safeSessionId(sessionId)) { res.status(400).json({ ok: false, error: "Invalid sessionId" }); return; }
+  const session = getOrCreateSession(sessionId);
+  const digits = String(req.body?.phone || "").replace(/\D/g, "");
+  if (!session.sock || session.status !== "connected" || !digits) { res.status(400).json({ ok: false, error: "not connected or no phone" }); return; }
+  res.json({ ok: true, ...(await runDeliveryProbe(session.sock, digits, req.body || {})) });
 });
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "flowpedidos-whatsapp-gateway", uptime: Math.round(process.uptime()), timestamp: new Date().toISOString() }));

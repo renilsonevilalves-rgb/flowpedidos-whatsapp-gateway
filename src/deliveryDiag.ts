@@ -53,6 +53,10 @@ export async function inspectRecipient(sock: any, pnJid: string) {
       const tc = await sock.authState?.keys?.get?.("tctoken", [jid]);
       const entry = tc?.[jid];
       out[`tctoken_${String(jid).split("@")[1]}`] = entry?.token?.length ? { bytes: entry.token.length, ts: entry.timestamp } : null;
+      try {
+        const devices = await sock.getUSyncDevices?.([jid], false, false);
+        out[`devices_${String(jid).split("@")[1]}`] = (devices || []).map((d: any) => mask(d.jid));
+      } catch (e: any) { out[`devices_${String(jid).split("@")[1]}`] = `erro: ${e?.message}`; }
       const v = await sock.signalRepository?.validateSession?.(jid);
       out[`session_${String(jid).split("@")[1]}`] = v;
     }
@@ -60,4 +64,22 @@ export async function inspectRecipient(sock: any, pnJid: string) {
     out.error = error?.message || String(error);
   }
   return out;
+}
+
+// Gatilho temporário: quando o número em DELIVERY_DIAG_PHONE manda "diag", roda o teste.
+export function attachDiagTrigger(sock: any, run: (digits: string) => Promise<void>) {
+  const phone = String(process.env.DELIVERY_DIAG_PHONE || "").replace(/\D/g, "");
+  if (!phone || !sock?.ev?.on) return;
+  sock.ev.on("messages.upsert", ({ messages }: any) => {
+    for (const m of messages || []) {
+      if (m?.key?.fromMe) continue;
+      const k = m?.key || {};
+      const from = [k.remoteJidAlt, k.senderPn, k.remoteJid].map((j: any) => String(j || "").split("@")[0].split(":")[0]);
+      const text = String(m?.message?.conversation || m?.message?.extendedTextMessage?.text || "").trim().toLowerCase();
+      if (text === "diag" && from.some((d) => d && (d === phone || d.endsWith(phone.slice(-8))))) {
+        const digits = from.find((d) => /^\d+$/.test(d) && d.length >= 12) || phone;
+        void run(digits).catch(() => {});
+      }
+    }
+  });
 }
