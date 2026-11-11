@@ -11,6 +11,7 @@ import { flushAiEvents, logAiEvent, phoneForJid, rememberCustomerPhone, takeTool
 import { usesCentralAgent } from "./chatOrder.js";
 import { applyPeriodGreeting, isGreetingMessage, periodGreeting } from "./greeting.js";
 import { showTypingThenWait } from "./naturalPacing.js";
+import { attachDeliveryDiag, getDiagEvents, inspectRecipient, trackDiagSend } from "./deliveryDiag.js";
 import { join } from "node:path";
 import {
   Browsers,
@@ -317,6 +318,8 @@ function rememberOwnSend(messageId: unknown) {
 function trackOwnSends(sessionId: string, sock: WASocket) {
   if (!sock || typeof (sock as any).sendMessage !== "function" || trackedSockets.has(sock as any)) return;
   trackedSockets.add(sock as any);
+  // DIAGNÓSTICO TEMPORÁRIO: ACK/recibos das mensagens do robô.
+  if (typeof attachDeliveryDiag === "function") { try { attachDeliveryDiag(sock, sessionId, logger, (id) => ownSentIds.has(id)); } catch {} }
   // Diagnóstico de entrega das mensagens do robô (2 = servidor, 3 = entregue, 4 = lida, 0 = erro).
   try {
     (sock as any).ev?.on?.("messages.update", (updates: any[]) => {
@@ -651,6 +654,49 @@ function normalizePairingPhone(value: unknown) {
   if (raw.length >= 11 && raw.length <= 15) return raw;
   return null;
 }
+
+// DIAGNÓSTICO TEMPORÁRIO (remover): envia 1) texto p/ PN, 2) texto p/ LID, 3) botão,
+// e devolve ACK/recibos de cada um.
+app.post("/session/:sessionId/diag/delivery", authMiddleware, async (req, res) => {
+  const sessionId = req.params.sessionId as string;
+  if (!safeSessionId(sessionId)) { res.status(400).json({ ok: false, error: "Invalid sessionId" }); return; }
+  const session = getOrCreateSession(sessionId);
+  const sock: any = session.sock;
+  const digits = String(req.body?.phone || "").replace(/\D/g, "");
+  if (!sock || session.status !== "connected" || !digits) { res.status(400).json({ ok: false, error: "not connected or no phone" }); return; }
+  const steps = String(req.body?.steps || "pn,lid,button").split(",");
+  const waitMs = Math.min(60000, Number(req.body?.waitMs || 25000));
+  const pnJid = `${digits}@s.whatsapp.net`;
+  const before = await inspectRecipient(sock, pnJid);
+  const sent: any[] = [];
+  const run = async (label: string, fn: () => Promise<string | undefined>) => {
+    try { const id = await fn(); if (id) { trackDiagSend(id, label, label); rememberOwnSend(id); } sent.push({ label, id }); }
+    catch (error: any) { sent.push({ label, error: error?.message || String(error) }); }
+  };
+  if (steps.includes("pn")) await run("text-pn", async () => (await sock.sendMessage(pnJid, { text: "Teste de entrega 1/3 (texto para número)" }))?.key?.id);
+  if (steps.includes("lid")) await run("text-lid", async () => {
+    if (!before.lid) throw new Error("sem mapeamento LID para este número");
+    return (await sock.sendMessage(before.lid, { text: "Teste de entrega 2/3 (texto para LID)" }))?.key?.id;
+  });
+  if (steps.includes("button")) await run("button-pn", async () => {
+    const url = String(req.body?.menuUrl || "https://example.com");
+    const interactiveMessage = proto.Message.InteractiveMessage.create({
+      body: proto.Message.InteractiveMessage.Body.create({ text: "Teste de entrega 3/3 (botão)" }),
+      nativeFlowMessage: proto.Message.InteractiveMessage.NativeFlowMessage.create({
+        buttons: [proto.Message.InteractiveMessage.NativeFlowMessage.NativeFlowButton.create({ name: "cta_url", buttonParamsJson: JSON.stringify({ display_text: "Ver cardápio", url, merchant_url: url }) })],
+        messageParamsJson: "{}", messageVersion: 1,
+      }),
+    });
+    const target = req.body?.buttonToLid && before.lid ? before.lid : pnJid;
+    const message = generateWAMessageFromContent(target, { interactiveMessage }, { userJid: sock.user?.id });
+    const extra: any[] = req.body?.noBizNodes ? [] : [{ tag: "bot", attrs: { biz_bot: "1" } }, buildMenuGreetingBizNode()];
+    await sock.relayMessage(target, message.message, { messageId: message.key.id, additionalNodes: extra });
+    return message.key.id || undefined;
+  });
+  await new Promise((r) => setTimeout(r, waitMs));
+  const after = await inspectRecipient(sock, pnJid);
+  res.json({ ok: true, before, after, results: sent.map((s) => ({ ...s, events: s.id ? getDiagEvents(s.id) : [] })) });
+});
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "flowpedidos-whatsapp-gateway", uptime: Math.round(process.uptime()), timestamp: new Date().toISOString() }));
 
