@@ -72,3 +72,26 @@ export function isGreetingMessage(input: unknown): boolean {
   }
   return core > 0;
 }
+
+// Saudação pelo horário de Brasília: 05h–11h59 bom dia, 12h–17h59 boa tarde, 18h–04h59 boa noite.
+export function periodGreeting(now: Date = new Date(), timeZone = process.env.WHATSAPP_TIMEZONE || "America/Sao_Paulo") {
+  let hour = now.getUTCHours() - 3;
+  try {
+    const part = new Intl.DateTimeFormat("pt-BR", { hour: "2-digit", hourCycle: "h23", timeZone }).format(now);
+    const parsed = Number(String(part).replace(/\D/g, ""));
+    if (Number.isFinite(parsed)) hour = parsed;
+  } catch {
+    // fallback UTC-3 acima
+  }
+  hour = ((hour % 24) + 24) % 24;
+  if (hour >= 5 && hour < 12) return "Bom dia";
+  if (hour >= 12 && hour < 18) return "Boa tarde";
+  return "Boa noite";
+}
+
+// Troca um "Olá"/"Oi" genérico no início da mensagem pela saudação do período.
+// Mensagens que já começam com outra coisa (ou já têm bom dia/boa tarde/boa noite) ficam intactas.
+export function applyPeriodGreeting(text: string, now: Date = new Date()) {
+  const value = String(text || "");
+  return value.replace(/^(\s*)(ol[áa]|oi[eê]?)(?=[\s!,.👋]|$)/i, (_m, lead) => `${lead}${periodGreeting(now)}`);
+}

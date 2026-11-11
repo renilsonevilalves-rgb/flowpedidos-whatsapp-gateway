@@ -9,7 +9,8 @@ import { describeIncomingImage, hasAudio, hasImage, transcribeIncomingAudio } fr
 import { isAiPaused, pauseAi } from "./humanHandoff.js";
 import { flushAiEvents, logAiEvent, phoneForJid, rememberCustomerPhone, takeTools } from "./aiEvents.js";
 import { usesCentralAgent } from "./chatOrder.js";
-import { isGreetingMessage } from "./greeting.js";
+import { applyPeriodGreeting, isGreetingMessage, periodGreeting } from "./greeting.js";
+import { showTypingThenWait } from "./naturalPacing.js";
 import { join } from "node:path";
 import {
   Browsers,
@@ -299,6 +300,13 @@ function trackOwnSends(sessionId: string, sock: WASocket) {
   trackedSockets.add(sock as any);
   const original = (sock as any).sendMessage.bind(sock);
   (sock as any).sendMessage = async (jid: string, content: any, options?: any) => {
+    // Respostas a um cliente que escreveu há pouco mostram "digitando..." antes de sair.
+    // Notificações avulsas (/send) para quem não está conversando seguem sem atraso.
+    const pacedText = typeof content?.text === "string" ? content.text : "";
+    if (pacedText && typeof jid === "string" && !jid.endsWith("@g.us")
+      && Date.now() - (lastCustomerMessageAt.get(`${sessionId}:${jid}`) || 0) < 10 * 60 * 1000) {
+      await showTypingThenWait(sock, jid, pacedText);
+    }
     const sent = await original(jid, content, options);
     rememberOwnSend(sent?.key?.id);
     const text = typeof content?.text === "string" ? content.text : "";

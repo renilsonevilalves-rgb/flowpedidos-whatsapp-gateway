@@ -36,10 +36,10 @@ if (!source.includes(helperMarker)) {
     : "";
 
   if (!configured) {
-    return \`Olá! 👋 Seja bem-vindo a *\${storeName}*\\n\\nConfira nosso cardápio e faça seu pedido por aqui. 😊\\n\\nÉ só clicar abaixo para ver o cardápio!\`;
+    return \`\${periodGreeting()}! 👋 Seja bem-vindo a *\${storeName}*\\n\\nConfira nosso cardápio e faça seu pedido por aqui. 😊\\n\\nÉ só clicar abaixo para ver o cardápio!\`;
   }
 
-  let text = configured
+  let text = applyPeriodGreeting(configured)
     .replace(/\\{link\\}/gi, "")
     .replace(/_?\\(?\\s*Este é um atendimento automático\\s*\\)?_?/gi, "")
     .trim();
@@ -88,9 +88,24 @@ function buildMenuGreetingBizNode(): any {
   };
 }
 
+// Anti-repetição: não reenvia o mesmo botão de cardápio ao mesmo cliente em poucos segundos
+// (cliente mandando "oi" várias vezes, ou outro robô respondendo em loop).
+const MENU_GREETING_REPEAT_MS = Number(process.env.WHATSAPP_MENU_REPEAT_SECONDS || 45) * 1000;
+const recentMenuGreetings = new Map<string, number>();
+
 async function sendMenuGreetingButton(sock: WASocket, customerJid: string, storeInfo: any, includeHumanOption = false) {
   const menuUrl = String(storeInfo?.menuUrl || "").trim();
   if (!menuUrl) throw new Error("Store has no menuUrl");
+
+  const repeatKey = \`\${sock.user?.id || ""}:\${customerJid}\`;
+  if (Date.now() - (recentMenuGreetings.get(repeatKey) || 0) < MENU_GREETING_REPEAT_MS) {
+    logger.info({ remoteJid: customerJid }, "[Auto-Reply] Cardápio enviado há poucos segundos; repetição ignorada");
+    return "skipped-recent";
+  }
+  const markSent = () => {
+    recentMenuGreetings.set(repeatKey, Date.now());
+    if (recentMenuGreetings.size > 20000) recentMenuGreetings.delete(recentMenuGreetings.keys().next().value as string);
+  };
 
   const replyText = buildMenuGreetingText(storeInfo);
 
@@ -139,6 +154,7 @@ async function sendMenuGreetingButton(sock: WASocket, customerJid: string, store
       throw new Error("Could not generate interactive greeting message");
     }
 
+    await showTypingThenWait(sock, customerJid, replyText);
     await sock.relayMessage(customerJid, message.message, {
       messageId: message.key.id,
       additionalNodes: [
@@ -147,6 +163,7 @@ async function sendMenuGreetingButton(sock: WASocket, customerJid: string, store
       ],
     });
 
+    markSent();
     return "button";
   } catch (error: any) {
     logger.warn(
@@ -157,6 +174,7 @@ async function sendMenuGreetingButton(sock: WASocket, customerJid: string, store
     await sock.sendMessage(customerJid, {
       text: \`\${replyText}\\n\\n\${menuUrl}\`,
     });
+    markSent();
     return "text-fallback";
   }
 }
