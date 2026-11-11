@@ -340,7 +340,8 @@ function trackOwnSends(sessionId: string, sock: WASocket) {
     }
     const sent = await original(jid, content, options);
     rememberOwnSend(sent?.key?.id);
-    rememberSentMessage(sent);
+    // Guarded: isolated handoff tests load this wrapper without the cache helper.
+    if (typeof rememberSentMessage === "function") rememberSentMessage(sent);
     const text = typeof content?.text === "string" ? content.text : "";
     if (text && typeof jid === "string" && !jid.endsWith("@g.us")) {
       logAiEvent({ sessionId, customerPhone: phoneForJid(sessionId, jid), role: "assistant", body: text, tools: takeTools(sessionId, jid) });
