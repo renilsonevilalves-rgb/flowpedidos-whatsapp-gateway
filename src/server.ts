@@ -587,6 +587,26 @@ function normalizeRecipientPhone(value: unknown) {
   return null;
 }
 
+// Uma tentativa de pareamento que falhou (QR/código expirado) deixa credenciais
+// pela metade no disco. Reaproveitá-las faz o próximo QR/código falhar ou entrar em
+// loop. Só descarta quando a sessão terminou em erro, sem socket ativo e NUNCA foi
+// registrada — uma loja já conectada de verdade nunca é apagada aqui.
+async function discardUnfinishedPairing(id: string) {
+  const session = getOrCreateSession(id);
+  if (session.status !== "error" || session.sock || session.starting || session.loggingOut) return;
+  try {
+    const { readFile } = await import("node:fs/promises");
+    const creds = JSON.parse(await readFile(join(authPathFor(id), "creds.json"), "utf8"));
+    if (creds?.registered === true) return;
+  } catch (error: any) {
+    if (error?.code === "ENOENT") return;
+    logger.warn({ sessionId: id }, "Could not inspect unfinished pairing credentials; keeping them");
+    return;
+  }
+  await clearAuthState(id);
+  logger.info({ sessionId: id }, "Discarded unfinished pairing credentials before a new attempt");
+}
+
 function normalizePairingPhone(value: unknown) {
   const raw = String(value || "").replace(/\D/g, "");
   if (!raw) return null;
@@ -608,6 +628,7 @@ app.post("/session/:sessionId/start", authMiddleware, async (req, res) => {
   const sessionId = req.params.sessionId as string;
   if (!safeSessionId(sessionId)) { res.status(400).json({ error: "Invalid sessionId" }); return; }
   try {
+    await discardUnfinishedPairing(sessionId);
     await startSessionWithRecovery(sessionId);
     const session = getOrCreateSession(sessionId);
     res.json({ ok: true, id: session.id, status: session.status, phone: session.phone || null, hasQr: Boolean(session.qrDataUrl) });
@@ -647,6 +668,7 @@ app.post("/session/:sessionId/pairing-code", authMiddleware, async (req, res) =>
     if (session.sock && session.status === "qr" && !(session.sock as any).authState?.creds?.registered) {
       await logoutSession(sessionId);
     }
+    await discardUnfinishedPairing(sessionId);
     await startSessionWithRecovery(sessionId);
     const activeSession = getOrCreateSession(sessionId);
 
