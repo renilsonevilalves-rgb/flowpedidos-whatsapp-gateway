@@ -6,9 +6,10 @@ import { describeProduct, searchProducts, soldOutMatch, type Catalog } from "./c
 import { generate, GeminiUnavailable, type GeminiContent, type GeminiPart } from "./gemini.js";
 import {
   addItem, changeItem, commitOrder, describeCart, makeSummary, missingForSummary, PAYMENT_NAMES,
-  removeItem, setDelivery, setName, setPayment, summaryIsCurrent, type ToolOutcome,
+  checkIfoodPayment, ifoodPaymentsText, removeItem, setDelivery, setName, setPayment, summaryIsCurrent, type ToolOutcome,
 } from "./order.js";
-import { freshState, getSession, persist, type CartItem, type ConversationState, type Session } from "./state.js";
+import { randomInt } from "node:crypto";
+import { findSessionByAddressLink, freshState, getSession, persist, type CartItem, type ConversationState, type IfoodPaymentOption, type Session } from "./state.js";
 import {
   aboutPlacedOrder, brl, choiceAnswer, clean, isOnlyGreeting, isOrderNumberOnly, isPureYes, norm, refersToPlacedOrder, wantsHuman,
   wantsPaymentChange, wantsToAdd, wantsToCancel,
@@ -87,14 +88,15 @@ const TOOLS = [
     parameters: { type: "OBJECT", properties: { item_numero: { type: "INTEGER", description: "número do item no carrinho" }, produto: S("nome do item"), quantidade: { type: "INTEGER", description: "quantas unidades tirar; vazio = todas" } } } },
   { name: "alterar_item", description: "Muda a quantidade ou a observação de um item do carrinho. Para trocar sabor/borda/adicional, remova e adicione de novo.",
     parameters: { type: "OBJECT", properties: { item_numero: { type: "INTEGER", description: "número do item" }, produto: S("nome do item"), nova_quantidade: { type: "INTEGER", description: "nova quantidade" }, observacao: S("nova observação") } } },
-  { name: "definir_entrega", description: "Define entrega (com endereço) ou retirada. Use usar_endereco_salvo=true quando o cliente aceitar o endereço do último pedido.",
+  { name: "definir_entrega", description: "Define entrega (com endereço) ou retirada. Em loja com entrega iFood, devolve um link para o cliente preencher o endereço. Use usar_endereco_salvo=true quando o cliente aceitar o endereço do último pedido.",
     parameters: { type: "OBJECT", properties: {
       tipo: S("'entrega' ou 'retirada'"), usar_endereco_salvo: { type: "BOOLEAN", description: "usar o endereço do último pedido" },
       rua: S("rua/avenida"), numero: S("número"), bairro: S("bairro"), complemento: S("apto, bloco, casa"), referencia: S("ponto de referência"),
     }, required: ["tipo"] } },
   { name: "definir_pagamento", description: "Define a forma de pagamento (pix, credito, debito, dinheiro ou online). Para dinheiro, informe troco_para ou sem_troco.",
     parameters: { type: "OBJECT", properties: { forma: S("pix | credito | debito | dinheiro | pix online | credito online | debito online"),
-      troco_para: { type: "NUMBER", description: "valor em reais para o troco" }, sem_troco: { type: "BOOLEAN", description: "true se não precisa de troco" } }, required: ["forma"] } },
+      troco_para: { type: "NUMBER", description: "valor em reais para o troco" }, sem_troco: { type: "BOOLEAN", description: "true se não precisa de troco" },
+      bandeira: S("bandeira do cartão (Visa, Mastercard, Elo...), quando a entrega é pelo iFood e o pagamento é cartão na entrega") }, required: ["forma"] } },
   { name: "definir_nome", description: "Define o nome do cliente para o pedido.",
     parameters: { type: "OBJECT", properties: { nome: S("nome do cliente") }, required: ["nome"] } },
   { name: "gerar_resumo", description: "Calcula os valores oficiais (subtotal, taxa, total) e envia o resumo ao cliente pedindo confirmação. Chame quando itens, entrega/endereço, pagamento e nome estiverem definidos, e de novo sempre que algo mudar depois de um resumo.",
@@ -145,6 +147,15 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
     case "remover_item": return removeItem(state, args);
     case "alterar_item": return changeItem(state, args);
     case "definir_entrega": {
+      // Entrega iFood: o cliente preenche o endereço num link e a cotação oficial volta para cá.
+      if (catalog.store.deliveryMode === "ifood" && !/retir|buscar|balcao|pickup/.test(norm(args?.tipo))) {
+        if (state.delivery?.type === "delivery" && state.delivery.ifood && !ifoodQuoteExpired(state) && !args?.rua && !args?.trocar_endereco) {
+          return { ok: true, entrega: state.delivery.address + ", " + state.delivery.number + " - " + state.delivery.neighborhood, taxa_ifood: state.delivery.ifood.fee };
+        }
+        const link = createAddressLink(p, state);
+        return { ok: true, aguardando_endereco: true, link,
+          dica: "Mande este link numa mensagem curta: o cliente preenche o endereço e vê a taxa do iFood; assim que confirmar, a conversa continua aqui sozinha. Não peça o endereço por mensagem." };
+      }
       // Endereço novo sem bairro: a IA não pode presumir o bairro do último pedido (a taxa muda).
       const saved = catalog.customer?.savedAddress;
       const recentUser = norm(state.history.filter((t) => t.role === "user").slice(-3).map((t) => t.text).join(" "));
@@ -163,6 +174,10 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
     }
     case "gerar_resumo": {
       if (!catalog.store.isOpen) return { erro: "loja_fechada", abre: catalog.store.opensAt };
+      if (ifoodQuoteExpired(state)) {
+        return { erro: "taxa_ifood_expirada", link: createAddressLink(p, state),
+          dica: "A taxa do iFood vale por pouco tempo e venceu. Mande este link para o cliente confirmar o endereço de novo." };
+      }
       const result = await makeSummary(p.sessionId, String(p.customerPhone), state);
       if (result.ok && result.text) { ctx.flags.summary = result.text; return { ok: true, enviado: "O sistema enviou o resumo ao cliente. Não escreva valores." }; }
       return result;
@@ -189,7 +204,9 @@ function storeBlock(catalog: Catalog): string {
     s.preparationTime ? "Tempo de preparo: " + s.preparationTime.min + "-" + s.preparationTime.max + " min" : "",
     s.deliveryMode === "neighborhood"
       ? (s.deliveryFees.length ? "Taxas de entrega por bairro: " + s.deliveryFees.map((f) => f.name + " " + brl(f.fee)).join("; ") : "Entrega: sem taxa cadastrada")
-      : "Entrega: taxa calculada só pelo cardápio digital (ofereça retirada ou o link)",
+      : s.deliveryMode === "ifood"
+        ? "Entrega: pelo iFood. NUNCA peça o endereço por mensagem: chame definir_entrega com tipo 'entrega' e mande o link que ela devolver; a taxa sai lá."
+        : "Entrega: taxa calculada só pelo cardápio digital (ofereça retirada ou o link)",
     "Retirada na loja: sim" + (s.address ? " (" + s.address + ")" : ""),
   ];
   return lines.filter(Boolean).join("\n");
@@ -217,7 +234,9 @@ function stateBlock(state: ConversationState, catalog: Catalog, firstName: strin
     saved?.address ? "Endereço do último pedido: " + saved.address + ", " + saved.number + " - " + saved.neighborhood + (saved.complement ? " (" + saved.complement + ")" : "") : "Sem endereço salvo",
     c?.lastOrder?.paymentMethod ? "Pagamento do último pedido: " + (PAYMENT_NAMES[c.lastOrder.paymentMethod] || c.lastOrder.paymentMethod) : "",
     "CARRINHO: " + (state.items.length ? "\n  " + describeCart(state).join("\n  ") : "vazio"),
-    "Entrega: " + (!d ? "(não definida)" : d.type === "pickup" ? "retirada" : d.address + ", " + d.number + " - " + d.neighborhood),
+    "Entrega: " + (!d ? (state.addressLinkId ? "(link de endereço enviado, aguardando o cliente preencher)" : "(não definida)") : d.type === "pickup" ? "retirada"
+      : d.address + ", " + d.number + " - " + d.neighborhood + (d.ifood ? " — taxa iFood " + brl(d.ifood.fee) + "; entregador aceita: " + (ifoodPaymentsText(d.ifood.payments) || "só pagamento online") : "")),
+    state.ifoodPayment ? "Pagamento na entrega iFood: " + state.ifoodPayment.method + (state.ifoodPayment.brand ? " " + state.ifoodPayment.brand : "") : "",
     "Pagamento: " + (state.payment ? PAYMENT_NAMES[state.payment] : "(não definido)") + (state.payment === "money" ? (state.changeFor === null ? ", troco não perguntado" : state.changeFor ? ", troco para " + brl(state.changeFor) : ", sem troco") : ""),
     state.items.length ? "Ainda falta: " + (missingForSummary(state).join(", ") || "nada — pode chamar gerar_resumo") : "",
     state.summary ? (summaryIsCurrent(state) ? "Resumo já enviado e atual: aguardando o cliente confirmar." : "O pedido mudou depois do último resumo: chame gerar_resumo de novo.") : "",
@@ -249,7 +268,8 @@ function systemPrompt(state: ConversationState, catalog: Catalog, firstName: str
     "15. Só diga 'mais um'/'mais uma' se o item já estava no CARRINHO antes. Carrinho vazio = primeiro item.",
     "16. Pedido já feito (veja ESTADO ATUAL): nunca recoloque os itens dele no carrinho nem gere resumo com eles. Mudança de pagamento, endereço ou itens de um pedido já feito é tratada pela loja, não monte pedido novo para isso.",
     "17. Se o cliente disser só 'cartão' e a loja aceitar crédito e débito, pergunte se é crédito ou débito.",
-    "18. Localização pelo mapa: agradeça e peça rua, número e bairro por escrito (a taxa é pelo bairro).",
+    "18. Localização pelo mapa: agradeça e peça rua, número e bairro por escrito (a taxa é pelo bairro); em loja com entrega iFood, mande o link de endereço (regra 19).",
+    "19. Loja com entrega pelo iFood: para entrega, chame definir_entrega (tipo 'entrega') e mande o link que ela devolver, explicando que é só para preencher o endereço e ver a taxa. Não peça rua/número/bairro por mensagem. Na entrega iFood o entregador não recebe Pix; se for cartão na entrega, pergunte a bandeira e passe em definir_pagamento (bandeira).",
     state.addToPlaced
       ? "\nMODO ADICIONAR AO PEDIDO JÁ FEITO" + (state.addToPlaced.orderNumber ? " Nº " + state.addToPlaced.orderNumber : "") +
         ": o cliente quer ACRESCENTAR itens ao pedido que já fez. Mostre as opções reais (buscar_cardapio) e, quando ele escolher, chame adicionar_ao_pedido_feito. NÃO use adicionar_item nem gerar_resumo e não pergunte endereço. Se ele disser que quer um pedido novo, chame sair_modo_adicionar."
@@ -364,6 +384,77 @@ function mentionsCartItem(state: ConversationState, text: string): boolean {
   const words = new Set(norm(text).replace(/[^a-z0-9 ]/g, " ").split(" ").filter(Boolean));
   return state.items.some((item) => norm(item.name).replace(/[^a-z0-9 ]/g, " ").split(" ")
     .some((w) => w.length >= 3 && !GENERIC_WORDS.has(w) && words.has(w)));
+}
+
+// ---------------------------------------------------------------------------
+// Link de endereço (entrega iFood): clickaipedidos.com.br/e/<código>.
+const LINK_TTL_MS = 60 * 60_000;
+const B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+const addressLinks = new Map<string, { sessionId: string; customerJid: string; phone: string; name: string; at: number }>();
+
+function ifoodQuoteExpired(state: ConversationState): boolean {
+  const q = state.delivery?.type === "delivery" ? state.delivery.ifood : undefined;
+  return Boolean(q && !(Date.parse(q.expiresAt) > Date.now() + 30_000));
+}
+
+function createAddressLink(p: AtendenteParams, state: ConversationState): string {
+  let id = "";
+  for (let i = 0; i < 10; i += 1) id += B62[randomInt(62)];
+  if (state.addressLinkId) addressLinks.delete(state.addressLinkId);
+  state.addressLinkId = id;
+  state.delivery = null;
+  state.ifoodPayment = null;
+  addressLinks.set(id, { sessionId: p.sessionId, customerJid: p.customerJid, phone: p.customerPhone || "", name: state.name, at: Date.now() });
+  return "clickaipedidos.com.br/e/" + id;
+}
+
+/** Dados do link para a página de endereço (consultado pelo servidor do site, com chave). */
+export function getAddressLink(id: string) {
+  const link = addressLinks.get(id);
+  if (!link || Date.now() - link.at > LINK_TTL_MS) return null;
+  return { sessionId: link.sessionId, phone: link.phone, customerName: link.name };
+}
+
+type LinkAddress = { streetName: string; streetNumber: string; neighborhood: string; city: string; state: string; postalCode: string; complement?: string; reference?: string };
+
+/** O cliente confirmou o endereço no link: grava a entrega com a cotação iFood e devolve o texto para continuar a conversa. */
+export async function applyAddressFromLink(id: string, body: any):
+  Promise<{ ok: true; sessionId: string; customerJid: string; phone: string; text: string } | { ok: false; status: number; error: string }> {
+  const link = addressLinks.get(id);
+  if (!link || Date.now() - link.at > LINK_TTL_MS) return { ok: false, status: 404, error: "Este link expirou. Peça um novo no WhatsApp." };
+  const quote = body?.quote, a: LinkAddress = body?.address || {};
+  const fee = Number(quote?.feeCents) / 100;
+  if (!/^[0-9a-f-]{36}$/i.test(String(quote?.id || "")) || !Number.isFinite(fee) || fee < 0 || !a.streetName || !a.streetNumber || !a.neighborhood) {
+    return { ok: false, status: 400, error: "Cotação inválida." };
+  }
+  const session = findSessionByAddressLink(id)?.session || (await getSession(link.sessionId, link.customerJid));
+  const state = session.state;
+  if (state.addressLinkId !== id) return { ok: false, status: 409, error: "Este link foi substituído por um mais novo no WhatsApp." };
+  const payments: IfoodPaymentOption[] = (Array.isArray(quote.paymentMethods) ? quote.paymentMethods : [])
+    .filter((m: any) => ["CREDIT", "DEBIT", "CASH"].includes(m?.method) && (m.method === "CASH" || (typeof m.brand === "string" && m.brand.trim())))
+    .map((m: any) => (m.method === "CASH" ? { method: "CASH" } : { method: m.method, brand: String(m.brand).trim() }));
+  state.delivery = {
+    type: "delivery", address: clean(a.streetName, 120), number: clean(a.streetNumber, 30), neighborhood: clean(a.neighborhood, 100),
+    complement: clean(a.complement || "", 160), reference: clean(a.reference || "", 160),
+    city: clean(a.city, 80), state: clean(a.state, 2), cep: clean(a.postalCode, 9),
+    ifood: { quoteId: String(quote.id), fee, expiresAt: String(quote.expiresAt || ""), payments },
+  };
+  state.addressLinkId = null;
+  state.summary = null;
+  state.awaitingConfirm = false;
+  addressLinks.delete(id);
+  // Pagamento escolhido antes do endereço: confere com o que o entregador aceita aqui.
+  if (state.payment && !state.payment.startsWith("online_") && checkIfoodPayment(state, state.payment, state.ifoodPayment?.brand)) {
+    state.payment = "";
+    state.ifoodPayment = null;
+  }
+  state.updatedAt = Date.now();
+  void persist(link.sessionId);
+  const where = state.delivery.address + ", " + state.delivery.number + " - " + state.delivery.neighborhood;
+  const text = "[Endereço confirmado pelo cliente no link: " + where + ". Taxa de entrega iFood: " + brl(fee) +
+    ". O entregador aceita na entrega: " + (ifoodPaymentsText(payments) || "nenhuma forma (só pagamento online)") +
+    ". Avise que o endereço chegou com a taxa e continue o pedido: se faltar algo, pergunte; se estiver tudo certo, gere o resumo.]";
+  return { ok: true, sessionId: link.sessionId, customerJid: link.customerJid, phone: link.phone, text };
 }
 
 const orderLabel = (n: string) => "pedido" + (n ? " Nº " + n : " que você já fez");
@@ -503,6 +594,12 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
       if (again.ok && again.text) { state.awaitingConfirm = true; await reply("O pedido mudou, então atualizei o resumo:\n\n" + again.text); return; }
       state.awaitingConfirm = false;
       await reply(again.erro === "sistema_indisponivel" ? fallbackText(catalog, true) : "Não consegui conferir o pedido: " + (again.motivo || "faltam dados") + ".");
+      return;
+    }
+    if (ifoodQuoteExpired(state)) {
+      state.awaitingConfirm = false;
+      state.summary = null;
+      await reply("A taxa de entrega do iFood vale por pouco tempo e acabou de vencer 😕 Confirma o endereço de novo neste link que eu atualizo o resumo:\n" + createAddressLink(p, state));
       return;
     }
     const result = await commitOrder(p.sessionId, String(p.customerPhone), state, catalog);

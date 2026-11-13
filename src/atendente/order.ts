@@ -158,12 +158,48 @@ export function setDelivery(state: ConversationState, catalog: Catalog, args: an
     ...(fee !== null ? { taxa_do_bairro: fee } : {}) };
 }
 
+const IFOOD_METHOD: Record<string, "CREDIT" | "DEBIT" | "CASH"> = { credit: "CREDIT", debit: "DEBIT", money: "CASH" };
+const IFOOD_LABEL: Record<string, string> = { CREDIT: "Crédito", DEBIT: "Débito", CASH: "Dinheiro" };
+
+/** Formas aceitas pelo entregador iFood neste endereço, em texto ("Dinheiro, Crédito (Visa, Elo)"). */
+export function ifoodPaymentsText(payments: Array<{ method: string; brand?: string }>): string {
+  const groups = new Map<string, string[]>();
+  for (const p of payments) {
+    const list = groups.get(p.method) || [];
+    if (p.brand && !list.includes(p.brand)) list.push(p.brand);
+    groups.set(p.method, list);
+  }
+  return [...groups].map(([m, brands]) => IFOOD_LABEL[m] + (brands.length ? " (" + brands.join(", ") + ")" : "")).join(", ");
+}
+
+/** Pagamento na entrega iFood: confere método e bandeira com a cotação do endereço. */
+export function checkIfoodPayment(state: ConversationState, id: string, brand: unknown): ToolOutcome | null {
+  const ifood = state.delivery?.type === "delivery" ? state.delivery.ifood : undefined;
+  if (!ifood || id.startsWith("online_")) { state.ifoodPayment = null; return null; }
+  const formas = ifoodPaymentsText(ifood.payments);
+  if (id === "pix") return { erro: "pix_na_entrega_indisponivel", formas_na_entrega: formas,
+    dica: "Na entrega pelo iFood o entregador não recebe Pix. Ofereça as formas na entrega ou Pix online, se a loja tiver." };
+  const method = IFOOD_METHOD[id];
+  const options = ifood.payments.filter((p) => p.method === method);
+  if (!options.length) return { erro: "forma_indisponivel_no_ifood", formas_na_entrega: formas };
+  if (method === "CASH") { state.ifoodPayment = { method }; return null; }
+  const wanted = norm(String(brand || ""));
+  const match = options.find((p) => wanted && norm(p.brand || "") === wanted) ||
+    options.find((p) => wanted && (norm(p.brand || "").includes(wanted) || wanted.includes(norm(p.brand || ""))));
+  if (!match) return { erro: "informe_bandeira", bandeiras: options.map((p) => p.brand),
+    dica: "Pergunte qual a bandeira do cartão, mostrando só estas opções." };
+  state.ifoodPayment = { method, brand: match.brand };
+  return null;
+}
+
 export function setPayment(state: ConversationState, catalog: Catalog, args: any): ToolOutcome {
   const id = paymentId(args?.forma);
   const allowed = catalog.store.paymentMethods.map((m) => m.id);
   if (!id || !allowed.includes(id)) {
     return { erro: "forma_invalida", formas_aceitas: catalog.store.paymentMethods.map((m) => m.label) };
   }
+  const ifoodProblem = checkIfoodPayment(state, id, args?.bandeira);
+  if (ifoodProblem) return ifoodProblem;
   state.payment = id;
   if (id !== "money") state.changeFor = null;
   else if (args?.sem_troco === true) state.changeFor = 0;
@@ -181,9 +217,12 @@ export function setName(state: ConversationState, args: any): ToolOutcome {
 export function missingForSummary(state: ConversationState): string[] {
   const missing: string[] = [];
   if (!state.items.length) missing.push("itens");
-  if (!state.delivery) missing.push("entrega ou retirada (e endereço)");
+  if (!state.delivery) missing.push(state.addressLinkId ? "endereço (aguardando o cliente preencher o link enviado)" : "entrega ou retirada (e endereço)");
   if (!state.payment) missing.push("forma de pagamento");
   if (state.payment === "money" && state.changeFor === null) missing.push("troco (para quanto, ou sem troco)");
+  if (state.delivery?.type === "delivery" && state.delivery.ifood && state.payment && !state.payment.startsWith("online_") && !state.ifoodPayment) {
+    missing.push("forma de pagamento aceita pelo entregador iFood (e a bandeira, se for cartão)");
+  }
   if (state.name.trim().length < 2) missing.push("nome do cliente");
   return missing;
 }
@@ -196,6 +235,7 @@ export function previewBody(sessionId: string, phone: string, state: Conversatio
       selectedOptions: i.options.map((o) => ({ id: o.id, groupId: o.groupId, quantity: o.quantity })) })),
     deliveryType: d?.type || "",
     ...(d?.type === "delivery" ? { address: d.address, number: d.number, neighborhood: d.neighborhood, complement: d.complement, reference: d.reference } : {}),
+    ...(d?.type === "delivery" && d.ifood ? { ifoodQuoteId: d.ifood.quoteId, ...(state.ifoodPayment ? { ifoodPaymentMethod: state.ifoodPayment } : {}) } : {}),
     paymentMethod: state.payment,
     ...(state.payment === "money" && state.changeFor ? { changeFor: state.changeFor } : {}),
     ...(action === "commit" && state.summary ? { quoteToken: state.summary.quoteToken } : {}),
@@ -217,12 +257,12 @@ export function formatSummary(state: ConversationState, data: any): string {
   if (d?.type === "delivery") {
     lines.push("🛵 Entrega: " + d.address + ", " + d.number + " - " + d.neighborhood + (d.complement ? " (" + d.complement + ")" : ""));
   } else lines.push("🏪 Retirada na loja");
-  lines.push("💳 Pagamento: " + (PAYMENT_NAMES[state.payment] || state.payment));
+  lines.push("💳 Pagamento: " + (PAYMENT_NAMES[state.payment] || state.payment) + (state.ifoodPayment?.brand ? " — " + state.ifoodPayment.brand : ""));
   if (state.payment === "money") lines.push(state.changeFor ? "💵 Troco para " + brl(state.changeFor) : "💵 Sem troco");
   lines.push("👤 Nome: " + state.name.trim());
   lines.push("");
   lines.push("Subtotal: " + brl(Number(data.subtotal)));
-  if (d?.type === "delivery") lines.push("Taxa de entrega: " + (Number(data.deliveryFee) > 0 ? brl(Number(data.deliveryFee)) : "grátis"));
+  if (d?.type === "delivery") lines.push("Taxa de entrega" + (d.ifood ? " (iFood)" : "") + ": " + (Number(data.deliveryFee) > 0 ? brl(Number(data.deliveryFee)) : "grátis"));
   lines.push("*Total: " + brl(Number(data.total)) + "*");
   lines.push("");
   lines.push("Posso confirmar o seu pedido?");

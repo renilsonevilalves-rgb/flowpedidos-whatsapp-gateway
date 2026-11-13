@@ -12,7 +12,7 @@ import { usesCentralAgent } from "./chatOrder.js";
 import { applyPeriodGreeting, isGreetingMessage, periodGreeting } from "./greeting.js";
 import { showTypingThenWait } from "./naturalPacing.js";
 import { hasOptedOut, isDuplicateSend, isOptInRequest, isOptOutRequest, setOptOut, waitForSendSlot } from "./sendHygiene.js";
-import { handleAtendenteMessage, isAtendenteTenant, noteOrderContext, noteOutboundOrderMessage } from "./atendente/engine.js";
+import { applyAddressFromLink, getAddressLink, handleAtendenteMessage, isAtendenteTenant, noteOrderContext, noteOutboundOrderMessage } from "./atendente/engine.js";
 import * as legacyOrderAi from "./aiAssistant.js";
 import * as legacyOrderAiV2 from "./aiAssistantV2.js";
 import { join } from "node:path";
@@ -711,6 +711,30 @@ function normalizePairingPhone(value: unknown) {
 }
 
 app.get("/health", (_req, res) => res.json({ ok: true, service: "flowpedidos-whatsapp-gateway", uptime: Math.round(process.uptime()), timestamp: new Date().toISOString() }));
+
+// Link de endereço da entrega iFood (página clickaipedidos.com.br/e/<código>).
+app.get("/atendente/endereco/:id", authMiddleware, (req, res) => {
+  const link = getAddressLink(String(req.params.id || ""));
+  if (!link) return res.status(404).json({ ok: false, error: "Este link expirou. Peça um novo no WhatsApp." });
+  return res.json({ ok: true, ...link });
+});
+
+app.post("/atendente/endereco/:id", authMiddleware, async (req, res) => {
+  const applied = await applyAddressFromLink(String(req.params.id || ""), req.body || {});
+  if (!applied.ok) return res.status(applied.status).json({ ok: false, error: applied.error });
+  const sock = sessions.get(applied.sessionId)?.sock;
+  res.json({ ok: true });
+  if (!sock) return;
+  const jid = applied.customerJid;
+  void handleAtendenteMessage({
+    sessionId: applied.sessionId, customerJid: jid, text: applied.text,
+    customerPhone: applied.phone || null, customerName: null,
+    sendMessage: async (reply) => { await sock.sendMessage(jid, { text: reply }); },
+    pauseForHuman: async () => { await pauseAi(applied.sessionId, jid, Number(process.env.WHATSAPP_HUMAN_PAUSE_MINUTES || 120), "customer_request"); },
+    periodGreeting: () => periodGreeting(),
+    logger,
+  }).catch((error: any) => logger.warn({ sessionId: applied.sessionId, error: error?.message || error }, "[Atendente] Falha após link de endereço"));
+});
 
 app.get("/session/:sessionId/status", authMiddleware, (req, res) => {
   const sessionId = req.params.sessionId as string;

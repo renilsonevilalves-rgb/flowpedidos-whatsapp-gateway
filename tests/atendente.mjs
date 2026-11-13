@@ -14,7 +14,7 @@ process.env.GEMINI_FALLBACK_MODEL = "";
 process.env.ATENDENTE_DEBOUNCE_MS = "0";
 process.env.ATENDENTE_STATE_DIR = tmpdir() + "/atendente-test-" + process.pid;
 
-const { handleAtendenteMessage, noteOrderContext, noteOutboundOrderMessage } = await import("../dist/atendente/engine.js");
+const { handleAtendenteMessage, noteOrderContext, noteOutboundOrderMessage, applyAddressFromLink, getAddressLink } = await import("../dist/atendente/engine.js");
 const { resetStateForTests } = await import("../dist/atendente/state.js");
 const { searchProducts, resolveProduct, resolveOption } = await import("../dist/atendente/catalog.js");
 const { isPureYes, wantsPaymentChange, isOrderNumberOnly } = await import("../dist/atendente/text.js");
@@ -61,7 +61,7 @@ function price(body) {
     subtotal = Math.round((subtotal + total) * 100) / 100;
     items.push({ name: p.name, quantity: it.quantity, total, selectedOptions: opts, notes: it.notes });
   }
-  const fee = body.deliveryType === "delivery" ? (world.store.deliveryFees.find((f) => f.name === body.neighborhood)?.fee ?? 0) : 0;
+  const fee = body.ifoodQuoteId ? 7.5 : body.deliveryType === "delivery" ? (world.store.deliveryFees.find((f) => f.name === body.neighborhood)?.fee ?? 0) : 0;
   return { items, subtotal, deliveryFee: fee, total: Math.round((subtotal + fee) * 100) / 100 };
 }
 globalThis.fetch = async (url, init) => {
@@ -639,4 +639,39 @@ test("pergunta 'e pão de sal?' não adiciona; pedido 'quero' adiciona; sem 'mai
   r = await c.send("quero um");
   assert.equal(lastFunctionResponses().find((f) => f.name === "adicionar_item").response.ok, true);
   assert.match(r.last, /^Adicionei um X- Salada/);
+});
+
+test("entrega iFood: manda link de endereço, recebe a cotação, pede bandeira e grava com a cotação", async () => {
+  resetWorld();
+  world.store = { ...STORE, deliveryMode: "ifood", deliveryFees: [] };
+  const c = customer("5531990000077");
+  world.script.push([call("adicionar_item", { produto: "x salada" }), call("definir_entrega", { tipo: "entrega" })],
+    (body) => [say("Preencha seu endereço aqui: " + JSON.stringify(body).match(/clickaipedidos\.com\.br\/e\/[A-Za-z0-9]{10}/)[0])]);
+  let r = await c.send("quero um x salada pra entregar");
+  const id = r.last.match(/\/e\/([A-Za-z0-9]{10})/)[1];
+  assert.equal(getAddressLink(id).sessionId, SID);
+  const bad = await applyAddressFromLink("XXXXXXXXXX", {});
+  assert.equal(bad.ok, false);
+  const ok = await applyAddressFromLink(id, {
+    quote: { id: "11111111-2222-4333-8444-555555555555", feeCents: 750, expiresAt: new Date(Date.now() + 600_000).toISOString(),
+      paymentMethods: [{ id: "a", method: "CREDIT", brand: "Visa" }, { id: "b", method: "CASH" }] },
+    address: { streetName: "Rua A", streetNumber: "10", neighborhood: "Centro", city: "Belo Horizonte", state: "MG", postalCode: "30110000", complement: "", reference: "" },
+  });
+  assert.equal(ok.ok, true);
+  assert.match(ok.text, /R\$ 7,50/);
+  assert.equal(getAddressLink(id), null);
+  world.script.push([call("definir_pagamento", { forma: "pix" })], [say("Na entrega iFood não tem Pix. Cartão ou dinheiro?")]);
+  await c.send(ok.text);
+  assert.equal(lastFunctionResponses()[0].response.erro, "pix_na_entrega_indisponivel");
+  world.script.push([call("definir_pagamento", { forma: "credito" })], [say("Qual a bandeira?")]);
+  await c.send("crédito");
+  assert.equal(lastFunctionResponses()[0].response.erro, "informe_bandeira");
+  world.script.push([call("definir_pagamento", { forma: "credito", bandeira: "visa" }), call("gerar_resumo")]);
+  r = await c.send("visa");
+  assert.match(r.last, /7,50/);
+  await c.send("sim");
+  const commit = world.commits.at(-1);
+  assert.equal(commit.ifoodQuoteId, "11111111-2222-4333-8444-555555555555");
+  assert.deepEqual(commit.ifoodPaymentMethod, { method: "CREDIT", brand: "Visa" });
+  assert.equal(commit.paymentMethod, "credit");
 });

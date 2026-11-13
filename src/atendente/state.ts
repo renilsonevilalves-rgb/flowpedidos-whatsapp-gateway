@@ -9,7 +9,11 @@ export type CartOption = { id: string; groupId: string; name: string; price: num
 export type CartItem = { productId: string; name: string; quantity: number; unitPrice: number; options: CartOption[]; notes: string };
 export type Delivery =
   | { type: "pickup" }
-  | { type: "delivery"; address: string; number: string; neighborhood: string; complement: string; reference: string };
+  | { type: "delivery"; address: string; number: string; neighborhood: string; complement: string; reference: string;
+      /** Entrega iFood: endereço confirmado no link, com a cotação oficial. */
+      city?: string; state?: string; cep?: string; ifood?: IfoodQuote };
+export type IfoodPaymentOption = { method: "CREDIT" | "DEBIT" | "CASH"; brand?: string };
+export type IfoodQuote = { quoteId: string; fee: number; expiresAt: string; payments: IfoodPaymentOption[] };
 export type Summary = {
   fingerprint: string; quoteToken: string; expires: number; total: number; subtotal: number; deliveryFee: number;
   text: string;
@@ -41,6 +45,10 @@ export type ConversationState = {
   lastReroute?: { items: string; at: number } | null;
   /** De onde veio o nome: perfil de pedidos anteriores, nome do WhatsApp ou dito pelo cliente. */
   nameSource?: "profile" | "whatsapp" | "customer";
+  /** Forma de pagamento ao entregador iFood (com bandeira para cartão). */
+  ifoodPayment?: IfoodPaymentOption | null;
+  /** Link de endereço (entrega iFood) aguardando o cliente preencher. */
+  addressLinkId?: string | null;
 };
 
 export type Session = { state: ConversationState; catalog?: Catalog; catalogAt?: number };
@@ -110,6 +118,17 @@ export function persist(sessionId: string): Promise<void> {
   return writes;
 }
 
+/** Procura a conversa dona de um link de endereço (entrega iFood). */
+export function findSessionByAddressLink(id: string): { sessionId: string; customerKey: string; session: Session } | null {
+  for (const [key, session] of sessions) {
+    if (session.state.addressLinkId === id) {
+      const cut = key.indexOf("|");
+      return { sessionId: key.slice(0, cut), customerKey: key.slice(cut + 1), session };
+    }
+  }
+  return null;
+}
+
 export function resetStateForTests() {
   sessions.clear();
   loaded.clear();
@@ -119,6 +138,6 @@ export function resetStateForTests() {
 export function cartFingerprint(state: ConversationState): string {
   return JSON.stringify([
     state.items.map((i) => [i.productId, i.quantity, i.notes, i.options.map((o) => [o.id, o.quantity])]),
-    state.delivery, state.payment, state.payment === "money" ? state.changeFor : null, state.name.trim(),
+    state.delivery, state.payment, state.payment === "money" ? state.changeFor : null, state.name.trim(), state.ifoodPayment || null,
   ]);
 }
