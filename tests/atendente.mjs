@@ -683,3 +683,18 @@ test("entrega iFood: manda link de endereço, recebe a cotação, pede bandeira 
   assert.deepEqual(commit.ifoodPaymentMethod, { method: "CREDIT", brand: "Visa" });
   assert.equal(commit.paymentMethod, "credit");
 });
+
+test("primeiro contato com pergunta: cardápio primeiro; taxa iFood sem itens não manda link de endereço", async () => {
+  resetWorld();
+  world.store = { ...STORE, deliveryMode: "ifood", deliveryFees: [] };
+  const c = customer("5531990000088");
+  world.script.push([call("definir_entrega", { tipo: "entrega" })], [say("A entrega é pelo iFood e a taxa aparece no cardápio ao finalizar.")]);
+  const r = await c.send("Boa noite! qual o valor da entrega?");
+  assert.equal(r.replies.length, 2);
+  assert.match(r.replies[0], /clickaipedidos\.com\.br\/click-testes/);
+  assert.equal(lastFunctionResponses()[0].response.erro, "sem_itens");
+  assert.doesNotMatch(r.replies.join("\n"), /\/e\//);
+  world.script.push([say("Temos sim!")]);
+  const again = await c.send("tem pão de sal?");
+  assert.equal(again.replies.length, 1, "a saudação não se repete");
+});

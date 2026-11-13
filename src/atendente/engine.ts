@@ -149,6 +149,9 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
     case "definir_entrega": {
       // Entrega iFood: o cliente preenche o endereço num link e a cotação oficial volta para cá.
       if (catalog.store.deliveryMode === "ifood" && !/retir|buscar|balcao|pickup/.test(norm(args?.tipo))) {
+        if (!state.items.length) {
+          return { erro: "sem_itens", dica: "Ainda não há itens no pedido: não mande link de endereço. Se o cliente só perguntou a taxa, diga que a entrega é pelo iFood, a taxa depende do endereço e aparece no cardápio ao finalizar o pedido (link do cardápio). Se quiser pedir por aqui, pergunte o que deseja." };
+        }
         if (state.delivery?.type === "delivery" && state.delivery.ifood && !ifoodQuoteExpired(state) && !args?.rua && !args?.trocar_endereco) {
           return { ok: true, entrega: state.delivery.address + ", " + state.delivery.number + " - " + state.delivery.neighborhood, taxa_ifood: state.delivery.ifood.fee };
         }
@@ -240,6 +243,7 @@ function stateBlock(state: ConversationState, catalog: Catalog, firstName: strin
       ? "Entrega iFood: NÃO ofereça o endereço nem o pagamento do último pedido. Pergunte se é entrega ou retirada; para entrega chame definir_entrega e mande o link (o último endereço já vem preenchido nele). O pagamento é escolhido depois, só entre as formas disponíveis."
       : saved?.address ? "Endereço do último pedido: " + saved.address + ", " + saved.number + " - " + saved.neighborhood + (saved.complement ? " (" + saved.complement + ")" : "") : "Sem endereço salvo",
     c?.lastOrder?.paymentMethod && catalog.store.deliveryMode !== "ifood" ? "Pagamento do último pedido: " + (PAYMENT_NAMES[c.lastOrder.paymentMethod] || c.lastOrder.paymentMethod) : "",
+    state.greetedAt && Date.now() - state.greetedAt < 6 * 3600_000 ? "A saudação com o link do cardápio JÁ foi enviada nesta conversa: não repita a saudação nem o link, a não ser que o cliente peça." : "",
     "CARRINHO: " + (state.items.length ? "\n  " + describeCart(state).join("\n  ") : "vazio"),
     "Entrega: " + (!d ? (state.addressLinkId ? "(link de endereço enviado, aguardando o cliente preencher)" : "(não definida)") : d.type === "pickup" ? "retirada"
       : d.address + ", " + d.number + " - " + d.neighborhood + (d.ifood ? " — taxa iFood " + brl(d.ifood.fee) + "; entregador aceita: " + (ifoodPaymentsText(d.ifood.payments) || "só pagamento online") : "")),
@@ -276,7 +280,7 @@ function systemPrompt(state: ConversationState, catalog: Catalog, firstName: str
     "16. Pedido já feito (veja ESTADO ATUAL): nunca recoloque os itens dele no carrinho nem gere resumo com eles. Mudança de pagamento, endereço ou itens de um pedido já feito é tratada pela loja, não monte pedido novo para isso.",
     "17. Se o cliente disser só 'cartão' e a loja aceitar crédito e débito, pergunte se é crédito ou débito.",
     "18. Localização pelo mapa: agradeça e peça rua, número e bairro por escrito (a taxa é pelo bairro); em loja com entrega iFood, mande o link de endereço (regra 19).",
-    "19. Loja com entrega pelo iFood: para entrega, chame definir_entrega (tipo 'entrega') e mande o link que ela devolver, explicando que é só para preencher o endereço e ver a taxa. Não peça rua/número/bairro por mensagem. Na entrega iFood o entregador não recebe Pix; se for cartão na entrega, pergunte a bandeira e passe em definir_pagamento (bandeira). Formas de pagamento: ofereça só as da lista 'Pagamentos disponíveis AGORA', uma por linha começando com •, nunca as outras.",
+    "19. Loja com entrega pelo iFood: para entrega, chame definir_entrega (tipo 'entrega') e mande o link que ela devolver, explicando que é só para preencher o endereço e ver a taxa. Não peça rua/número/bairro por mensagem. Na entrega iFood o entregador não recebe Pix; se for cartão na entrega, pergunte a bandeira e passe em definir_pagamento (bandeira). Formas de pagamento: ofereça só as da lista 'Pagamentos disponíveis AGORA', uma por linha começando com •, nunca as outras. Pergunta de taxa de entrega sem itens no pedido: responda que a entrega é pelo iFood e a taxa depende do endereço, aparecendo no cardápio ao finalizar o pedido; não mande o link de endereço.",
     state.addToPlaced
       ? "\nMODO ADICIONAR AO PEDIDO JÁ FEITO" + (state.addToPlaced.orderNumber ? " Nº " + state.addToPlaced.orderNumber : "") +
         ": o cliente quer ACRESCENTAR itens ao pedido que já fez. Mostre as opções reais (buscar_cardapio) e, quando ele escolher, chame adicionar_ao_pedido_feito. NÃO use adicionar_item nem gerar_resumo e não pergunte endereço. Se ele disser que quer um pedido novo, chame sair_modo_adicionar."
@@ -582,6 +586,8 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
     pushHistory(state, "model", message);
     await p.sendMessage(message);
   };
+  // Primeiro contato da conversa: o link do cardápio vai antes de qualquer resposta.
+  const firstContact = !state.items.length && Date.now() - (state.greetedAt || 0) > 6 * 3600_000 && !state.history.some((t) => t.role === "model");
   pushHistory(state, "user", text);
   if (!catalog) { await reply(fallbackText(null, state.items.length > 0)); return; }
   if (!state.name) {
@@ -651,6 +657,11 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
     state.greetedAt = Date.now();
     await reply(greetingText(p, catalog));
     return;
+  }
+
+  if (firstContact) {
+    state.greetedAt = Date.now();
+    await reply(greetingText(p, catalog));
   }
 
   // 5) Conversa livre com o Gemini + ferramentas.
