@@ -627,3 +627,16 @@ test("nome vindo só do perfil do WhatsApp: a IA é avisada para confirmar", asy
   assert.match(system, /veio do perfil do WhatsApp/);
   world.customer = CUSTOMER;
 });
+
+test("pergunta 'e pão de sal?' não adiciona; pedido 'quero' adiciona; sem 'mais um' com carrinho vazio", async () => {
+  resetWorld();
+  const c = customer("5531990000401");
+  world.script.push([call("adicionar_item", { produto: "x-sal" })], [say("Temos sim! X- Salada por R$ 22,00. Quer pedir?")]);
+  let r = await c.send("e x salada?");
+  assert.equal(lastFunctionResponses().find((f) => f.name === "adicionar_item").response.erro, "cliente_so_perguntou");
+  assert.match(r.last, /Quer pedir/);
+  world.script.push([call("adicionar_item", { produto: "x-sal" })], [say("Adicionei mais um X- Salada (R$ 22,00)! Entrega ou retirada?")]);
+  r = await c.send("quero um");
+  assert.equal(lastFunctionResponses().find((f) => f.name === "adicionar_item").response.ok, true);
+  assert.match(r.last, /^Adicionei um X- Salada/);
+});

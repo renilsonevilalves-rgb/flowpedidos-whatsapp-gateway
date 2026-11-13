@@ -134,7 +134,14 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
       if (!found.length) return { resultados: [], ...(sold ? { esgotado: sold } : {}), dica: "Nada parecido no cardápio. Não invente." };
       return { resultados: found.map((m) => describeProduct(m.product)), ...(sold ? { esgotado: sold } : {}) };
     }
-    case "adicionar_item": return addItem(state, catalog, args);
+    case "adicionar_item": {
+      // Pergunta ("tem pão de sal?", "e pão de sal?", "quanto é a coca?") não é pedido: só responde.
+      const lastUser = [...state.history].reverse().find((t) => t.role === "user")?.text || "";
+      if (isOnlyQuestion(lastUser) && !state.addToPlaced) {
+        return { erro: "cliente_so_perguntou", dica: "O cliente só perguntou se tem/quanto custa. NÃO adicione. Responda com o produto e o preço e pergunte se quer pedir." };
+      }
+      return addItem(state, catalog, args);
+    }
     case "remover_item": return removeItem(state, args);
     case "alterar_item": return changeItem(state, args);
     case "definir_entrega": {
@@ -206,7 +213,7 @@ function stateBlock(state: ConversationState, catalog: Catalog, firstName: strin
   const d = state.delivery;
   const lines = [
     "Nome do cliente: " + (state.name || "(não informado)") + (firstName ? " (chame de " + firstName + ")" : "") +
-      (state.name && state.nameSource === "whatsapp" ? " — veio do perfil do WhatsApp; se não parecer nome de pessoa (ex.: 'Consultor', 'Loja', apelido), pergunte o nome antes do resumo" : ""),
+      (state.name && state.nameSource === "whatsapp" ? " — veio do perfil do WhatsApp; se não parecer nome de pessoa (ex.: 'Consultor', 'Loja', apelido), antes do resumo pergunte só 'Qual o seu nome?' (sem citar o nome do WhatsApp)" : ""),
     saved?.address ? "Endereço do último pedido: " + saved.address + ", " + saved.number + " - " + saved.neighborhood + (saved.complement ? " (" + saved.complement + ")" : "") : "Sem endereço salvo",
     c?.lastOrder?.paymentMethod ? "Pagamento do último pedido: " + (PAYMENT_NAMES[c.lastOrder.paymentMethod] || c.lastOrder.paymentMethod) : "",
     "CARRINHO: " + (state.items.length ? "\n  " + describeCart(state).join("\n  ") : "vazio"),
@@ -225,7 +232,8 @@ function systemPrompt(state: ConversationState, catalog: Catalog, firstName: str
     "Você é o atendente virtual de pedidos de um delivery no WhatsApp. Fale em português do Brasil, curto e simpático (no máximo 1 ou 2 emojis por mensagem). Nada de menus numerados, nada de botões.",
     "REGRAS:",
     "1. Nunca invente produto, sabor, tamanho, preço, taxa ou total. Use só o cardápio abaixo e as ferramentas. Na dúvida, chame buscar_cardapio.",
-    "2. Quando o cliente disser o que quer, chame adicionar_item na hora (não pergunte 'posso adicionar?'). Diga o item e o preço em uma frase curta.",
+    "2. Quando o cliente PEDIR um item (quero, me vê, manda, vou querer, 2 pães...), chame adicionar_item na hora. Se ele só PERGUNTAR (tem X? e X? quanto custa?), responda e pergunte se quer pedir; não adicione.",
+    "2b. Ao listar 2 ou mais produtos, use uma linha por produto, assim: • Coca-Cola 2L — R$ 13,90",
     "3. Se adicionar_item disser que faltam opções (tamanho, sabor, borda...), ou que está ambíguo, pergunte UMA vez com as opções curtas.",
     "4. Depois do item, se faltar entrega/pagamento e houver endereço e pagamento do último pedido, pergunte numa frase só: 'Posso usar a entrega na <rua>, nº <número> e o pagamento no <forma>, como no seu último pedido?'. Sem histórico: pergunte se é entrega ou retirada e o endereço; depois a forma de pagamento. Dinheiro: pergunte o troco.",
     "5. Nunca pergunte de novo algo que já está no ESTADO ATUAL. Faça uma pergunta por vez.",
@@ -341,6 +349,13 @@ export function noteOutboundOrderMessage(sessionId: string, phone: string, text:
   if (!number || tail.length < 8) return;
   outboundNotices.set(sessionId + "|" + tail, { orderNumber: number, at: Date.now() });
   if (outboundNotices.size > 5000) outboundNotices.delete(outboundNotices.keys().next().value as string);
+}
+
+/** Mensagem que só pergunta (tem X? / e X? / quanto custa X?), sem pedir. */
+function isOnlyQuestion(text: string): boolean {
+  const t = norm(text);
+  if (/\b(quero|queria|vou querer|me (?:ve|manda|traz|da)|manda|pode (?:mandar|colocar|por|adicionar)|adiciona|coloca|bota|pedir|vou levar|separa)\b/.test(t)) return false;
+  return /\?\s*$/.test(text.trim()) || /^(?:tem|voces tem|vcs tem|ainda tem|quanto (?:custa|e|fica|ta)|qual o (?:valor|preco))\b/.test(t);
 }
 
 const GENERIC_WORDS = new Set(["pedido", "lanche", "lanches", "porcao", "bebida", "pizza", "media", "grande", "pequena", "com", "sem", "tradicional"]);
@@ -518,6 +533,7 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
 
   // 5) Conversa livre com o Gemini + ferramentas.
   const flags: TurnFlags = {};
+  const itemsBefore = state.items.length;
   const contents: GeminiContent[] = state.history.slice(0, -1).slice(-10).map((t) => ({ role: t.role, parts: [{ text: t.text }] }));
   while (contents.length && contents[0].role !== "user") contents.shift();
   contents.push({ role: "user", parts: [{ text }] });
@@ -561,7 +577,9 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
     await reply("Certo! Já chamei alguém da loja para falar com você. Aguarde só um pouquinho 🙏");
     return;
   }
-  const lead = sanitizeReply(answer, catalog);
+  let lead = sanitizeReply(answer, catalog);
+  // "Adicionei mais um..." com o carrinho vazio antes deste turno: tira o "mais".
+  if (itemsBefore === 0) lead = lead.replace(/\b(adicionei|coloquei|anotei|separei)\s+mais\s+(?=(?:um|uma|\d+)\b)/gi, "$1 ");
   if (flags.summary) {
     state.awaitingConfirm = true;
     // Texto da IA antes do resumo sem perguntas soltas (a pergunta final é a confirmação).
