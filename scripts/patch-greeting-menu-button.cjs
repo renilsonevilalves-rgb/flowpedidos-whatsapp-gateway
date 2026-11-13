@@ -119,7 +119,7 @@ async function sendMenuGreetingButton(sock: WASocket, customerJid: string, store
   // texto simples com o link do cardápio. Botões só com WHATSAPP_MENU_BUTTONS=true.
   if (process.env.WHATSAPP_MENU_BUTTONS !== "true") {
     const plainText = replyText.replace(/clic(?:ar|que) abaixo/gi, "clicar no link abaixo") +
-      "\\n\\n" + menuUrl +
+      "\\n\\n" + menuUrl.split("https://clickaipedidos.com.br/cardapio/").join("clickaipedidos.com.br/c/") +
       (includeHumanOption ? "\\n\\nSe preferir falar com a loja, é só responder *atendente*." : "");
     await showTypingThenWait(sock, customerJid, plainText);
     await sock.sendMessage(customerJid, { text: plainText });

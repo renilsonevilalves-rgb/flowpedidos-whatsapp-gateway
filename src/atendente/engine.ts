@@ -39,6 +39,11 @@ export function isAtendenteTenant(sessionId: string): boolean {
   return atendenteTenants().has(sessionId);
 }
 
+/** Link curto para o WhatsApp: clickaipedidos.com.br/c/loja (redireciona para /cardapio/loja). */
+export function shortMenuLink(url: string): string {
+  return String(url || "").replace(/^https?:\/\/(?:www\.)?clickaipedidos\.com\.br\/cardapio\//i, "clickaipedidos.com.br/c/");
+}
+
 // ---------------------------------------------------------------------------
 // Cardápio (cache de 5 min por cliente; o perfil do cliente vem junto)
 async function ensureCatalog(session: Session, p: AtendenteParams): Promise<Catalog | null> {
@@ -47,7 +52,7 @@ async function ensureCatalog(session: Session, p: AtendenteParams): Promise<Cata
   if (result.ok && Array.isArray(result.data?.products) && result.data?.store) {
     const d = result.data;
     session.catalog = {
-      storeName: clean(d.storeName, 120), menuUrl: clean(d.menuUrl, 300), products: d.products,
+      storeName: clean(d.storeName, 120), menuUrl: shortMenuLink(clean(d.menuUrl, 300)), products: d.products,
       soldOut: Array.isArray(d.soldOut) ? d.soldOut : [], store: d.store, customer: d.customer || null,
       learnedAliases: Array.isArray(d.learnedAliases) ? d.learnedAliases : [],
     };
@@ -239,16 +244,14 @@ function firstNameOf(state: ConversationState, p: AtendenteParams, catalog: Cata
   return /^[\p{L}][\p{L}'-]{1,30}$/u.test(raw) ? raw.charAt(0).toUpperCase() + raw.slice(1).toLowerCase() : "";
 }
 
-function greetingText(p: AtendenteParams, catalog: Catalog, firstName: string): string {
-  const hello = p.periodGreeting() + (firstName ? ", " + firstName : "") + "! 😊";
+// Mesma saudação de antes (a do botão "Ver cardápio"), agora só em texto com o link curto.
+function greetingText(p: AtendenteParams, catalog: Catalog): string {
+  const hello = p.periodGreeting() + "! 👋 Seja bem-vindo a *" + catalog.storeName + "*";
   const s = catalog.store;
   if (!s.isOpen) {
-    return hello + " Aqui é da *" + catalog.storeName + "*.\nNo momento estamos fechados" + (s.opensAt ? " — abrimos " + s.opensAt : "") +
-      ".\n\nO cardápio fica aqui: " + catalog.menuUrl;
+    return hello + "\n\nNo momento estamos fechados" + (s.opensAt ? " — abrimos " + s.opensAt : "") + ".\n\nNosso cardápio:\n" + catalog.menuUrl;
   }
-  const until = s.closesAt ? (s.closesAt === "00:00" || s.closesAt === "23:59" ? " até meia-noite" : " até as " + s.closesAt) : "";
-  return hello + " Aqui é da *" + catalog.storeName + "*. Estamos abertos" + until + ".\n\n" +
-    "Pode fazer seu pedido por aqui mesmo, é só me dizer o que deseja. Se preferir, o cardápio completo está aqui: " + catalog.menuUrl;
+  return hello + "\n\nConfira nosso cardápio e faça seu pedido por aqui. 😊\n\nÉ só clicar no link abaixo para ver o cardápio!\n\n" + catalog.menuUrl;
 }
 
 function fallbackText(catalog: Catalog | null, hasCart: boolean): string {
@@ -472,7 +475,7 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
   // 4) Saudação simples: resposta pronta (rápida e sem custo de IA).
   if (isOnlyGreeting(text) && !state.items.length) {
     state.greetedAt = Date.now();
-    await reply(greetingText(p, catalog, firstName));
+    await reply(greetingText(p, catalog));
     return;
   }
 
