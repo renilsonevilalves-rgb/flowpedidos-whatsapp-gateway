@@ -39,9 +39,9 @@ export function isAtendenteTenant(sessionId: string): boolean {
   return atendenteTenants().has(sessionId);
 }
 
-/** Link curto para o WhatsApp: clickaipedidos.com.br/c/loja (redireciona para /cardapio/loja). */
+/** Link curto para o WhatsApp: clickaipedidos.com.br/loja (abre /cardapio/loja). */
 export function shortMenuLink(url: string): string {
-  return String(url || "").replace(/^https?:\/\/(?:www\.)?clickaipedidos\.com\.br\/cardapio\//i, "clickaipedidos.com.br/c/");
+  return String(url || "").replace(/^https?:\/\/(?:www\.)?clickaipedidos\.com\.br\/cardapio\//i, "clickaipedidos.com.br/");
 }
 
 // ---------------------------------------------------------------------------
@@ -266,9 +266,9 @@ function greetingText(p: AtendenteParams, catalog: Catalog): string {
   const hello = p.periodGreeting() + "! 👋 Seja bem-vindo a *" + catalog.storeName + "*";
   const s = catalog.store;
   if (!s.isOpen) {
-    return hello + "\n\nNo momento estamos fechados" + (s.opensAt ? " — abrimos " + s.opensAt : "") + ".\n\nNosso cardápio:\n" + catalog.menuUrl;
+    return hello + "\n\n> No momento estamos fechados" + (s.opensAt ? " — abrimos " + s.opensAt : "") + ".\nNosso cardápio:\n👉 " + catalog.menuUrl;
   }
-  return hello + "\n\nConfira nosso cardápio e faça seu pedido por aqui. 😊\n\nÉ só clicar no link abaixo para ver o cardápio!\n\n" + catalog.menuUrl;
+  return hello + "\n\n> Confira nosso cardápio e faça seu pedido por aqui. 😊\nÉ só clicar no link abaixo para ver o cardápio!\n👉 " + catalog.menuUrl;
 }
 
 function fallbackText(catalog: Catalog | null, hasCart: boolean): string {

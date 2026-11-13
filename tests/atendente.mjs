@@ -151,8 +151,8 @@ test("saudação: igual à de antes, sem botão, com link curto e sem IA", async
   const r = await c.send("Boa noite");
   assert.equal(r.handled, true);
   assert.equal(world.geminiCalls, 0);
-  assert.equal(r.last, "Boa noite! 👋 Seja bem-vindo a *Click Testes*\n\nConfira nosso cardápio e faça seu pedido por aqui. 😊\n\n" +
-    "É só clicar no link abaixo para ver o cardápio!\n\nclickaipedidos.com.br/c/click-testes");
+  assert.equal(r.last, "Boa noite! 👋 Seja bem-vindo a *Click Testes*\n\n> Confira nosso cardápio e faça seu pedido por aqui. 😊\n" +
+    "É só clicar no link abaixo para ver o cardápio!\n👉 clickaipedidos.com.br/click-testes");
 });
 
 test("pedido simples no estilo Brendi: endereço/pagamento do último pedido, troca para débito, resumo e sim", async () => {
@@ -339,7 +339,7 @@ test("Gemini fora do ar (429): resposta educada com link e carrinho preservado",
   let r = await c.send("e uma coca 2l");
   assert.match(r.last, /instabilidade/);
   assert.match(r.last, /continua salvo/);
-  assert.match(r.last, /clickaipedidos\.com\.br\/c\/click-testes/);
+  assert.match(r.last, /clickaipedidos\.com\.br\/click-testes/);
   // Volta ao normal e o carrinho continua lá.
   world.geminiDown = false;
   world.script.push([call("adicionar_item", { produto: "coca 2l" }), call("definir_entrega", { tipo: "retirada" }), call("definir_pagamento", { forma: "pix" }), call("gerar_resumo")]);
