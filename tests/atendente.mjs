@@ -698,3 +698,15 @@ test("primeiro contato com pergunta: cardápio primeiro; taxa iFood sem itens n�
   const again = await c.send("tem pão de sal?");
   assert.equal(again.replies.length, 1, "a saudação não se repete");
 });
+
+test("conversa parada 30+ min volta com o cardápio; taxa iFood sem itens sempre leva o link do cardápio", async () => {
+  resetWorld();
+  world.store = { ...STORE, deliveryMode: "ifood", deliveryFees: [] };
+  const c = customer("5531990000099");
+  world.script.push([say("Oi!")]);
+  await c.send("oi tudo bem? quero ver umas coisas");
+  world.script.push([say("A entrega é pelo iFood e a taxa depende do seu endereço.")]);
+  let r = await c.send("quanto custa a taxa de entrega?");
+  assert.equal(r.replies.length, 1);
+  assert.match(r.last, /👉 clickaipedidos\.com\.br\/click-testes$/);
+});
