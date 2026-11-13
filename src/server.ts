@@ -11,6 +11,9 @@ import { flushAiEvents, logAiEvent, phoneForJid, rememberCustomerPhone, takeTool
 import { usesCentralAgent } from "./chatOrder.js";
 import { applyPeriodGreeting, isGreetingMessage, periodGreeting } from "./greeting.js";
 import { showTypingThenWait } from "./naturalPacing.js";
+import { handleAtendenteMessage, isAtendenteTenant } from "./atendente/engine.js";
+import * as legacyOrderAi from "./aiAssistant.js";
+import * as legacyOrderAiV2 from "./aiAssistantV2.js";
 import { join } from "node:path";
 import {
   Browsers,
@@ -446,6 +449,30 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
           await sock.sendMessage(customerJid, { text: "Não consegui localizar seu pedido agora. Verifique se o pedido foi feito com este mesmo número de WhatsApp e tente novamente. 🙏" }).catch(() => undefined);
         }
         continue;
+      }
+
+      // Atendente de pedidos pela conversa: só lojas em WHATSAPP_AI_ORDER_TENANTS.
+      // Pedidos já feitos (acompanhar/alterar/cancelar) seguem no fluxo atual.
+      if (isAtendenteTenant(id)) {
+        const atendenteJid = getCustomerJid(msg, remoteJid);
+        const atendenteHandled = await handleAtendenteMessage({
+          sessionId: id, customerJid: atendenteJid, text,
+          customerPhone: await resolveCustomerPhone(sock, msg, remoteJid),
+          customerName: typeof msg.pushName === "string" ? msg.pushName : null,
+          legacyBusy: legacyOrderAi.hasPendingOrderCancellation(id, atendenteJid) ||
+            legacyOrderAi.hasPendingOrderAction(id, atendenteJid) || legacyOrderAiV2.hasPendingOrderChange(id, atendenteJid),
+          sendMessage: async (reply) => { await sock.sendMessage(atendenteJid, { text: reply }); },
+          pauseForHuman: async () => {
+            await pauseAi(id, atendenteJid, Number(process.env.WHATSAPP_HUMAN_PAUSE_MINUTES || 120), "customer_request");
+            logAiEvent({ sessionId: id, customerPhone: phoneForJid(id, atendenteJid), kind: "human_request", role: "system", body: "Cliente pediu atendente" });
+          },
+          periodGreeting: () => periodGreeting(),
+          logger,
+        }).catch((error: any) => {
+          logger.warn({ sessionId: id, error: error?.message || error }, "[Atendente] Falha; seguindo fluxo atual");
+          return false;
+        });
+        if (atendenteHandled) continue;
       }
 
       const isTrigger = isAutoReplyTrigger(text);

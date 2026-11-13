@@ -35,3 +35,13 @@ Não exponha a `API_KEY` no navegador. O frontend deverá chamar um backend segu
 - Entregas por distância/iFood ainda utilizam o checkout do cardápio para cotação. Essa limitação é intencional para não inventar taxas.
 - Os rascunhos ficam temporariamente na memória do gateway; reinícios descartam rascunhos, nunca pedidos já gravados. Piloto deve validar recuperação de sessão.
 - Não ativar em todas as lojas sem homologar as rotas, duplicidades, preços, personalizações, loja fechada e pagamento real em sandbox.
+
+## Atendente de pedidos pela conversa (src/atendente)
+Conversa livre (sem botões e sem menu de números) que monta o pedido, mostra o resumo com valores
+oficiais do backend e só grava depois do "sim" do cliente ao resumo mais recente.
+- Liga por loja: `WHATSAPP_AI_ORDER_TENANTS` (Railway) = IDs das lojas separados por vírgula. Vazio = desligado.
+- Na Vercel a loja precisa estar em `WHATSAPP_CHAT_ORDER_ALLOWED_TENANTS` com `WHATSAPP_CHAT_ORDERS_ENABLED=true`.
+- Usa `GEMINI_API_KEY` e `GEMINI_MODEL` (opcional `GEMINI_FALLBACK_MODEL`). Sem Gemini, responde com o link do cardápio sem perder o carrinho.
+- Pedidos já feitos (acompanhar, alterar, cancelar) continuam no atendimento atual.
+- Opcionais: `ATENDENTE_DEBOUNCE_MS` (junta mensagens seguidas, padrão 1500), `ATENDENTE_STATE_TTL_MINUTES` (padrão 180).
+- Testes: `tests/atendente.mjs`.
