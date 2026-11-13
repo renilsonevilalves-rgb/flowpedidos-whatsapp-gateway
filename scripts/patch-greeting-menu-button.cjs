@@ -115,6 +115,19 @@ async function sendMenuGreetingButton(sock: WASocket, customerJid: string, store
 
   const replyText = buildMenuGreetingText(storeInfo);
 
+  // Sem botões por padrão (menor risco de bloqueio na conexão não oficial):
+  // texto simples com o link do cardápio. Botões só com WHATSAPP_MENU_BUTTONS=true.
+  if (process.env.WHATSAPP_MENU_BUTTONS !== "true") {
+    const plainText = replyText.replace(/clic(?:ar|que) abaixo/gi, "clicar no link abaixo") +
+      "\\n\\n" + menuUrl +
+      (includeHumanOption ? "\\n\\nSe preferir falar com a loja, é só responder *atendente*." : "");
+    await showTypingThenWait(sock, customerJid, plainText);
+    await sock.sendMessage(customerJid, { text: plainText });
+    markSent();
+    logger.info({ remoteJid: customerJid }, "[Auto-Reply] Cardápio enviado em texto (sem botões)");
+    return "text";
+  }
+
   const buttons = [
     proto.Message.InteractiveMessage.NativeFlowMessage.NativeFlowButton.create({
       name: "cta_url",
