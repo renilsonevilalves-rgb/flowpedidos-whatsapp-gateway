@@ -172,22 +172,41 @@ export function ifoodPaymentsText(payments: Array<{ method: string; brand?: stri
   return [...groups].map(([m, brands]) => IFOOD_LABEL[m] + (brands.length ? " (" + brands.join(", ") + ")" : "")).join(", ");
 }
 
+const ONLINE_LABEL: Record<string, string> = { online_pix: "Pix online (link de pagamento)", online_credit: "Cartão de crédito online (link)", online_debit: "Cartão de débito online (link)" };
+
+/** Formas disponíveis agora numa entrega iFood, uma por linha: as do entregador (cotação) + as online da loja. */
+export function ifoodPaymentLines(state: ConversationState, catalog?: Catalog | null): string[] {
+  const ifood = state.delivery?.type === "delivery" ? state.delivery.ifood : undefined;
+  if (!ifood) return [];
+  const lines: string[] = [];
+  if (ifood.payments.some((p) => p.method === "CASH")) lines.push("• Dinheiro");
+  for (const method of ["CREDIT", "DEBIT"] as const) {
+    for (const p of ifood.payments) {
+      const line = "• " + IFOOD_LABEL[method] + " " + p.brand;
+      if (p.method === method && p.brand && !lines.includes(line)) lines.push(line);
+    }
+  }
+  for (const m of catalog?.store.paymentMethods || []) if (ONLINE_LABEL[m.id]) lines.push("• " + ONLINE_LABEL[m.id]);
+  return lines;
+}
+
 /** Pagamento na entrega iFood: confere método e bandeira com a cotação do endereço. */
-export function checkIfoodPayment(state: ConversationState, id: string, brand: unknown): ToolOutcome | null {
+export function checkIfoodPayment(state: ConversationState, id: string, brand: unknown, catalog?: Catalog | null): ToolOutcome | null {
   const ifood = state.delivery?.type === "delivery" ? state.delivery.ifood : undefined;
   if (!ifood || id.startsWith("online_")) { state.ifoodPayment = null; return null; }
-  const formas = ifoodPaymentsText(ifood.payments);
+  const formas = ifoodPaymentLines(state, catalog).join("\n");
+  const show = "Mostre ao cliente exatamente esta lista (uma forma por linha, como está):\n" + formas;
   if (id === "pix") return { erro: "pix_na_entrega_indisponivel", formas_na_entrega: formas,
-    dica: "Na entrega pelo iFood o entregador não recebe Pix. Ofereça as formas na entrega ou Pix online, se a loja tiver." };
+    dica: "Na entrega pelo iFood o entregador não recebe Pix na entrega. " + show };
   const method = IFOOD_METHOD[id];
   const options = ifood.payments.filter((p) => p.method === method);
-  if (!options.length) return { erro: "forma_indisponivel_no_ifood", formas_na_entrega: formas };
+  if (!options.length) return { erro: "forma_indisponivel_no_ifood", formas_na_entrega: formas, dica: "Diga que essa forma não está disponível agora. " + show };
   if (method === "CASH") { state.ifoodPayment = { method }; return null; }
   const wanted = norm(String(brand || ""));
   const match = options.find((p) => wanted && norm(p.brand || "") === wanted) ||
     options.find((p) => wanted && (norm(p.brand || "").includes(wanted) || wanted.includes(norm(p.brand || ""))));
-  if (!match) return { erro: "informe_bandeira", bandeiras: options.map((p) => p.brand),
-    dica: "Pergunte qual a bandeira do cartão, mostrando só estas opções." };
+  if (!match) return { erro: wanted ? "bandeira_indisponivel" : "informe_bandeira", bandeiras: options.map((p) => p.brand),
+    dica: (wanted ? "Essa bandeira não é aceita agora. " : "") + "Pergunte a bandeira mostrando só estas, uma por linha:\n" + options.map((p) => "• " + p.brand).join("\n") };
   state.ifoodPayment = { method, brand: match.brand };
   return null;
 }
@@ -198,7 +217,7 @@ export function setPayment(state: ConversationState, catalog: Catalog, args: any
   if (!id || !allowed.includes(id)) {
     return { erro: "forma_invalida", formas_aceitas: catalog.store.paymentMethods.map((m) => m.label) };
   }
-  const ifoodProblem = checkIfoodPayment(state, id, args?.bandeira);
+  const ifoodProblem = checkIfoodPayment(state, id, args?.bandeira, catalog);
   if (ifoodProblem) return ifoodProblem;
   state.payment = id;
   if (id !== "money") state.changeFor = null;

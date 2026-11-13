@@ -6,7 +6,7 @@ import { describeProduct, searchProducts, soldOutMatch, type Catalog } from "./c
 import { generate, GeminiUnavailable, type GeminiContent, type GeminiPart } from "./gemini.js";
 import {
   addItem, changeItem, commitOrder, describeCart, makeSummary, missingForSummary, PAYMENT_NAMES,
-  checkIfoodPayment, ifoodPaymentsText, removeItem, setDelivery, setName, setPayment, summaryIsCurrent, type ToolOutcome,
+  checkIfoodPayment, ifoodPaymentLines, ifoodPaymentsText, removeItem, setDelivery, setName, setPayment, summaryIsCurrent, type ToolOutcome,
 } from "./order.js";
 import { randomInt } from "node:crypto";
 import { findSessionByAddressLink, freshState, getSession, persist, type CartItem, type ConversationState, type IfoodPaymentOption, type Session } from "./state.js";
@@ -192,14 +192,19 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
 }
 
 // ---------------------------------------------------------------------------
-function storeBlock(catalog: Catalog): string {
+function storeBlock(catalog: Catalog, state?: ConversationState): string {
+  const ifoodLines = state ? ifoodPaymentLines(state, catalog) : [];
   const s = catalog.store;
   const lines = [
     "Loja: " + catalog.storeName,
     "Link do cardápio: " + catalog.menuUrl,
     s.isOpen ? "Situação: ABERTA agora" + (s.closesAt ? ", fecha às " + s.closesAt : "") : "Situação: FECHADA agora" + (s.opensAt ? "; abre " + s.opensAt : "") + ". Não monte pedido.",
     s.text ? "Horários: " + s.text : "",
-    "Pagamentos aceitos: " + s.paymentMethods.map((m) => m.label).join(", "),
+    ifoodLines.length
+      ? "Pagamentos disponíveis AGORA nesta entrega iFood (ofereça só estes, um por linha, exatamente assim):\n" + ifoodLines.join("\n")
+      : state?.delivery?.type === "delivery" && state.delivery.ifood
+        ? "Pagamentos nesta entrega iFood: nenhuma forma disponível agora; ofereça retirada na loja."
+        : "Pagamentos aceitos: " + s.paymentMethods.map((m) => m.label).join(", "),
     s.minimumOrderValue ? "Pedido mínimo (produtos): " + brl(s.minimumOrderValue) : "",
     s.preparationTime ? "Tempo de preparo: " + s.preparationTime.min + "-" + s.preparationTime.max + " min" : "",
     s.deliveryMode === "neighborhood"
@@ -269,13 +274,13 @@ function systemPrompt(state: ConversationState, catalog: Catalog, firstName: str
     "16. Pedido já feito (veja ESTADO ATUAL): nunca recoloque os itens dele no carrinho nem gere resumo com eles. Mudança de pagamento, endereço ou itens de um pedido já feito é tratada pela loja, não monte pedido novo para isso.",
     "17. Se o cliente disser só 'cartão' e a loja aceitar crédito e débito, pergunte se é crédito ou débito.",
     "18. Localização pelo mapa: agradeça e peça rua, número e bairro por escrito (a taxa é pelo bairro); em loja com entrega iFood, mande o link de endereço (regra 19).",
-    "19. Loja com entrega pelo iFood: para entrega, chame definir_entrega (tipo 'entrega') e mande o link que ela devolver, explicando que é só para preencher o endereço e ver a taxa. Não peça rua/número/bairro por mensagem. Na entrega iFood o entregador não recebe Pix; se for cartão na entrega, pergunte a bandeira e passe em definir_pagamento (bandeira).",
+    "19. Loja com entrega pelo iFood: para entrega, chame definir_entrega (tipo 'entrega') e mande o link que ela devolver, explicando que é só para preencher o endereço e ver a taxa. Não peça rua/número/bairro por mensagem. Na entrega iFood o entregador não recebe Pix; se for cartão na entrega, pergunte a bandeira e passe em definir_pagamento (bandeira). Formas de pagamento: ofereça só as da lista 'Pagamentos disponíveis AGORA', uma por linha começando com •, nunca as outras.",
     state.addToPlaced
       ? "\nMODO ADICIONAR AO PEDIDO JÁ FEITO" + (state.addToPlaced.orderNumber ? " Nº " + state.addToPlaced.orderNumber : "") +
         ": o cliente quer ACRESCENTAR itens ao pedido que já fez. Mostre as opções reais (buscar_cardapio) e, quando ele escolher, chame adicionar_ao_pedido_feito. NÃO use adicionar_item nem gerar_resumo e não pergunte endereço. Se ele disser que quer um pedido novo, chame sair_modo_adicionar."
       : "",
     "",
-    "LOJA:\n" + storeBlock(catalog),
+    "LOJA:\n" + storeBlock(catalog, state),
     "",
     "CARDÁPIO (preços reais):\n" + menuBlock(catalog),
     "",
@@ -419,7 +424,7 @@ type LinkAddress = { streetName: string; streetNumber: string; neighborhood: str
 
 /** O cliente confirmou o endereço no link: grava a entrega com a cotação iFood e devolve o texto para continuar a conversa. */
 export async function applyAddressFromLink(id: string, body: any):
-  Promise<{ ok: true; sessionId: string; customerJid: string; phone: string; text: string } | { ok: false; status: number; error: string }> {
+  Promise<{ ok: true; sessionId: string; customerJid: string; phone: string; text: string; reply?: string } | { ok: false; status: number; error: string }> {
   const link = addressLinks.get(id);
   if (!link || Date.now() - link.at > LINK_TTL_MS) return { ok: false, status: 404, error: "Este link expirou. Peça um novo no WhatsApp." };
   const quote = body?.quote, a: LinkAddress = body?.address || {};
@@ -444,7 +449,8 @@ export async function applyAddressFromLink(id: string, body: any):
   state.awaitingConfirm = false;
   addressLinks.delete(id);
   // Pagamento escolhido antes do endereço: confere com o que o entregador aceita aqui.
-  if (state.payment && !state.payment.startsWith("online_") && checkIfoodPayment(state, state.payment, state.ifoodPayment?.brand)) {
+  const catalog = session.catalog || null;
+  if (state.payment && !state.payment.startsWith("online_") && checkIfoodPayment(state, state.payment, state.ifoodPayment?.brand, catalog)) {
     state.payment = "";
     state.ifoodPayment = null;
   }
@@ -454,6 +460,18 @@ export async function applyAddressFromLink(id: string, body: any):
   const text = "[Endereço confirmado pelo cliente no link: " + where + ". Taxa de entrega iFood: " + brl(fee) +
     ". O entregador aceita na entrega: " + (ifoodPaymentsText(payments) || "nenhuma forma (só pagamento online)") +
     ". Avise que o endereço chegou com a taxa e continue o pedido: se faltar algo, pergunte; se estiver tudo certo, gere o resumo.]";
+  // Sem pagamento ainda: a resposta sai pronta do código, só com as formas disponíveis agora.
+  if (!state.payment) {
+    const lines = ifoodPaymentLines(state, catalog);
+    const reply = "✅ Endereço confirmado!\n📍 " + where + (state.delivery.complement ? " (" + state.delivery.complement + ")" : "") +
+      "\n🛵 Taxa de entrega (iFood): " + brl(fee) + "\n\n" +
+      (lines.length ? "Como prefere pagar? Formas disponíveis agora:\n" + lines.join("\n")
+        : "No momento o entregador do iFood não está aceitando pagamento na entrega para este endereço 😕 Se preferir, pode retirar na loja.");
+    pushHistory(state, "user", "(confirmei o endereço pelo link)");
+    pushHistory(state, "model", reply);
+    void persist(link.sessionId);
+    return { ok: true, sessionId: link.sessionId, customerJid: link.customerJid, phone: link.phone, text, reply };
+  }
   return { ok: true, sessionId: link.sessionId, customerJid: link.customerJid, phone: link.phone, text };
 }
 

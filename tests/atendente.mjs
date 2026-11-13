@@ -660,9 +660,14 @@ test("entrega iFood: manda link de endereço, recebe a cotação, pede bandeira 
   assert.equal(ok.ok, true);
   assert.match(ok.text, /R\$ 7,50/);
   assert.equal(getAddressLink(id), null);
-  world.script.push([call("definir_pagamento", { forma: "pix" })], [say("Na entrega iFood não tem Pix. Cartão ou dinheiro?")]);
-  await c.send(ok.text);
+  assert.match(ok.reply, /Taxa de entrega \(iFood\): R\$ 7,50/);
+  assert.match(ok.reply, /\n• Dinheiro\n• Crédito Visa$/);
+  assert.doesNotMatch(ok.reply, /Pix|Débito/);
+  world.script.push([call("definir_pagamento", { forma: "pix" })], [say("Na entrega iFood não tem Pix.")]);
+  await c.send("pix");
   assert.equal(lastFunctionResponses()[0].response.erro, "pix_na_entrega_indisponivel");
+  assert.match(lastFunctionResponses()[0].response.dica, /• Dinheiro\n• Crédito Visa/);
+  assert.match(world.geminiBodies.at(-1).system_instruction.parts[0].text, /AGORA nesta entrega iFood[^\n]*\n• Dinheiro\n• Crédito Visa/);
   world.script.push([call("definir_pagamento", { forma: "credito" })], [say("Qual a bandeira?")]);
   await c.send("crédito");
   assert.equal(lastFunctionResponses()[0].response.erro, "informe_bandeira");

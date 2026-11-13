@@ -726,6 +726,10 @@ app.post("/atendente/endereco/:id", authMiddleware, async (req, res) => {
   res.json({ ok: true });
   if (!sock) return;
   const jid = applied.customerJid;
+  if (applied.reply) {
+    void sock.sendMessage(jid, { text: applied.reply }).catch((error: any) => logger.warn({ sessionId: applied.sessionId, error: error?.message || error }, "[Atendente] Falha ao enviar confirmação do endereço"));
+    return;
+  }
   void handleAtendenteMessage({
     sessionId: applied.sessionId, customerJid: jid, text: applied.text,
     customerPhone: applied.phone || null, customerName: null,
