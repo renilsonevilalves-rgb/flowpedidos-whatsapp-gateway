@@ -66,3 +66,26 @@ export function levenshtein(a: string, b: string, max = 3): number {
   }
   return prev[b.length];
 }
+
+/** Verbo de acrescentar: "adicionar", "coloca", "inclui", "mais uma", "esqueci"... */
+export function wantsToAdd(text: string): boolean {
+  return /\b(adicion\w*|acrescent\w*|coloc\w*|inclu\w*|bota|botar|boto|poe|por tambem|junta\w*|mais um|mais uma|esqueci\w*|faltou)\b/.test(norm(text));
+}
+
+/** Fala explicitamente de um pedido JÁ FEITO ("no pedido que acabei de fazer", "no meu pedido", "pedido 2473"). */
+export function refersToPlacedOrder(text: string): boolean {
+  const t = norm(text);
+  return /(pedido (?:que |q )?(?:eu )?(?:acabei|fiz|mandei|pedi|enviei|ja fiz)|acabei de (?:fazer|pedir|mandar)|pedido anterior|pedido (?:ja )?(?:feito|enviado|confirmado)|ultimo pedido|\b(?:no|ao|nesse|neste|naquele|junto (?:com|ao|do)) (?:meu |mesmo |ultimo |outro )?pedido\b(?! novo)|meu pedido|pedido\s*(?:#|n[°º.o]?\.?|numero)?\s*\d{3,}|#\d{3,})/.test(t);
+}
+
+export function wantsToCancel(text: string): boolean {
+  return /\b(cancel\w*|desist\w*|nao quero mais|esquece (?:o|esse) pedido)\b/.test(norm(text));
+}
+
+/** Resposta à pergunta "este carrinho ou o pedido Nº X?": "draft" | "placed" | "". */
+export function choiceAnswer(text: string): "draft" | "placed" | "" {
+  const t = norm(text).replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  if (/\b(novo|nova|carrinho|rascunho|resumo|este|esse|essa|esta|agora|atual|montando|1)\b/.test(t) && !/\b(feito|anterior|acabei|fiz|mandei|enviado|ja)\b/.test(t)) return "draft";
+  if (/\b(feito|anterior|acabei|fiz|mandei|enviado|ja|outro|aquele|antigo|primeiro|2|pedido)\b/.test(t) || /\d{3,}/.test(t)) return "placed";
+  return "";
+}

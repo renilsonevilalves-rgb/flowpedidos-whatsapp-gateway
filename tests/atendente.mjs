@@ -14,7 +14,7 @@ process.env.GEMINI_FALLBACK_MODEL = "";
 process.env.ATENDENTE_DEBOUNCE_MS = "0";
 process.env.ATENDENTE_STATE_DIR = tmpdir() + "/atendente-test-" + process.pid;
 
-const { handleAtendenteMessage } = await import("../dist/atendente/engine.js");
+const { handleAtendenteMessage, noteOrderContext } = await import("../dist/atendente/engine.js");
 const { resetStateForTests } = await import("../dist/atendente/state.js");
 const { searchProducts, resolveProduct, resolveOption } = await import("../dist/atendente/catalog.js");
 const { isPureYes } = await import("../dist/atendente/text.js");
@@ -410,4 +410,106 @@ test("valores totais escritos pela IA são removidos (só o resumo oficial mostr
   const r = await c.send("um x salada");
   assert.doesNotMatch(r.last, /Total: R\$ 10/);
   assert.match(r.last, /entrega ou retirada/);
+});
+
+// =========================================================================
+// Pedido já feito: adicionar nele, mover item do carrinho, cancelar qual e atendente indevido.
+const jidOf = (phone) => phone + "@s.whatsapp.net";
+
+test("acompanhar pedido e depois 'adicionar bebida': escolhe pelo cardápio e vai para o pedido Nº 2473 (não cria pedido novo)", async () => {
+  resetWorld();
+  const c = customer("5531990000101");
+  await noteOrderContext(SID, jidOf("5531990000101"), "2473");
+  world.script.push([call("buscar_cardapio", { termo: "bebida" })], [say("Temos Coca cola 2L (R$ 17,99) e Coca cola 350ml (R$ 6,00). Qual você prefere?")]);
+  let r = await c.send("Quero adicionar alguma bebida para pagar no Pix, qual tem ?");
+  assert.equal(r.handled, true);
+  assert.match(r.last, /Coca cola 350ml/);
+  world.script.push([call("adicionar_item", { produto: "c-350" })]);
+  r = await c.send("Coca lata");
+  assert.equal(typeof r.handled, "string", "vai para o fluxo de pedido já feito");
+  assert.match(r.handled, /adicionar no meu pedido Nº 2473: 1x Coca cola 350ml/);
+  assert.match(r.handled, /Pix/);
+  assert.equal(world.previews.length, 0, "não montou resumo de pedido novo");
+  assert.equal(world.commits.length, 0);
+  // Depois disso, um pedido novo volta ao normal.
+  world.script.push([call("adicionar_item", { produto: "x-sal" })], [say("Anotado: 1 X- Salada!")]);
+  r = await c.send("agora quero fazer outro pedido, um x salada");
+  assert.equal(r.handled, true);
+});
+
+test("'quero adicionar ela no pedido que acabei de fazer' move o item do carrinho, sem duplicar", async () => {
+  resetWorld();
+  const c = customer("5531990000102");
+  await noteOrderContext(SID, jidOf("5531990000102"), "2473");
+  world.script.push([call("sair_modo_adicionar"), call("adicionar_item", { produto: "c-350" })], [say("Anotado: 1 Coca cola 350ml.")]);
+  await c.send("quero fazer um pedido novo de uma coca lata");
+  const calls = world.geminiCalls;
+  const r = await c.send("Na verdade eu quero adicionar ela no pedido que acabei de fazer");
+  assert.equal(world.geminiCalls, calls, "decidido sem IA");
+  assert.equal(typeof r.handled, "string");
+  assert.match(r.handled, /Nº 2473: 1x Coca cola 350ml\./);
+  assert.doesNotMatch(r.handled, /2x/);
+  // Carrinho foi esvaziado: "sim" não grava nada.
+  await c.send("sim");
+  assert.equal(world.commits.length, 0);
+});
+
+test("'quero cancelar o pedido' com carrinho aberto e pedido recente pergunta qual", async () => {
+  resetWorld();
+  const c = customer("5531990000103");
+  await noteOrderContext(SID, jidOf("5531990000103"), "2473");
+  world.script.push([call("sair_modo_adicionar"), call("adicionar_item", { produto: "c-2l" })], [say("Anotado!")]);
+  await c.send("quero um pedido novo, uma coca 2l");
+  let r = await c.send("Quero cancelar o pedido");
+  assert.equal(r.handled, true);
+  assert.match(r.last, /este pedido que estamos montando/);
+  assert.match(r.last, /pedido Nº 2473/);
+  assert.equal(c.paused(), 0, "não chama atendente");
+  r = await c.send("o pedido 2473");
+  assert.equal(r.handled, "Quero cancelar o meu pedido Nº 2473");
+
+  const d = customer("5531990000104");
+  await noteOrderContext(SID, jidOf("5531990000104"), "2473");
+  world.script.push([call("sair_modo_adicionar"), call("adicionar_item", { produto: "c-2l" })], [say("Anotado!")]);
+  await d.send("quero um pedido novo, uma coca 2l");
+  await d.send("quero cancelar");
+  r = await d.send("esse carrinho");
+  assert.match(r.last, /cancelei o pedido que estávamos montando/);
+  assert.match(r.last, /2473 continua normal/);
+  await d.send("sim");
+  assert.equal(world.commits.length, 0);
+});
+
+test("cancelar sem pedido recente: limpa o carrinho na hora, sem IA e sem atendente", async () => {
+  resetWorld();
+  const c = customer("5531990000105");
+  world.script.push([call("adicionar_item", { produto: "x-sal" })], [say("Anotado!")]);
+  await c.send("um x salada");
+  const calls = world.geminiCalls;
+  const r = await c.send("quero cancelar o pedido");
+  assert.equal(world.geminiCalls, calls);
+  assert.match(r.last, /cancelei o pedido que estávamos montando/);
+  assert.equal(c.paused(), 0);
+});
+
+test("IA chamando atendente sem o cliente pedir é ignorada", async () => {
+  resetWorld();
+  const c = customer("5531990000106");
+  world.script.push([call("chamar_atendente")]);
+  const r = await c.send("hmm deixa eu pensar");
+  assert.equal(c.paused(), 0);
+  assert.match(r.last, /atendente/);
+});
+
+test("'adicionar' sem contexto recente mas com pedido feito há pouco: pergunta se é no pedido ou pedido novo", async () => {
+  resetWorld();
+  world.customer = { ...CUSTOMER, lastOrderAt: new Date(Date.now() - 40 * 60_000).toISOString() };
+  const c = customer("5531990000107");
+  let r = await c.send("quero adicionar uma coca 2l");
+  assert.match(r.last, /pedido que você já fez\* ou fazer um \*pedido novo/);
+  world.script.push([call("adicionar_item", { produto: "c-2l" })], [say("Anotado: 1 Coca cola 2L!")]);
+  r = await c.send("pedido novo");
+  assert.equal(r.handled, true);
+  assert.match(r.last, /Coca cola 2L/);
+  world.customer = CUSTOMER;
 });

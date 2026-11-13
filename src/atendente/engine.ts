@@ -8,8 +8,10 @@ import {
   addItem, changeItem, commitOrder, describeCart, makeSummary, missingForSummary, PAYMENT_NAMES,
   removeItem, setDelivery, setName, setPayment, summaryIsCurrent, type ToolOutcome,
 } from "./order.js";
-import { freshState, getSession, persist, type ConversationState, type Session } from "./state.js";
-import { aboutPlacedOrder, brl, clean, isOnlyGreeting, isPureYes, norm, wantsHuman } from "./text.js";
+import { freshState, getSession, persist, type CartItem, type ConversationState, type Session } from "./state.js";
+import {
+  aboutPlacedOrder, brl, choiceAnswer, clean, isOnlyGreeting, isPureYes, norm, refersToPlacedOrder, wantsHuman, wantsToAdd, wantsToCancel,
+} from "./text.js";
 
 export type AtendenteParams = {
   sessionId: string;
@@ -84,15 +86,33 @@ const TOOLS = [
     parameters: { type: "OBJECT", properties: { nome: S("nome do cliente") }, required: ["nome"] } },
   { name: "gerar_resumo", description: "Calcula os valores oficiais (subtotal, taxa, total) e envia o resumo ao cliente pedindo confirmação. Chame quando itens, entrega/endereço, pagamento e nome estiverem definidos, e de novo sempre que algo mudar depois de um resumo.",
     parameters: { type: "OBJECT", properties: {} } },
+  { name: "adicionar_ao_pedido_feito", description: "SÓ no modo ADICIONAR AO PEDIDO JÁ FEITO: envia para a loja o item escolhido para ser acrescentado ao pedido que o cliente já fez.",
+    parameters: { type: "OBJECT", properties: {
+      produto: S("id do produto (de buscar_cardapio) ou o nome"),
+      quantidade: { type: "INTEGER", description: "padrão 1" },
+      opcoes: { type: "ARRAY", items: { type: "STRING" }, description: "opções escolhidas" },
+      observacao: S("observação simples"),
+    }, required: ["produto"] } },
+  { name: "sair_modo_adicionar", description: "O cliente desistiu de acrescentar ao pedido já feito e quer fazer um pedido NOVO.", parameters: { type: "OBJECT", properties: {} } },
   { name: "cancelar_rascunho", description: "Descarta o pedido em montagem quando o cliente desistir.", parameters: { type: "OBJECT", properties: {} } },
   { name: "chamar_atendente", description: "Pausa o robô e chama uma pessoa da loja para este cliente.", parameters: { type: "OBJECT", properties: {} } },
 ];
 
-type TurnFlags = { summary?: string; handoff?: boolean };
+type TurnFlags = { summary?: string; handoff?: boolean; reroute?: string };
 
 async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state: ConversationState; catalog: Catalog; flags: TurnFlags }): Promise<ToolOutcome> {
   const { p, state, catalog } = ctx;
+  if (state.addToPlaced && name === "adicionar_item") name = "adicionar_ao_pedido_feito";
   switch (name) {
+    case "adicionar_ao_pedido_feito": {
+      if (!state.addToPlaced) return { erro: "use adicionar_item: o cliente está montando um pedido novo" };
+      const temp = freshState();
+      const result = addItem(temp, catalog, args);
+      if ("erro" in result) return result;
+      ctx.flags.reroute = addToPlacedText(state.addToPlaced.orderNumber, temp.items.map(describeItemPlain), state.addToPlaced.payment);
+      return { ok: true, enviado: "Pedido de alteração enviado para a loja." };
+    }
+    case "sair_modo_adicionar": state.addToPlaced = null; return { ok: true, modo: "pedido novo" };
     case "buscar_cardapio": {
       const term = clean(args?.termo, 120);
       const found = searchProducts(catalog, term, 8);
@@ -113,7 +133,7 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
       return result;
     }
     case "cancelar_rascunho": {
-      Object.assign(state, freshState(), { name: state.name, lastPlaced: state.lastPlaced, history: state.history, greetedAt: state.greetedAt });
+      clearDraft(state);
       return { ok: true, carrinho: [] };
     }
     case "chamar_atendente": ctx.flags.handoff = true; return { ok: true };
@@ -185,6 +205,12 @@ function systemPrompt(state: ConversationState, catalog: Catalog, firstName: str
     "10. Perguntas sobre horário, taxa, pagamento, pedido mínimo: responda com os dados da LOJA abaixo. Quem quiser ver o cardápio: mande o link exato.",
     "11. Cliente pediu atendente/pessoa: chame chamar_atendente. Desistiu do pedido: chame cancelar_rascunho.",
     "12. Mensagem confusa: interprete com bom senso (erros de digitação são normais); se continuar sem entender, pergunte de forma simples.",
+    "13. 'ela', 'ele', 'isso', 'esse', 'essa' se referem ao item já citado. Uma correção do cliente ('na verdade...', 'não, é...') NUNCA vira item novo; só aumente a quantidade quando ele pedir claramente mais unidades.",
+    "14. Nunca chame chamar_atendente sem o cliente pedir para falar com uma pessoa.",
+    state.addToPlaced
+      ? "\nMODO ADICIONAR AO PEDIDO JÁ FEITO" + (state.addToPlaced.orderNumber ? " Nº " + state.addToPlaced.orderNumber : "") +
+        ": o cliente quer ACRESCENTAR itens ao pedido que já fez. Mostre as opções reais (buscar_cardapio) e, quando ele escolher, chame adicionar_ao_pedido_feito. NÃO use adicionar_item nem gerar_resumo e não pergunte endereço. Se ele disser que quer um pedido novo, chame sair_modo_adicionar."
+      : "",
     "",
     "LOJA:\n" + storeBlock(catalog),
     "",
@@ -230,7 +256,128 @@ const pushHistory = (state: ConversationState, role: "user" | "model", text: str
 };
 
 // ---------------------------------------------------------------------------
-async function processTurn(p: AtendenteParams, session: Session, text: string): Promise<void> {
+// Pedido já feito: contexto, "adicionar nele" e "cancelar qual?"
+const CONTEXT_FRESH_MS = 30 * 60_000;
+const RECENT_ORDER_MS = 3 * 3600_000;
+
+function describeItemPlain(item: CartItem): string {
+  const opts = item.options.map((o) => (o.quantity > 1 ? o.quantity + "x " : "") + o.name).join(", ");
+  return item.quantity + "x " + item.name + (opts ? " (" + opts + ")" : "") + (item.notes ? " - obs: " + item.notes : "");
+}
+
+function paymentHint(text: string): string {
+  const t = norm(text);
+  if (/\bpix\b/.test(t)) return "Pix";
+  if (/\bdebito\b/.test(t)) return "cartão de débito";
+  if (/\bcredito\b/.test(t)) return "cartão de crédito";
+  if (/\b(dinheiro|especie)\b/.test(t)) return "dinheiro";
+  return "";
+}
+
+function addToPlacedText(orderNumber: string, items: string[], payment = ""): string {
+  return "Quero adicionar no meu pedido" + (orderNumber ? " Nº " + orderNumber : " que acabei de fazer") + ": " + items.join("; ") +
+    (payment ? ". Vou pagar o adicional no " + payment : "") + ".";
+}
+
+/** Número do pedido já feito de que se falou há pouco ("" = existe, número desconhecido; null = nenhum). */
+function recentPlacedOrder(state: ConversationState, catalog: Catalog | null): string | null {
+  const now = Date.now();
+  if (state.placedContext && now - state.placedContext.at < RECENT_ORDER_MS) return state.placedContext.orderNumber;
+  if (state.lastPlaced && now - state.lastPlaced.at < RECENT_ORDER_MS) return state.lastPlaced.orderNumber;
+  const last = Date.parse(String(catalog?.customer?.lastOrderAt || ""));
+  if (Number.isFinite(last) && now - last < RECENT_ORDER_MS) return "";
+  return null;
+}
+
+function contextIsFresh(state: ConversationState): boolean {
+  const now = Date.now();
+  return Boolean((state.placedContext && now - state.placedContext.at < CONTEXT_FRESH_MS) ||
+    (state.lastPlaced && now - state.lastPlaced.at < CONTEXT_FRESH_MS));
+}
+
+const orderLabel = (n: string) => "pedido" + (n ? " Nº " + n : " que você já fez");
+const numberIn = (text: string) => (norm(text).match(/\b(\d{3,})\b/) || [])[1] || "";
+
+function clearDraft(state: ConversationState) {
+  Object.assign(state, freshState(), {
+    name: state.name, lastPlaced: state.lastPlaced, history: state.history, greetedAt: state.greetedAt, placedContext: state.placedContext,
+  });
+}
+
+/** Registra que a conversa tratou de um pedido já feito (ex.: "acompanhar pedido"). */
+export async function noteOrderContext(sessionId: string, customerJid: string, orderNumber: string) {
+  if (!isAtendenteTenant(sessionId)) return;
+  const session = await getSession(sessionId, customerJid);
+  session.state.placedContext = { orderNumber: clean(orderNumber, 30), at: Date.now() };
+  session.state.updatedAt = Date.now();
+  await persist(sessionId);
+}
+
+/** Decisões sobre pedido já feito antes da IA. Retorna texto para o fluxo de pedidos feitos, true se respondeu, false se segue. */
+async function placedOrderRouting(state: ConversationState, catalog: Catalog, text: string, reply: (m: string) => Promise<void>): Promise<string | boolean> {
+  const recent = recentPlacedOrder(state, catalog);
+  const explicit = refersToPlacedOrder(text);
+
+  // Resposta a "este carrinho ou o pedido Nº X?"
+  const pending = state.pendingChoice;
+  if (pending) {
+    state.pendingChoice = null;
+    if (Date.now() - pending.at < 10 * 60_000) {
+      const answer = choiceAnswer(text);
+      if (pending.kind === "cancel" && answer === "draft") {
+        clearDraft(state);
+        await reply("Pronto, cancelei o pedido que estávamos montando 👍" + (pending.orderNumber ? " O pedido Nº " + pending.orderNumber + " continua normal." : ""));
+        return true;
+      }
+      if (pending.kind === "cancel" && answer === "placed") {
+        return "Quero cancelar o meu pedido" + (pending.orderNumber ? " Nº " + pending.orderNumber : "");
+      }
+      if (pending.kind === "add" && answer === "placed") {
+        state.addToPlaced = { orderNumber: pending.orderNumber, at: Date.now(), payment: paymentHint(pending.text) };
+        return "use:" + pending.text;
+      }
+      if (pending.kind === "add" && answer === "draft") return "use:" + pending.text;
+    }
+  }
+
+  // Item do carrinho que deve ir para o pedido já feito ("quero adicionar ela no pedido que acabei de fazer").
+  if (state.items.length && explicit && (wantsToAdd(text) || /\b(ela|ele|isso|essa|esse|tambem|junto)\b/.test(norm(text)))) {
+    const orderNumber = numberIn(text) || recent || "";
+    const items = state.items.map(describeItemPlain);
+    const payment = paymentHint(text) || paymentHint(state.history.filter((t) => t.role === "user").slice(-4).map((t) => t.text).join(" "));
+    clearDraft(state);
+    state.placedContext = { orderNumber, at: Date.now() };
+    return addToPlacedText(orderNumber, items, payment);
+  }
+
+  // Cancelar: carrinho atual, pedido já feito ou perguntar qual.
+  if (wantsToCancel(text) && !wantsToAdd(text)) {
+    if (!state.items.length) return recent !== null || explicit ? text : false;
+    if (explicit) return text;
+    if (recent !== null) {
+      state.pendingChoice = { kind: "cancel", text, orderNumber: recent, at: Date.now() };
+      await reply("Quer cancelar *este pedido que estamos montando* (" + state.items.map(describeItemPlain).join(", ") + ") ou o *" + orderLabel(recent) + "*?");
+      return true;
+    }
+    clearDraft(state);
+    await reply("Pronto, cancelei o pedido que estávamos montando 👍 Se quiser começar de novo, é só me dizer.");
+    return true;
+  }
+
+  // "Quero adicionar..." sem carrinho e com pedido recente: é para o pedido já feito?
+  if (!state.items.length && !state.addToPlaced && wantsToAdd(text) && recent !== null) {
+    if (explicit || contextIsFresh(state)) {
+      state.addToPlaced = { orderNumber: numberIn(text) || recent, at: Date.now(), payment: paymentHint(text) };
+      return false;
+    }
+    state.pendingChoice = { kind: "add", text, orderNumber: recent, at: Date.now() };
+    await reply("Você quer adicionar no *" + orderLabel(recent) + "* ou fazer um *pedido novo*?");
+    return true;
+  }
+  return false;
+}
+
+async function processTurn(p: AtendenteParams, session: Session, text: string): Promise<string | void> {
   const state = session.state;
   state.updatedAt = Date.now();
   const catalog = await ensureCatalog(session, p);
@@ -248,6 +395,15 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
     await p.pauseForHuman();
     await reply("Certo! Já chamei alguém da loja para falar com você. Aguarde só um pouquinho 🙏" + (state.items.length ? "\nSeu pedido em montagem fica guardado." : ""));
     return;
+  }
+
+  // 1b) Pedido já feito: adicionar nele, cancelar qual, mover item do carrinho.
+  if (state.addToPlaced && Date.now() - state.addToPlaced.at > CONTEXT_FRESH_MS) state.addToPlaced = null;
+  const routed = await placedOrderRouting(state, catalog, text, reply);
+  if (routed === true) return;
+  if (typeof routed === "string") {
+    if (!routed.startsWith("use:")) { state.placedContext = { orderNumber: state.placedContext?.orderNumber || "", at: Date.now() }; return routed; }
+    text = routed.slice(4);
   }
 
   // 2) "sim" para o resumo: decisão do código, nunca da IA.
@@ -307,7 +463,7 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
         p.logger.info({ sessionId: p.sessionId, tool: call.name, ok: !("erro" in result) }, "[Atendente] Ferramenta");
         responses.push({ functionResponse: { name: call.name, response: result } });
       }
-      if (flags.summary || flags.handoff) { answer = texts; break; }
+      if (flags.summary || flags.handoff || flags.reroute) { answer = texts; break; }
       contents.push({ role: "user", parts: responses });
     }
   } catch (error: any) {
@@ -318,6 +474,14 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
     return;
   }
 
+  if (flags.reroute) {
+    state.addToPlaced = null;
+    return flags.reroute;
+  }
+  if (flags.handoff && !wantsHuman(text) && !/\b(pessoa|alguem|humano|dono|dona|gerente|reclam\w*|falar com)\b/.test(norm(text))) {
+    flags.handoff = false;
+    if (!answer.trim()) answer = "Me conta o que você precisa que eu resolvo por aqui 😊 Se preferir falar com alguém da loja, é só escrever *atendente*.";
+  }
   if (flags.handoff) {
     await p.pauseForHuman();
     await reply("Certo! Já chamei alguém da loja para falar com você. Aguarde só um pouquinho 🙏");
@@ -337,24 +501,30 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
 
 // ---------------------------------------------------------------------------
 // Fila por cliente: mensagens seguidas são juntadas (ritmo humano, menos respostas).
-type Pending = { texts: string[]; timer?: ReturnType<typeof setTimeout>; done: Promise<void>; resolve: () => void; params: AtendenteParams };
+type Pending = { texts: string[]; timer?: ReturnType<typeof setTimeout>; done: Promise<void>; resolve: () => void; params: AtendenteParams; reroute?: string };
 const pending = new Map<string, Pending>();
 const chains = new Map<string, Promise<void>>();
 
 function editsPlacedOrder(text: string) {
-  return /\b(adiciona|acrescenta|coloca|inclui|esqueci|faltou|tira|retira|remove|troca|trocar|muda|mudar)\b/.test(norm(text));
+  return /\b(tira\w*|retir\w*|remov\w*|troc\w*|mud\w*|alter\w*)\b/.test(norm(text));
 }
 
-/** true = o atendente novo cuidou da mensagem; false = segue o fluxo atual. */
-export async function handleAtendenteMessage(p: AtendenteParams): Promise<boolean> {
+/** true = o atendente novo cuidou; false = segue o fluxo atual; texto = segue o fluxo atual com este texto. */
+export async function handleAtendenteMessage(p: AtendenteParams): Promise<boolean | string> {
   if (!isAtendenteTenant(p.sessionId) || !backendConfigured() || !p.customerPhone || !p.text.trim()) return false;
   if (p.legacyBusy) return false;
   const key = p.sessionId + "|" + p.customerJid;
   const session = await getSession(p.sessionId, p.customerJid);
   const state = session.state;
   // Pedido já feito (acompanhar, alterar, cancelar): atendimento atual de pedidos.
-  if (!state.items.length && aboutPlacedOrder(p.text)) return false;
-  if (!state.items.length && state.lastPlaced && Date.now() - state.lastPlaced.at < 2 * 3600_000 && editsPlacedOrder(p.text)) return false;
+  const markPlaced = () => {
+    state.placedContext = { orderNumber: numberIn(p.text) || state.placedContext?.orderNumber || state.lastPlaced?.orderNumber || "", at: Date.now() };
+    state.updatedAt = Date.now();
+    void persist(p.sessionId);
+  };
+  if (!state.items.length && !state.pendingChoice && aboutPlacedOrder(p.text) && !wantsToAdd(p.text)) { markPlaced(); return false; }
+  if (!state.items.length && !state.pendingChoice && recentPlacedOrder(state, session.catalog || null) !== null &&
+    editsPlacedOrder(p.text) && !wantsToAdd(p.text)) { markPlaced(); return false; }
   // Sem cardápio (loja não liberada na Vercel ou fora do ar e sem cache): fluxo atual.
   if (!(await ensureCatalog(session, p))) return false;
 
@@ -373,7 +543,8 @@ export async function handleAtendenteMessage(p: AtendenteParams): Promise<boolea
     pending.delete(key);
     const run = (chains.get(key) || Promise.resolve()).then(async () => {
       try {
-        await processTurn(current.params, session, current.texts.join("\n"));
+        const reroute = await processTurn(current.params, session, current.texts.join("\n"));
+        if (reroute) current.reroute = reroute;
       } catch (error: any) {
         current.params.logger.warn({ sessionId: p.sessionId, error: error?.message }, "[Atendente] Falha inesperada");
         await current.params.sendMessage(fallbackText(session.catalog || null, session.state.items.length > 0)).catch(() => undefined);
@@ -385,5 +556,7 @@ export async function handleAtendenteMessage(p: AtendenteParams): Promise<boolea
     void run.finally(() => { if (chains.get(key) === run) chains.delete(key); current.resolve(); });
   }, DEBOUNCE_MS);
   await current.done;
+  // Só a última mensagem juntada leva o texto para o fluxo de pedidos já feitos.
+  if (current.reroute) return current.params === p ? current.reroute : true;
   return true;
 }

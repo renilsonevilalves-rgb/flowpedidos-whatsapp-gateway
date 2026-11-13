@@ -11,7 +11,7 @@ import { flushAiEvents, logAiEvent, phoneForJid, rememberCustomerPhone, takeTool
 import { usesCentralAgent } from "./chatOrder.js";
 import { applyPeriodGreeting, isGreetingMessage, periodGreeting } from "./greeting.js";
 import { showTypingThenWait } from "./naturalPacing.js";
-import { handleAtendenteMessage, isAtendenteTenant } from "./atendente/engine.js";
+import { handleAtendenteMessage, isAtendenteTenant, noteOrderContext } from "./atendente/engine.js";
 import * as legacyOrderAi from "./aiAssistant.js";
 import * as legacyOrderAiV2 from "./aiAssistantV2.js";
 import { join } from "node:path";
@@ -442,6 +442,7 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
           const customerPhone = customerJid.split("@")[0].split(":")[0];
           const result = await fetchOrderStatus(id, customerPhone);
           await sock.sendMessage(customerJid, { text: result.message });
+          if (isAtendenteTenant(id)) void noteOrderContext(id, customerJid, String(result.orderNumber || "")).catch(() => undefined);
           logger.info({ sessionId: id, remoteJid: customerJid, orderId: result.orderId }, "[Order-Tracking] Status enviado com sucesso");
         } catch (error: any) {
           logger.error({ error: error?.message || error, sessionId: id, remoteJid }, "[Order-Tracking] Falha ao consultar/enviar status");
@@ -472,7 +473,9 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
           logger.warn({ sessionId: id, error: error?.message || error }, "[Atendente] Falha; seguindo fluxo atual");
           return false;
         });
-        if (atendenteHandled) continue;
+        if (atendenteHandled === true) continue;
+        // Assunto de pedido já feito: segue o fluxo atual com o texto preparado pelo atendente.
+        if (typeof atendenteHandled === "string" && atendenteHandled) text = atendenteHandled;
       }
 
       const isTrigger = isAutoReplyTrigger(text);

@@ -31,6 +31,12 @@ export type ConversationState = {
   history: Turn[];
   updatedAt: number;
   greetedAt: number;
+  /** Último pedido JÁ FEITO de que se falou na conversa (acompanhar, alterar). */
+  placedContext: { orderNumber: string; at: number } | null;
+  /** Pergunta de desambiguação pendente ("este carrinho ou o pedido Nº X?"). */
+  pendingChoice: { kind: "cancel" | "add"; text: string; orderNumber: string; at: number } | null;
+  /** Cliente escolhendo itens para ADICIONAR a um pedido já feito. */
+  addToPlaced: { orderNumber: string; at: number; payment: string } | null;
 };
 
 export type Session = { state: ConversationState; catalog?: Catalog; catalogAt?: number };
@@ -44,6 +50,7 @@ export function freshState(): ConversationState {
   return {
     draftId: randomUUID(), items: [], name: "", delivery: null, payment: "", changeFor: null,
     summary: null, awaitingConfirm: false, committing: false, lastPlaced: null, history: [], updatedAt: Date.now(), greetedAt: 0,
+    placedContext: null, pendingChoice: null, addToPlaced: null,
   };
 }
 
@@ -74,7 +81,8 @@ export async function getSession(sessionId: string, customerKey: string): Promis
   let session = sessions.get(key);
   if (!session || Date.now() - session.state.updatedAt > TTL_MS) {
     const lastPlaced = session?.state.lastPlaced || null;
-    session = { state: { ...freshState(), lastPlaced } };
+    const placedContext = session?.state.placedContext || null;
+    session = { state: { ...freshState(), lastPlaced, placedContext } };
     sessions.set(key, session);
   }
   return session;
