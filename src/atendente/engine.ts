@@ -149,8 +149,8 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
     case "definir_entrega": {
       // Entrega iFood: o cliente preenche o endereço num link e a cotação oficial volta para cá.
       if (catalog.store.deliveryMode === "ifood" && !/retir|buscar|balcao|pickup/.test(norm(args?.tipo))) {
-        if (!state.items.length) {
-          return { erro: "sem_itens", dica: "Ainda não há itens no pedido: não mande link de endereço. Se o cliente só perguntou a taxa, diga que a entrega é pelo iFood, a taxa depende do endereço e aparece no cardápio ao finalizar o pedido, e mande o link do cardápio: " + catalog.menuUrl + ". Se quiser pedir por aqui, pergunte o que deseja." };
+        if (!state.items.length || (/\b(taxa|frete)\b/.test(norm(ctx.p.text)) && isOnlyQuestion(ctx.p.text))) {
+          return { erro: "sem_itens", dica: "Não mande link de endereço agora (pedido sem itens ou só uma pergunta). Se o cliente só perguntou a taxa, diga que a entrega é pelo iFood, a taxa depende do endereço e aparece no cardápio ao finalizar o pedido, e mande o link do cardápio: " + catalog.menuUrl + ". Se quiser pedir por aqui, pergunte o que deseja." };
         }
         if (state.delivery?.type === "delivery" && state.delivery.ifood && !ifoodQuoteExpired(state) && !args?.rua && !args?.trocar_endereco) {
           return { ok: true, entrega: state.delivery.address + ", " + state.delivery.number + " - " + state.delivery.neighborhood, taxa_ifood: state.delivery.ifood.fee };
@@ -580,18 +580,24 @@ async function placedOrderRouting(state: ConversationState, catalog: Catalog, te
 
 async function processTurn(p: AtendenteParams, session: Session, text: string): Promise<string | void> {
   const state = session.state;
+  const quietFor = Date.now() - (state.updatedAt || 0);
   state.updatedAt = Date.now();
+  // 1h+ parada: é uma conversa nova. Rascunho e contexto antigos não voltam (o cliente recomeça pelo cardápio).
+  const stale = quietFor > 60 * 60_000 && !state.committing;
+  if (stale) {
+    clearDraft(state);
+    state.history = [];
+    state.pendingChoice = null;
+  }
   const catalog = await ensureCatalog(session, p);
   const reply = async (message: string) => {
     pushHistory(state, "model", message);
     await p.sendMessage(message);
   };
   // Primeiro contato da conversa: o link do cardápio vai antes de qualquer resposta.
-  // Conta como nova conversa: nunca respondida, ou 30+ min parada com o carrinho vazio.
-  const quietFor = Date.now() - (session.lastTurnAt || 0);
-  const firstContact = !state.items.length && Date.now() - (state.greetedAt || 0) > 6 * 3600_000 &&
-    (!state.history.some((t) => t.role === "model") || quietFor > 30 * 60_000);
-  session.lastTurnAt = Date.now();
+  // Conta como nova conversa: nunca respondida ou parada há 1h+ (saudação não repetida em menos de 1h).
+  const firstContact = !state.items.length && Date.now() - (state.greetedAt || 0) > 60 * 60_000 &&
+    (stale || !state.history.some((t) => t.role === "model"));
   pushHistory(state, "user", text);
   if (!catalog) { await reply(fallbackText(null, state.items.length > 0)); return; }
   if (!state.name) {

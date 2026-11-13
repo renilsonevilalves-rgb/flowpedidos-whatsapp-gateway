@@ -15,7 +15,7 @@ process.env.ATENDENTE_DEBOUNCE_MS = "0";
 process.env.ATENDENTE_STATE_DIR = tmpdir() + "/atendente-test-" + process.pid;
 
 const { handleAtendenteMessage, noteOrderContext, noteOutboundOrderMessage, applyAddressFromLink, getAddressLink } = await import("../dist/atendente/engine.js");
-const { resetStateForTests } = await import("../dist/atendente/state.js");
+const { resetStateForTests, getSession } = await import("../dist/atendente/state.js");
 const { searchProducts, resolveProduct, resolveOption } = await import("../dist/atendente/catalog.js");
 const { isPureYes, wantsPaymentChange, isOrderNumberOnly } = await import("../dist/atendente/text.js");
 
@@ -699,7 +699,7 @@ test("primeiro contato com pergunta: cardápio primeiro; taxa iFood sem itens n�
   assert.equal(again.replies.length, 1, "a saudação não se repete");
 });
 
-test("conversa parada 30+ min volta com o cardápio; taxa iFood sem itens sempre leva o link do cardápio", async () => {
+test("taxa iFood sem itens sempre leva o link do cardápio", async () => {
   resetWorld();
   world.store = { ...STORE, deliveryMode: "ifood", deliveryFees: [] };
   const c = customer("5531990000099");
@@ -709,4 +709,35 @@ test("conversa parada 30+ min volta com o cardápio; taxa iFood sem itens sempre
   let r = await c.send("quanto custa a taxa de entrega?");
   assert.equal(r.replies.length, 1);
   assert.match(r.last, /👉 clickaipedidos\.com\.br\/click-testes$/);
+});
+
+test("conversa parada 1h+: recomeça com o cardápio, descarta o rascunho velho e não manda link de endereço para pergunta de taxa", async () => {
+  resetWorld();
+  world.store = { ...STORE, deliveryMode: "ifood", deliveryFees: [] };
+  const c = customer("5531990000111");
+  world.script.push([call("adicionar_item", { produto: "x salada" })], [say("Adicionei 1x X- Salada! Entrega ou retirada?")]);
+  await c.send("quero um x salada");
+  const session = await getSession(SID, "5531990000111@s.whatsapp.net");
+  assert.equal(session.state.items.length, 1);
+  session.state.updatedAt -= 2 * 3600_000;
+  session.state.greetedAt -= 2 * 3600_000;
+  world.script.push([call("definir_entrega", { tipo: "entrega" })], [say("A entrega é pelo iFood e a taxa depende do endereço.")]);
+  const r = await c.send("Boa noite quanto custa taxa de entrega?");
+  assert.equal(r.replies.length, 2);
+  assert.match(r.replies[0], /Seja bem-vindo/);
+  assert.equal(session.state.items.length, 0);
+  assert.equal(lastFunctionResponses()[0].response.erro, "sem_itens");
+  assert.doesNotMatch(r.replies.join("\n"), /\/e\//);
+});
+
+test("com itens, pergunta de taxa não vira link de endereço", async () => {
+  resetWorld();
+  world.store = { ...STORE, deliveryMode: "ifood", deliveryFees: [] };
+  const c = customer("5531990000122");
+  world.script.push([call("adicionar_item", { produto: "x salada" })], [say("Adicionei! Entrega ou retirada?")]);
+  await c.send("quero um x salada");
+  world.script.push([call("definir_entrega", { tipo: "entrega" })], [say("A taxa depende do endereço.")]);
+  const r = await c.send("quanto custa a taxa de entrega?");
+  assert.equal(lastFunctionResponses()[0].response.erro, "sem_itens");
+  assert.doesNotMatch(r.last, /\/e\//);
 });

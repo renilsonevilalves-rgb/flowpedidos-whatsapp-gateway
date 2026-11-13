@@ -51,7 +51,7 @@ export type ConversationState = {
   addressLinkId?: string | null;
 };
 
-export type Session = { state: ConversationState; catalog?: Catalog; catalogAt?: number; lastTurnAt?: number };
+export type Session = { state: ConversationState; catalog?: Catalog; catalogAt?: number };
 
 const TTL_MS = Number(process.env.ATENDENTE_STATE_TTL_MINUTES || 180) * 60_000;
 const sessions = new Map<string, Session>();
