@@ -10,7 +10,8 @@ import {
 } from "./order.js";
 import { freshState, getSession, persist, type CartItem, type ConversationState, type Session } from "./state.js";
 import {
-  aboutPlacedOrder, brl, choiceAnswer, clean, isOnlyGreeting, isPureYes, norm, refersToPlacedOrder, wantsHuman, wantsToAdd, wantsToCancel,
+  aboutPlacedOrder, brl, choiceAnswer, clean, isOnlyGreeting, isOrderNumberOnly, isPureYes, norm, refersToPlacedOrder, wantsHuman,
+  wantsPaymentChange, wantsToAdd, wantsToCancel,
 } from "./text.js";
 
 export type AtendenteParams = {
@@ -61,7 +62,7 @@ async function ensureCatalog(session: Session, p: AtendenteParams): Promise<Cata
 // Ferramentas do Gemini
 const S = (description: string) => ({ type: "STRING", description });
 const TOOLS = [
-  { name: "buscar_cardapio", description: "Busca produtos reais do cardápio (aceita erros de digitação e apelidos). Use antes de falar de qualquer produto, sabor, tamanho, borda, adicional ou preço.",
+  { name: "buscar_cardapio", description: "Busca produtos reais do cardápio com as opções de cada um (aceita erros de digitação e apelidos). Use quando precisar ver sabores/tamanhos/bordas/adicionais ou quando o produto não estiver claro no CARDÁPIO. Produto simples e claro: chame adicionar_item direto.",
     parameters: { type: "OBJECT", properties: { termo: S("o que o cliente pediu, ex.: 'pizza media', 'coca 2l', 'calabresa'") }, required: ["termo"] } },
   { name: "adicionar_item", description: "Adiciona um produto ao carrinho assim que o cliente disser o que quer. Opções = sabores (meio a meio = 2 sabores), tamanho, borda, adicionais, exatamente como existem no produto.",
     parameters: { type: "OBJECT", properties: {
@@ -110,6 +111,7 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
       const result = addItem(temp, catalog, args);
       if ("erro" in result) return result;
       ctx.flags.reroute = addToPlacedText(state.addToPlaced.orderNumber, temp.items.map(describeItemPlain), state.addToPlaced.payment);
+      state.lastReroute = { items: norm(temp.items.map(describeItemPlain).join("; ")), at: Date.now() };
       return { ok: true, enviado: "Pedido de alteração enviado para a loja." };
     }
     case "sair_modo_adicionar": state.addToPlaced = null; return { ok: true, modo: "pedido novo" };
@@ -185,6 +187,8 @@ function stateBlock(state: ConversationState, catalog: Catalog, firstName: strin
     "Pagamento: " + (state.payment ? PAYMENT_NAMES[state.payment] : "(não definido)") + (state.payment === "money" ? (state.changeFor === null ? ", troco não perguntado" : state.changeFor ? ", troco para " + brl(state.changeFor) : ", sem troco") : ""),
     state.items.length ? "Ainda falta: " + (missingForSummary(state).join(", ") || "nada — pode chamar gerar_resumo") : "",
     state.summary ? (summaryIsCurrent(state) ? "Resumo já enviado e atual: aguardando o cliente confirmar." : "O pedido mudou depois do último resumo: chame gerar_resumo de novo.") : "",
+    state.lastPlaced && Date.now() - state.lastPlaced.at < RECENT_ORDER_MS
+      ? "Pedido JÁ FEITO nesta conversa: Nº " + state.lastPlaced.orderNumber + " (há " + Math.max(1, Math.round((Date.now() - state.lastPlaced.at) / 60_000)) + " min). Os itens dele NÃO estão no carrinho e não devem voltar para ele." : "",
   ];
   return lines.filter(Boolean).join("\n");
 }
@@ -207,6 +211,8 @@ function systemPrompt(state: ConversationState, catalog: Catalog, firstName: str
     "12. Mensagem confusa: interprete com bom senso (erros de digitação são normais); se continuar sem entender, pergunte de forma simples.",
     "13. 'ela', 'ele', 'isso', 'esse', 'essa' se referem ao item já citado. Uma correção do cliente ('na verdade...', 'não, é...') NUNCA vira item novo; só aumente a quantidade quando ele pedir claramente mais unidades.",
     "14. Nunca chame chamar_atendente sem o cliente pedir para falar com uma pessoa.",
+    "15. Só diga 'mais um'/'mais uma' se o item já estava no CARRINHO antes. Carrinho vazio = primeiro item.",
+    "16. Pedido já feito (veja ESTADO ATUAL): nunca recoloque os itens dele no carrinho nem gere resumo com eles. Mudança de pagamento, endereço ou itens de um pedido já feito é tratada pela loja, não monte pedido novo para isso.",
     state.addToPlaced
       ? "\nMODO ADICIONAR AO PEDIDO JÁ FEITO" + (state.addToPlaced.orderNumber ? " Nº " + state.addToPlaced.orderNumber : "") +
         ": o cliente quer ACRESCENTAR itens ao pedido que já fez. Mostre as opções reais (buscar_cardapio) e, quando ele escolher, chame adicionar_ao_pedido_feito. NÃO use adicionar_item nem gerar_resumo e não pergunte endereço. Se ele disser que quer um pedido novo, chame sair_modo_adicionar."
@@ -295,12 +301,27 @@ function contextIsFresh(state: ConversationState): boolean {
     (state.lastPlaced && now - state.lastPlaced.at < CONTEXT_FRESH_MS));
 }
 
+// Avisos de pedido enviados pela loja (/send: "pedido N° 2248 está em produção"):
+// a próxima mensagem do cliente provavelmente fala desse pedido.
+const outboundNotices = new Map<string, { orderNumber: string; at: number }>();
+const phoneTail = (phone: string) => String(phone || "").replace(/\D/g, "").slice(-8);
+
+export function noteOutboundOrderMessage(sessionId: string, phone: string, text: string) {
+  if (!isAtendenteTenant(sessionId)) return;
+  const number = (String(text || "").match(/\b(?:pedido|n[°ºo.]|#)\s*(?:n[°ºo.]\s*)?\*?#?\s*(\d{3,6})\b/i) || [])[1];
+  const tail = phoneTail(phone);
+  if (!number || tail.length < 8) return;
+  outboundNotices.set(sessionId + "|" + tail, { orderNumber: number, at: Date.now() });
+  if (outboundNotices.size > 5000) outboundNotices.delete(outboundNotices.keys().next().value as string);
+}
+
 const orderLabel = (n: string) => "pedido" + (n ? " Nº " + n : " que você já fez");
 const numberIn = (text: string) => (norm(text).match(/\b(\d{3,})\b/) || [])[1] || "";
 
 function clearDraft(state: ConversationState) {
   Object.assign(state, freshState(), {
     name: state.name, lastPlaced: state.lastPlaced, history: state.history, greetedAt: state.greetedAt, placedContext: state.placedContext,
+    lastReroute: state.lastReroute || null,
   });
 }
 
@@ -345,8 +366,16 @@ async function placedOrderRouting(state: ConversationState, catalog: Catalog, te
     const orderNumber = numberIn(text) || recent || "";
     const items = state.items.map(describeItemPlain);
     const payment = paymentHint(text) || paymentHint(state.history.filter((t) => t.role === "user").slice(-4).map((t) => t.text).join(" "));
+    const itemsKey = norm(items.join("; "));
+    const already = state.lastReroute && state.lastReroute.items === itemsKey && Date.now() - state.lastReroute.at < 15 * 60_000;
     clearDraft(state);
     state.placedContext = { orderNumber, at: Date.now() };
+    if (already) {
+      await reply("Esse item (" + items.join(", ") + ") já foi enviado para a loja acrescentar no seu " + orderLabel(orderNumber) + " ✅ Não vou mandar de novo. " +
+        "Assim que a loja responder, te aviso por aqui. Se quiser *mais uma unidade além dessa*, é só me dizer.");
+      return true;
+    }
+    state.lastReroute = { items: itemsKey, at: Date.now() };
     return addToPlacedText(orderNumber, items, payment);
   }
 
@@ -365,7 +394,7 @@ async function placedOrderRouting(state: ConversationState, catalog: Catalog, te
   }
 
   // "Quero adicionar..." sem carrinho e com pedido recente: é para o pedido já feito?
-  if (!state.items.length && !state.addToPlaced && wantsToAdd(text) && recent !== null) {
+  if (!state.items.length && !state.addToPlaced && wantsToAdd(text) && !wantsPaymentChange(text) && recent !== null) {
     if (explicit || contextIsFresh(state)) {
       state.addToPlaced = { orderNumber: numberIn(text) || recent, at: Date.now(), payment: paymentHint(text) };
       return false;
@@ -402,7 +431,11 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
   const routed = await placedOrderRouting(state, catalog, text, reply);
   if (routed === true) return;
   if (typeof routed === "string") {
-    if (!routed.startsWith("use:")) { state.placedContext = { orderNumber: state.placedContext?.orderNumber || "", at: Date.now() }; return routed; }
+    if (!routed.startsWith("use:")) {
+      state.placedContext = { orderNumber: state.placedContext?.orderNumber || "", at: Date.now() };
+      pushHistory(state, "model", "(Encaminhei para a loja, sobre o pedido já feito: " + routed + ")");
+      return routed;
+    }
     text = routed.slice(4);
   }
 
@@ -476,6 +509,7 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
 
   if (flags.reroute) {
     state.addToPlaced = null;
+    pushHistory(state, "model", "(Encaminhei para a loja, sobre o pedido já feito: " + flags.reroute + ")");
     return flags.reroute;
   }
   if (flags.handoff && !wantsHuman(text) && !/\b(pessoa|alguem|humano|dono|dona|gerente|reclam\w*|falar com)\b/.test(norm(text))) {
@@ -522,6 +556,22 @@ export async function handleAtendenteMessage(p: AtendenteParams): Promise<boolea
     state.updatedAt = Date.now();
     void persist(p.sessionId);
   };
+  // Aviso de pedido enviado pela loja há pouco: a conversa passa a ser sobre esse pedido.
+  const notice = outboundNotices.get(p.sessionId + "|" + phoneTail(p.customerPhone));
+  if (notice && Date.now() - notice.at < CONTEXT_FRESH_MS && (!state.placedContext || state.placedContext.at < notice.at)) {
+    state.placedContext = { orderNumber: notice.orderNumber, at: notice.at };
+  }
+  // Trocar pagamento de pedido já feito: nunca vira pedido novo (antes gerava pedido duplicado).
+  if (!state.items.length && !state.pendingChoice && wantsPaymentChange(p.text) &&
+    recentPlacedOrder(state, session.catalog || null) !== null) {
+    const number = (norm(p.text).match(/(?:pedido|n[°ºo.]|#)\s*(?:n[°ºo.]\s*)?#?\s*(\d{3,6})\b/) || [])[1] || recentPlacedOrder(state, session.catalog || null) || "";
+    markPlaced();
+    return "Quero trocar a forma de pagamento do meu pedido" + (number ? " Nº " + number : "") + ": " + clean(p.text, 300);
+  }
+  // Só o número do pedido ("2248") logo depois de falar de um pedido feito: é sobre ele.
+  if (!state.items.length && !state.pendingChoice && isOrderNumberOnly(p.text) && recentPlacedOrder(state, session.catalog || null) !== null) {
+    markPlaced(); return false;
+  }
   if (!state.items.length && !state.pendingChoice && aboutPlacedOrder(p.text) && !wantsToAdd(p.text)) { markPlaced(); return false; }
   if (!state.items.length && !state.pendingChoice && recentPlacedOrder(state, session.catalog || null) !== null &&
     editsPlacedOrder(p.text) && !wantsToAdd(p.text)) { markPlaced(); return false; }

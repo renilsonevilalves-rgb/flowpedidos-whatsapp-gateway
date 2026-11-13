@@ -37,6 +37,8 @@ export type ConversationState = {
   pendingChoice: { kind: "cancel" | "add"; text: string; orderNumber: string; at: number } | null;
   /** Cliente escolhendo itens para ADICIONAR a um pedido já feito. */
   addToPlaced: { orderNumber: string; at: number; payment: string } | null;
+  /** Últimos itens do carrinho já enviados para a loja acrescentar num pedido feito (evita mandar duas vezes). */
+  lastReroute?: { items: string; at: number } | null;
 };
 
 export type Session = { state: ConversationState; catalog?: Catalog; catalogAt?: number };

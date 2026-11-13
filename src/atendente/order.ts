@@ -208,7 +208,8 @@ export function formatSummary(state: ConversationState, data: any): string {
     lines.push(item.quantity + "x " + clean(item.name, 140) + " — " + brl(Number(item.total)));
     const opts = (Array.isArray(item.selectedOptions) ? item.selectedOptions : [])
       .map((o: any) => (o.quantity > 1 ? o.quantity + "x " : "") + clean(o.name, 80) + (Number(o.price) ? " (+" + brl(Number(o.price)) + ")" : ""));
-    if (opts.length) lines.push("   + " + opts.join(", "));
+    // O valor da linha já inclui as opções: deixa isso claro para o cliente.
+    if (opts.length) lines.push("   ↳ com " + opts.join(", ") + (opts.some((o: string) => o.includes("(+")) ? " — já incluso" : ""));
     if (item.notes) lines.push("   Obs: " + clean(item.notes, 160));
   }
   lines.push("");

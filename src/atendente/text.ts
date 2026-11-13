@@ -78,6 +78,22 @@ export function refersToPlacedOrder(text: string): boolean {
   return /(pedido (?:que |q )?(?:eu )?(?:acabei|fiz|mandei|pedi|enviei|ja fiz)|acabei de (?:fazer|pedir|mandar)|pedido anterior|pedido (?:ja )?(?:feito|enviado|confirmado)|ultimo pedido|\b(?:no|ao|nesse|neste|naquele|junto (?:com|ao|do)) (?:meu |mesmo |ultimo |outro )?pedido\b(?! novo)|meu pedido|pedido\s*(?:#|n[°º.o]?\.?|numero)?\s*\d{3,}|#\d{3,})/.test(t);
 }
 
+/** Trocar a forma de pagamento ("quero pagar na entrega", "muda pro pix", "colocar para pagar no cartão"). */
+export function wantsPaymentChange(text: string): boolean {
+  const t = norm(text);
+  if (/\b(troc|mud|alter)\w* (?:a |o )?(?:forma de )?pagamento\b/.test(t)) return true;
+  if (!/\b(pag\w*)\b/.test(t)) return false;
+  // "adicionar uma bebida para pagar no pix" é item novo; "colocar para pagar na entrega" é pagamento.
+  if (wantsToAdd(text) && !/\b(coloc\w*|bota\w*|poe) (?:pra|para|o pagamento|a forma)\b/.test(t)) return false;
+  return /\b(na entrega|na hora|no local|pessoalmente|quando chegar|em dinheiro|no dinheiro|em especie|no cartao|no debito|no credito|no pix|via pix|outra forma)\b/.test(t) ||
+    /\b(troc|mud|alter)\w*\b/.test(t);
+}
+
+/** Mensagem que é só o número de um pedido ("2248", "nº 2248", "#2248"). */
+export function isOrderNumberOnly(text: string): boolean {
+  return /^(?:o |no |do )?(?:pedido\s*)?(?:n[°º.o]?\s*|numero\s*)?#?\s*\d{3,6}\s*[.!]?$/.test(norm(text));
+}
+
 export function wantsToCancel(text: string): boolean {
   return /\b(cancel\w*|desist\w*|nao quero mais|esquece (?:o|esse) pedido)\b/.test(norm(text));
 }

@@ -14,10 +14,10 @@ process.env.GEMINI_FALLBACK_MODEL = "";
 process.env.ATENDENTE_DEBOUNCE_MS = "0";
 process.env.ATENDENTE_STATE_DIR = tmpdir() + "/atendente-test-" + process.pid;
 
-const { handleAtendenteMessage, noteOrderContext } = await import("../dist/atendente/engine.js");
+const { handleAtendenteMessage, noteOrderContext, noteOutboundOrderMessage } = await import("../dist/atendente/engine.js");
 const { resetStateForTests } = await import("../dist/atendente/state.js");
 const { searchProducts, resolveProduct, resolveOption } = await import("../dist/atendente/catalog.js");
-const { isPureYes } = await import("../dist/atendente/text.js");
+const { isPureYes, wantsPaymentChange, isOrderNumberOnly } = await import("../dist/atendente/text.js");
 
 // ---------------------------------------------------------------- cardápio
 const sabores = { id: "g-sab", name: "Sabores", min: 1, max: 2, options: [
@@ -210,7 +210,7 @@ test("meio a meio e opção obrigatória faltando (pergunta uma vez)", async () 
   world.script.push([call("definir_entrega", { tipo: "retirada" }), call("definir_pagamento", { forma: "credito" }), call("gerar_resumo")]);
   const r = await c.send("vou retirar, no cartão");
   assert.match(r.last, /1x Pizza Média — R\$ 45,00/);
-  assert.match(r.last, /\+ Calabresa, Portuguesa/);
+  assert.match(r.last, /↳ com Calabresa, Portuguesa/);
   assert.match(r.last, /Retirada na loja/);
 });
 
@@ -512,4 +512,81 @@ test("'adicionar' sem contexto recente mas com pedido feito há pouco: pergunta 
   assert.equal(r.handled, true);
   assert.match(r.last, /Coca cola 2L/);
   world.customer = CUSTOMER;
+});
+
+// ======================= Auditoria 13/11: casos reais que deram errado =======================
+test("textos: troca de pagamento e número de pedido sozinho", () => {
+  for (const t of ["Quero colocar para pagar na entrega", "vou pagar no pix", "muda a forma de pagamento", "quero trocar o pagamento pra dinheiro", "posso pagar no cartão?"])
+    assert.equal(wantsPaymentChange(t), true, t);
+  for (const t of ["Quero adicionar alguma bebida para pagar no Pix", "troco para 100", "quero um x salada", "qual o valor?"])
+    assert.equal(wantsPaymentChange(t), false, t);
+  for (const t of ["2248", "nº 2248", "#2248", "pedido 2248", "o pedido 2248"]) assert.equal(isOrderNumberOnly(t), true, t);
+  for (const t of ["2 coca", "quero 2248 cocas", "rua 1234"]) assert.equal(isOrderNumberOnly(t), false, t);
+});
+
+test("aviso da loja 'pedido N° 2248 em produção' + 'acrescentar mais um hot dog' vai para o pedido 2248 (não abre pedido novo)", async () => {
+  resetWorld();
+  const c = customer("5531972447117");
+  noteOutboundOrderMessage(SID, "31972447117", "Renilson, o pedido N° 2248 está em produção.");
+  world.script.push([call("adicionar_item", { produto: "x-sal" })]);
+  const r = await c.send("Queria acrescentar mais um x salada");
+  assert.equal(typeof r.handled, "string", "vai para o fluxo de pedido já feito");
+  assert.match(r.handled, /adicionar no meu pedido Nº 2248: 1x X- Salada/);
+  assert.equal(world.previews.length, 0);
+});
+
+test("'2248' sozinho depois de falar do pedido vai para o fluxo de pedido feito, sem IA", async () => {
+  resetWorld();
+  const c = customer("5531990000201");
+  await noteOrderContext(SID, jidOf("5531990000201"), "");
+  const calls = world.geminiCalls;
+  const r = await c.send("2248");
+  assert.equal(r.handled, false);
+  assert.equal(world.geminiCalls, calls);
+});
+
+test("mesmo item mandado duas vezes para o pedido feito: a segunda vez não duplica", async () => {
+  resetWorld();
+  const c = customer("5531990000202");
+  await noteOrderContext(SID, jidOf("5531990000202"), "2248");
+  world.script.push([call("sair_modo_adicionar"), call("adicionar_item", { produto: "x-sal" })], [say("Anotado!")]);
+  await c.send("um x salada");
+  let r = await c.send("é para acrescentar no mesmo pedido acima 2248");
+  assert.equal(typeof r.handled, "string");
+  assert.match(r.handled, /Nº 2248: 1x X- Salada/);
+  // A IA errou e colocou o mesmo item de novo no carrinho; o cliente repete "já está no pedido 2248".
+  world.script.push([call("adicionar_item", { produto: "x-sal" })], [say("Anotado!")]);
+  await c.send("ok");
+  r = await c.send("Já está escrito isso no pedido acima 2248");
+  assert.equal(r.handled, true, "não manda a alteração de novo para a loja");
+  assert.match(r.last, /já foi enviado para a loja/);
+  await c.send("sim");
+  assert.equal(world.commits.length, 0);
+});
+
+test("depois do pedido feito, 'quero colocar para pagar na entrega' não cria pedido duplicado", async () => {
+  resetWorld();
+  const c = customer("5531990000203");
+  world.script.push([call("adicionar_item", { produto: "x-sal" }), call("definir_entrega", { tipo: "entrega", usar_endereco_salvo: true }),
+    call("definir_pagamento", { forma: "pix" }), call("gerar_resumo")]);
+  await c.send("um x salada no mesmo endereço, pix");
+  await c.send("sim");
+  assert.equal(world.commits.length, 1);
+  const calls = world.geminiCalls;
+  const r = await c.send("Quero colocar para pagar na entrega");
+  assert.equal(typeof r.handled, "string");
+  assert.match(r.handled, /trocar a forma de pagamento do meu pedido Nº 1234/);
+  assert.equal(world.geminiCalls, calls, "decidido sem IA");
+  await c.send("sim");
+  assert.equal(world.commits.length, 1, "nenhum pedido novo");
+});
+
+test("resumo deixa claro que o adicional já está somado no valor do item", async () => {
+  resetWorld();
+  const c = customer("5531990000204");
+  world.script.push([call("adicionar_item", { produto: "xtudo", opcoes: ["catupiry"] }),
+    call("definir_entrega", { tipo: "retirada" }), call("definir_pagamento", { forma: "pix" }), call("gerar_resumo")]);
+  const r = await c.send("um x tudo com catupiry pra retirar, pix");
+  assert.match(r.last, /1x X- Tudo Turbo — R\$ 36,90/);
+  assert.match(r.last, /↳ com catupiry \(\+R\$ 2,00\) — já incluso/);
 });

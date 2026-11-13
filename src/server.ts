@@ -11,7 +11,7 @@ import { flushAiEvents, logAiEvent, phoneForJid, rememberCustomerPhone, takeTool
 import { usesCentralAgent } from "./chatOrder.js";
 import { applyPeriodGreeting, isGreetingMessage, periodGreeting } from "./greeting.js";
 import { showTypingThenWait } from "./naturalPacing.js";
-import { handleAtendenteMessage, isAtendenteTenant, noteOrderContext } from "./atendente/engine.js";
+import { handleAtendenteMessage, isAtendenteTenant, noteOrderContext, noteOutboundOrderMessage } from "./atendente/engine.js";
 import * as legacyOrderAi from "./aiAssistant.js";
 import * as legacyOrderAiV2 from "./aiAssistantV2.js";
 import { join } from "node:path";
@@ -792,6 +792,8 @@ app.post("/session/:sessionId/send", authMiddleware, async (req, res) => {
     await session.sock.sendMessage(`${phone}@s.whatsapp.net`, { text });
     logger.info({ sessionId, phone }, "[Outbound] Mensagem enviada com sucesso");
     res.json({ ok: true, phone });
+    // Aviso de pedido da loja: o atendente passa a saber de qual pedido o cliente vai falar.
+    try { noteOutboundOrderMessage(sessionId, phone, text); } catch { /* opcional */ }
   } catch (error: any) {
     logger.error({ error: error?.message || error, sessionId, phone }, "[Outbound] Falha ao enviar mensagem");
     res.status(502).json({ ok: false, error: "Não foi possível enviar a mensagem pelo WhatsApp." });
