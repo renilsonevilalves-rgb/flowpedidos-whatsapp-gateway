@@ -589,3 +589,41 @@ test("resumo deixa claro que o adicional já está somado no valor do item", asy
   assert.match(r.last, /1x X- Tudo Turbo — R\$ 36,90/);
   assert.match(r.last, /↳ com catupiry \(\+R\$ 2,00\) — já incluso/);
 });
+
+// ======================= Auditoria 13/11 (tarde) =======================
+test("'cancela a coca' com mais itens tira só a coca (não apaga o pedido todo)", async () => {
+  resetWorld();
+  const c = customer("5531990000301");
+  world.script.push([call("adicionar_item", { produto: "x-sal" }), call("adicionar_item", { produto: "c-2l" })], [say("Anotado!")]);
+  await c.send("um x salada e uma coca 2l");
+  world.script.push([call("remover_item", { produto: "coca" })], [say("Tirei a Coca. Ficou 1 X- Salada.")]);
+  const calls = world.geminiCalls;
+  const r = await c.send("cancela a coca");
+  assert.ok(world.geminiCalls > calls, "foi para a IA tirar o item");
+  assert.doesNotMatch(r.last, /cancelei o pedido/);
+  assert.match(r.last, /X- Salada/);
+});
+
+test("endereço novo sem bairro: IA não pode presumir o bairro do último pedido", async () => {
+  resetWorld();
+  const c = customer("5531990000302");
+  world.script.push([call("adicionar_item", { produto: "x-sal" }), call("definir_entrega", { tipo: "entrega", rua: "Rua Nova", numero: "10", bairro: "Centro" })],
+    [say("Qual é o bairro?")]);
+  await c.send("um x salada pra entregar na rua nova 10");
+  const fr = lastFunctionResponses().find((f) => f.name === "definir_entrega");
+  assert.equal(fr.response.erro, "confirmar_bairro");
+  world.script.push([call("definir_entrega", { tipo: "entrega", rua: "Rua Nova", numero: "10", bairro: "Centro" })], [say("Anotado!")]);
+  await c.send("é no centro mesmo");
+  assert.equal(lastFunctionResponses().find((f) => f.name === "definir_entrega").response.ok, true);
+});
+
+test("nome vindo só do perfil do WhatsApp: a IA é avisada para confirmar", async () => {
+  resetWorld();
+  world.customer = null;
+  const c = customer("5531990000303", { name: "Consultor" });
+  world.script.push([say("O que vai ser hoje?")]);
+  await c.send("quero fazer um pedido");
+  const system = JSON.stringify(world.geminiBodies[world.geminiBodies.length - 1].system_instruction);
+  assert.match(system, /veio do perfil do WhatsApp/);
+  world.customer = CUSTOMER;
+});

@@ -27,9 +27,9 @@ test("Olá/Oi genérico no início vira a saudação do período, o resto fica i
 
 test("tempo de digitação fica entre 1,2s e 4s", () => {
   assert.equal(typingDelayMs("", () => 0), 1200);
-  assert.equal(typingDelayMs("x".repeat(2000), () => 1), 4000);
+  assert.equal(typingDelayMs("x".repeat(2000), () => 1), 2500);
   const mid = typingDelayMs("x".repeat(100), () => 0.5);
-  assert.ok(mid > 1200 && mid < 4000);
+  assert.ok(mid > 1200 && mid <= 2500);
 });
 
 test("falha de presença nunca impede o envio e grupos são ignorados", async () => {

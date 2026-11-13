@@ -39,6 +39,8 @@ export type ConversationState = {
   addToPlaced: { orderNumber: string; at: number; payment: string } | null;
   /** Últimos itens do carrinho já enviados para a loja acrescentar num pedido feito (evita mandar duas vezes). */
   lastReroute?: { items: string; at: number } | null;
+  /** De onde veio o nome: perfil de pedidos anteriores, nome do WhatsApp ou dito pelo cliente. */
+  nameSource?: "profile" | "whatsapp" | "customer";
 };
 
 export type Session = { state: ConversationState; catalog?: Catalog; catalogAt?: number };

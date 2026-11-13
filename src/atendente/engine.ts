@@ -130,9 +130,23 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
     case "adicionar_item": return addItem(state, catalog, args);
     case "remover_item": return removeItem(state, args);
     case "alterar_item": return changeItem(state, args);
-    case "definir_entrega": return setDelivery(state, catalog, args);
+    case "definir_entrega": {
+      // Endereço novo sem bairro: a IA não pode presumir o bairro do último pedido (a taxa muda).
+      const saved = catalog.customer?.savedAddress;
+      const recentUser = norm(state.history.filter((t) => t.role === "user").slice(-3).map((t) => t.text).join(" "));
+      if (args?.usar_endereco_salvo !== true && saved?.neighborhood && args?.bairro && args?.rua &&
+        norm(args.bairro) === norm(saved.neighborhood) && norm(args.rua) !== norm(saved.address) &&
+        !recentUser.includes(norm(saved.neighborhood))) {
+        return { erro: "confirmar_bairro", dica: "O cliente passou um endereço novo sem dizer o bairro. Pergunte qual é o bairro; não presuma " + saved.neighborhood + "." };
+      }
+      return setDelivery(state, catalog, args);
+    }
     case "definir_pagamento": return setPayment(state, catalog, args);
-    case "definir_nome": return setName(state, args);
+    case "definir_nome": {
+      const result = setName(state, args);
+      if (!("erro" in result)) state.nameSource = "customer";
+      return result;
+    }
     case "gerar_resumo": {
       if (!catalog.store.isOpen) return { erro: "loja_fechada", abre: catalog.store.opensAt };
       const result = await makeSummary(p.sessionId, String(p.customerPhone), state);
@@ -184,7 +198,8 @@ function stateBlock(state: ConversationState, catalog: Catalog, firstName: strin
   const saved = c?.savedAddress;
   const d = state.delivery;
   const lines = [
-    "Nome do cliente: " + (state.name || "(não informado)") + (firstName ? " (chame de " + firstName + ")" : ""),
+    "Nome do cliente: " + (state.name || "(não informado)") + (firstName ? " (chame de " + firstName + ")" : "") +
+      (state.name && state.nameSource === "whatsapp" ? " — veio do perfil do WhatsApp; se não parecer nome de pessoa (ex.: 'Consultor', 'Loja', apelido), pergunte o nome antes do resumo" : ""),
     saved?.address ? "Endereço do último pedido: " + saved.address + ", " + saved.number + " - " + saved.neighborhood + (saved.complement ? " (" + saved.complement + ")" : "") : "Sem endereço salvo",
     c?.lastOrder?.paymentMethod ? "Pagamento do último pedido: " + (PAYMENT_NAMES[c.lastOrder.paymentMethod] || c.lastOrder.paymentMethod) : "",
     "CARRINHO: " + (state.items.length ? "\n  " + describeCart(state).join("\n  ") : "vazio"),
@@ -218,6 +233,8 @@ function systemPrompt(state: ConversationState, catalog: Catalog, firstName: str
     "14. Nunca chame chamar_atendente sem o cliente pedir para falar com uma pessoa.",
     "15. Só diga 'mais um'/'mais uma' se o item já estava no CARRINHO antes. Carrinho vazio = primeiro item.",
     "16. Pedido já feito (veja ESTADO ATUAL): nunca recoloque os itens dele no carrinho nem gere resumo com eles. Mudança de pagamento, endereço ou itens de um pedido já feito é tratada pela loja, não monte pedido novo para isso.",
+    "17. Se o cliente disser só 'cartão' e a loja aceitar crédito e débito, pergunte se é crédito ou débito.",
+    "18. Localização pelo mapa: agradeça e peça rua, número e bairro por escrito (a taxa é pelo bairro).",
     state.addToPlaced
       ? "\nMODO ADICIONAR AO PEDIDO JÁ FEITO" + (state.addToPlaced.orderNumber ? " Nº " + state.addToPlaced.orderNumber : "") +
         ": o cliente quer ACRESCENTAR itens ao pedido que já fez. Mostre as opções reais (buscar_cardapio) e, quando ele escolher, chame adicionar_ao_pedido_feito. NÃO use adicionar_item nem gerar_resumo e não pergunte endereço. Se ele disser que quer um pedido novo, chame sair_modo_adicionar."
@@ -318,6 +335,14 @@ export function noteOutboundOrderMessage(sessionId: string, phone: string, text:
   if (outboundNotices.size > 5000) outboundNotices.delete(outboundNotices.keys().next().value as string);
 }
 
+const GENERIC_WORDS = new Set(["pedido", "lanche", "lanches", "porcao", "bebida", "pizza", "media", "grande", "pequena", "com", "sem", "tradicional"]);
+/** O texto cita um item que está no carrinho ("cancela a coca" com Coca cola 2L no carrinho). */
+function mentionsCartItem(state: ConversationState, text: string): boolean {
+  const words = new Set(norm(text).replace(/[^a-z0-9 ]/g, " ").split(" ").filter(Boolean));
+  return state.items.some((item) => norm(item.name).replace(/[^a-z0-9 ]/g, " ").split(" ")
+    .some((w) => w.length >= 3 && !GENERIC_WORDS.has(w) && words.has(w)));
+}
+
 const orderLabel = (n: string) => "pedido" + (n ? " Nº " + n : " que você já fez");
 const numberIn = (text: string) => (norm(text).match(/\b(\d{3,})\b/) || [])[1] || "";
 
@@ -383,7 +408,8 @@ async function placedOrderRouting(state: ConversationState, catalog: Catalog, te
   }
 
   // Cancelar: carrinho atual, pedido já feito ou perguntar qual.
-  if (wantsToCancel(text) && !wantsToAdd(text)) {
+  // "cancela a coca" / "não quero mais a batata" é tirar um item do carrinho, não cancelar tudo.
+  if (wantsToCancel(text) && !wantsToAdd(text) && !(state.items.length > 1 && mentionsCartItem(state, text))) {
     if (!state.items.length) return recent !== null || explicit ? text : false;
     if (explicit) return text;
     if (recent !== null) {
@@ -419,7 +445,10 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
   };
   pushHistory(state, "user", text);
   if (!catalog) { await reply(fallbackText(null, state.items.length > 0)); return; }
-  if (!state.name) state.name = clean(catalog.customer?.name || p.customerName || "", 80).replace(/[^\p{L}\p{M}' .-]/gu, "").trim();
+  if (!state.name) {
+    state.name = clean(catalog.customer?.name || p.customerName || "", 80).replace(/[^\p{L}\p{M}' .-]/gu, "").trim();
+    state.nameSource = catalog.customer?.name ? "profile" : "whatsapp";
+  }
   const firstName = firstNameOf(state, p, catalog);
 
   // 1) Atendente humano: pausa este cliente.

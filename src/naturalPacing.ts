@@ -3,7 +3,7 @@
 // Nunca lança erro: se a presença falhar, a mensagem segue normalmente.
 
 const MIN_MS = Number(process.env.WHATSAPP_TYPING_MIN_MS || 1200);
-const MAX_MS = Number(process.env.WHATSAPP_TYPING_MAX_MS || 4000);
+const MAX_MS = Number(process.env.WHATSAPP_TYPING_MAX_MS || 2500);
 const ENABLED = process.env.WHATSAPP_TYPING_INDICATOR !== "false";
 
 export function typingDelayMs(text: string, random = Math.random) {

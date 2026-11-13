@@ -27,7 +27,8 @@ const hook = `      // The Fatima opt-in menu precedes conversational AI; transa
             const storeInfo = await fetchStoreInfo(id);
             if (!storeInfo?.menuUrl) throw new Error("Fatima has no configured menu URL");
             await sendMenuGreetingButton(sock, customerJid, storeInfo, true);
-            await sock.sendMessage(customerJid, {
+            // Sem botões, a saudação já diz "responder *atendente*": não manda uma segunda instrução.
+            if (process.env.WHATSAPP_MENU_BUTTONS === "true") await sock.sendMessage(customerJid, {
               text: "💬 *Prefere conversar com a loja?*\\nResponda *2* para falar com um atendente da Padaria Fátima.",
             });
           },

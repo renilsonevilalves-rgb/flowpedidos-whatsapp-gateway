@@ -418,6 +418,14 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
           continue;
         }
       }
+      // Localização (pino do mapa) no atendente de pedidos: vira texto para a IA pedir rua, número e bairro.
+      if (!text && isAtendenteTenant(id)) {
+        const location = unwrapMessage(msg.message)?.locationMessage || unwrapMessage(msg.message)?.liveLocationMessage;
+        if (location) {
+          const place = [location.name, location.address].filter((v: unknown) => typeof v === "string" && v.trim()).join(" - ").slice(0, 200);
+          text = "[Cliente enviou a localização pelo mapa" + (place ? ": " + place : "") + "]";
+        }
+      }
       // Photos (receipts, menu prints) for stores with the central AI.
       if (hasImage(msg.message) && usesCentralAgent(id) && process.env.GEMINI_API_KEY) {
         const seen = await describeIncomingImage(msg, logger, id);
