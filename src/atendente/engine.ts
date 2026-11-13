@@ -152,7 +152,7 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
         if (state.delivery?.type === "delivery" && state.delivery.ifood && !ifoodQuoteExpired(state) && !args?.rua && !args?.trocar_endereco) {
           return { ok: true, entrega: state.delivery.address + ", " + state.delivery.number + " - " + state.delivery.neighborhood, taxa_ifood: state.delivery.ifood.fee };
         }
-        const link = createAddressLink(p, state);
+        const link = createAddressLink(p, state, catalog);
         return { ok: true, aguardando_endereco: true, link,
           dica: "Mande este link numa mensagem curta: o cliente preenche o endereço e vê a taxa do iFood; assim que confirmar, a conversa continua aqui sozinha. Não peça o endereço por mensagem." };
       }
@@ -175,7 +175,7 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
     case "gerar_resumo": {
       if (!catalog.store.isOpen) return { erro: "loja_fechada", abre: catalog.store.opensAt };
       if (ifoodQuoteExpired(state)) {
-        return { erro: "taxa_ifood_expirada", link: createAddressLink(p, state),
+        return { erro: "taxa_ifood_expirada", link: createAddressLink(p, state, catalog),
           dica: "A taxa do iFood vale por pouco tempo e venceu. Mande este link para o cliente confirmar o endereço de novo." };
       }
       const result = await makeSummary(p.sessionId, String(p.customerPhone), state);
@@ -236,8 +236,10 @@ function stateBlock(state: ConversationState, catalog: Catalog, firstName: strin
   const lines = [
     "Nome do cliente: " + (state.name || "(não informado)") + (firstName ? " (chame de " + firstName + ")" : "") +
       (state.name && state.nameSource === "whatsapp" ? " — veio do perfil do WhatsApp; se não parecer nome de pessoa (ex.: 'Consultor', 'Loja', apelido), antes do resumo pergunte só 'Qual o seu nome?' (sem citar o nome do WhatsApp)" : ""),
-    saved?.address ? "Endereço do último pedido: " + saved.address + ", " + saved.number + " - " + saved.neighborhood + (saved.complement ? " (" + saved.complement + ")" : "") : "Sem endereço salvo",
-    c?.lastOrder?.paymentMethod ? "Pagamento do último pedido: " + (PAYMENT_NAMES[c.lastOrder.paymentMethod] || c.lastOrder.paymentMethod) : "",
+    catalog.store.deliveryMode === "ifood"
+      ? "Entrega iFood: NÃO ofereça o endereço nem o pagamento do último pedido. Pergunte se é entrega ou retirada; para entrega chame definir_entrega e mande o link (o último endereço já vem preenchido nele). O pagamento é escolhido depois, só entre as formas disponíveis."
+      : saved?.address ? "Endereço do último pedido: " + saved.address + ", " + saved.number + " - " + saved.neighborhood + (saved.complement ? " (" + saved.complement + ")" : "") : "Sem endereço salvo",
+    c?.lastOrder?.paymentMethod && catalog.store.deliveryMode !== "ifood" ? "Pagamento do último pedido: " + (PAYMENT_NAMES[c.lastOrder.paymentMethod] || c.lastOrder.paymentMethod) : "",
     "CARRINHO: " + (state.items.length ? "\n  " + describeCart(state).join("\n  ") : "vazio"),
     "Entrega: " + (!d ? (state.addressLinkId ? "(link de endereço enviado, aguardando o cliente preencher)" : "(não definida)") : d.type === "pickup" ? "retirada"
       : d.address + ", " + d.number + " - " + d.neighborhood + (d.ifood ? " — taxa iFood " + brl(d.ifood.fee) + "; entregador aceita: " + (ifoodPaymentsText(d.ifood.payments) || "só pagamento online") : "")),
@@ -395,21 +397,26 @@ function mentionsCartItem(state: ConversationState, text: string): boolean {
 // Link de endereço (entrega iFood): clickaipedidos.com.br/e/<código>.
 const LINK_TTL_MS = 60 * 60_000;
 const B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-const addressLinks = new Map<string, { sessionId: string; customerJid: string; phone: string; name: string; at: number }>();
+type SavedAddress = NonNullable<NonNullable<Catalog["customer"]>["savedAddress"]>;
+const addressLinks = new Map<string, { sessionId: string; customerJid: string; phone: string; name: string; at: number; saved: SavedAddress | null }>();
 
 function ifoodQuoteExpired(state: ConversationState): boolean {
   const q = state.delivery?.type === "delivery" ? state.delivery.ifood : undefined;
   return Boolean(q && !(Date.parse(q.expiresAt) > Date.now() + 30_000));
 }
 
-function createAddressLink(p: AtendenteParams, state: ConversationState): string {
+function createAddressLink(p: AtendenteParams, state: ConversationState, catalog?: Catalog | null): string {
   let id = "";
   for (let i = 0; i < 10; i += 1) id += B62[randomInt(62)];
   if (state.addressLinkId) addressLinks.delete(state.addressLinkId);
   state.addressLinkId = id;
+  const last = state.delivery?.type === "delivery" ? state.delivery : null;
+  const saved: SavedAddress | null = last?.address
+    ? { address: last.address, number: last.number, neighborhood: last.neighborhood, complement: last.complement, reference: last.reference, city: last.city, state: last.state, cep: last.cep }
+    : catalog?.customer?.savedAddress || null;
   state.delivery = null;
   state.ifoodPayment = null;
-  addressLinks.set(id, { sessionId: p.sessionId, customerJid: p.customerJid, phone: p.customerPhone || "", name: state.name, at: Date.now() });
+  addressLinks.set(id, { sessionId: p.sessionId, customerJid: p.customerJid, phone: p.customerPhone || "", name: state.name, at: Date.now(), saved });
   return "clickaipedidos.com.br/e/" + id;
 }
 
@@ -417,7 +424,7 @@ function createAddressLink(p: AtendenteParams, state: ConversationState): string
 export function getAddressLink(id: string) {
   const link = addressLinks.get(id);
   if (!link || Date.now() - link.at > LINK_TTL_MS) return null;
-  return { sessionId: link.sessionId, phone: link.phone, customerName: link.name };
+  return { sessionId: link.sessionId, phone: link.phone, customerName: link.name, savedAddress: link.saved };
 }
 
 type LinkAddress = { streetName: string; streetNumber: string; neighborhood: string; city: string; state: string; postalCode: string; complement?: string; reference?: string };
@@ -617,7 +624,7 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
     if (ifoodQuoteExpired(state)) {
       state.awaitingConfirm = false;
       state.summary = null;
-      await reply("A taxa de entrega do iFood vale por pouco tempo e acabou de vencer 😕 Confirma o endereço de novo neste link que eu atualizo o resumo:\n" + createAddressLink(p, state));
+      await reply("A taxa de entrega do iFood vale por pouco tempo e acabou de vencer 😕 Confirma o endereço de novo neste link que eu atualizo o resumo:\n" + createAddressLink(p, state, catalog));
       return;
     }
     const result = await commitOrder(p.sessionId, String(p.customerPhone), state, catalog);

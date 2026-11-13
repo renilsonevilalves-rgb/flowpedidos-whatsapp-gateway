@@ -650,6 +650,9 @@ test("entrega iFood: manda link de endereço, recebe a cotação, pede bandeira 
   let r = await c.send("quero um x salada pra entregar");
   const id = r.last.match(/\/e\/([A-Za-z0-9]{10})/)[1];
   assert.equal(getAddressLink(id).sessionId, SID);
+  assert.equal(getAddressLink(id).savedAddress.number, "123", "o link já vem com o último endereço");
+  const prompt = world.geminiBodies[0].system_instruction.parts[0].text;
+  assert.doesNotMatch(prompt, /Endereço do último pedido|Pagamento do último pedido/);
   const bad = await applyAddressFromLink("XXXXXXXXXX", {});
   assert.equal(bad.ok, false);
   const ok = await applyAddressFromLink(id, {

@@ -18,7 +18,7 @@ export type CustomerProfile = {
   name: string | null;
   lastOrderAt?: string | null;
   lastOrder?: { paymentMethod: string | null; deliveryType: string | null } | null;
-  savedAddress?: { address: string; number: string; neighborhood: string; complement?: string; reference?: string } | null;
+  savedAddress?: { address: string; number: string; neighborhood: string; complement?: string; reference?: string; city?: string; state?: string; cep?: string } | null;
 } | null;
 export type Catalog = {
   storeName: string; menuUrl: string; products: Product[]; soldOut: { id: string; name: string }[];
