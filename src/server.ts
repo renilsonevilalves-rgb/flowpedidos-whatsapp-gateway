@@ -11,6 +11,7 @@ import { flushAiEvents, logAiEvent, phoneForJid, rememberCustomerPhone, takeTool
 import { usesCentralAgent } from "./chatOrder.js";
 import { applyPeriodGreeting, isGreetingMessage, periodGreeting } from "./greeting.js";
 import { showTypingThenWait } from "./naturalPacing.js";
+import { hasOptedOut, isDuplicateSend, isOptInRequest, isOptOutRequest, setOptOut, waitForSendSlot } from "./sendHygiene.js";
 import { handleAtendenteMessage, isAtendenteTenant, noteOrderContext, noteOutboundOrderMessage } from "./atendente/engine.js";
 import * as legacyOrderAi from "./aiAssistant.js";
 import * as legacyOrderAiV2 from "./aiAssistantV2.js";
@@ -337,6 +338,14 @@ function trackOwnSends(sessionId: string, sock: WASocket) {
     // Respostas a um cliente que escreveu há pouco mostram "digitando..." antes de sair.
     // Notificações avulsas (/send) para quem não está conversando seguem sem atraso.
     const pacedText = typeof content?.text === "string" ? content.text : "";
+    // Sem repetição e sem rajada: mesma mensagem duplicada é descartada e os envios saem em fila.
+    // (Guardado: testes isolados carregam este wrapper sem o módulo de boas práticas.)
+    if (typeof isDuplicateSend === "function" && pacedText && typeof jid === "string"
+      && isDuplicateSend(sessionId, jid, pacedText, lastCustomerMessageAt.get(`${sessionId}:${jid}`) || 0)) {
+      logger.info({ sessionId }, "[Outbound] Mensagem repetida descartada");
+      return undefined;
+    }
+    if (typeof waitForSendSlot === "function") await waitForSendSlot(sessionId);
     if (pacedText && typeof jid === "string" && !jid.endsWith("@g.us")
       && Date.now() - (lastCustomerMessageAt.get(`${sessionId}:${jid}`) || 0) < 10 * 60 * 1000) {
       await showTypingThenWait(sock, jid, pacedText);
@@ -429,6 +438,17 @@ async function handleIncomingMessages(id: string, sock: WASocket, messages: any[
         if (lastCustomerMessageAt.size > 20000) lastCustomerMessageAt.delete(lastCustomerMessageAt.keys().next().value as string);
         const customerName = typeof msg.pushName === "string" ? msg.pushName.slice(0, 120) : null;
         logAiEvent({ sessionId: id, customerPhone: pausePhone, customerName, role: "customer", body: text });
+        // Marca como lida (como uma pessoa faria ao abrir a conversa).
+        if (process.env.WHATSAPP_READ_RECEIPTS !== "false") void Promise.resolve().then(() => sock.readMessages([msg.key])).catch(() => undefined);
+        // "Parar": não manda mais avisos automáticos para este cliente; "voltar" religa.
+        if (isOptOutRequest(text) || isOptInRequest(text)) {
+          const optOut = isOptOutRequest(text);
+          await setOptOut(id, pausePhone || pauseJid, optOut);
+          await sock.sendMessage(pauseJid, { text: optOut
+            ? "Pronto, não vou mais te mandar avisos automáticos 👍 Se quiser voltar a receber, é só mandar *voltar*."
+            : "Pronto, você voltou a receber os avisos dos seus pedidos por aqui ✅" }).catch(() => undefined);
+          continue;
+        }
         if (await isAiPaused(id, pauseJid, text) || (remoteJid !== pauseJid && await isAiPaused(id, remoteJid, text))) {
           logger.info({ sessionId: id }, "[Handoff] Human attendance active; automatic reply skipped");
           continue;
@@ -787,6 +807,15 @@ app.post("/session/:sessionId/send", authMiddleware, async (req, res) => {
     res.status(409).json({ ok: false, error: "O WhatsApp da loja não está conectado.", status: session.status });
     return;
   }
+
+  // Cliente que mandou "parar" não recebe avisos automáticos.
+  if (await hasOptedOut(sessionId, phone)) {
+    logger.info({ sessionId }, "[Outbound] Cliente pediu para não receber avisos; envio ignorado");
+    res.json({ ok: true, sent: false, skipped: "opt_out", phone });
+    return;
+  }
+  // Avisos avulsos também passam pela fila (sem rajada) e pela proteção contra repetição.
+  trackOwnSends(sessionId, session.sock as WASocket);
 
   try {
     await session.sock.sendMessage(`${phone}@s.whatsapp.net`, { text });
