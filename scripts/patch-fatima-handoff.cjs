@@ -33,6 +33,7 @@ const hook = `      // The Fatima opt-in menu precedes conversational AI; transa
             });
           },
           sendMessage: async (reply) => { await sock.sendMessage(customerJid, { text: reply }); },
+          passThroughFirstMessage: isAtendenteTenant(id),
         });
         if (handled) continue;
       }

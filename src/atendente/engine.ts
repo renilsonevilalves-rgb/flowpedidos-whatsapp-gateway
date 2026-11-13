@@ -13,6 +13,7 @@ import {
   aboutPlacedOrder, brl, choiceAnswer, clean, isOnlyGreeting, isOrderNumberOnly, isPureYes, norm, refersToPlacedOrder, wantsHuman,
   wantsPaymentChange, wantsToAdd, wantsToCancel,
 } from "./text.js";
+import { FATIMA_TENANT_ID } from "../fatimaHandoff.js";
 
 export type AtendenteParams = {
   sessionId: string;
@@ -35,9 +36,14 @@ const MAX_TOOL_ROUNDS = 6;
 export function atendenteTenants(): Set<string> {
   return new Set(String(process.env.WHATSAPP_AI_ORDER_TENANTS || "").split(",").map((v) => v.trim()).filter(Boolean));
 }
+/** "*" = toda loja cujo plano permite (Ultra/teste); o servidor confere o plano a cada passo. */
 export function isAtendenteTenant(sessionId: string): boolean {
-  return atendenteTenants().has(sessionId);
+  const tenants = atendenteTenants();
+  if (!tenants.has(sessionId) && !tenants.has("*")) return false;
+  return Date.now() >= (catalogDeniedUntil.get(sessionId) || 0);
 }
+// Loja sem permissão (plano sem pedido pela conversa): não pergunta de novo por 10 min.
+const catalogDeniedUntil = new Map<string, number>();
 
 /** Link curto para o WhatsApp: clickaipedidos.com.br/loja (abre /cardapio/loja). */
 export function shortMenuLink(url: string): string {
@@ -59,6 +65,7 @@ async function ensureCatalog(session: Session, p: AtendenteParams): Promise<Cata
     session.catalogAt = Date.now();
     return session.catalog;
   }
+  if (result.status === 403) catalogDeniedUntil.set(p.sessionId, Date.now() + 10 * 60_000);
   p.logger.warn({ sessionId: p.sessionId, status: result.status }, "[Atendente] Catálogo indisponível");
   return session.catalog || null;
 }
@@ -268,7 +275,8 @@ function greetingText(p: AtendenteParams, catalog: Catalog): string {
   if (!s.isOpen) {
     return hello + "\n\n> No momento estamos fechados" + (s.opensAt ? " — abrimos " + s.opensAt : "") + ".\nNosso cardápio:\n👉 " + catalog.menuUrl;
   }
-  return hello + "\n\n> Confira nosso cardápio e faça seu pedido por aqui. 😊\nÉ só clicar no link abaixo para ver o cardápio!\n👉 " + catalog.menuUrl;
+  return hello + "\n\n> Confira nosso cardápio e faça seu pedido por aqui. 😊\nÉ só clicar no link abaixo para ver o cardápio!\n👉 " + catalog.menuUrl +
+    (p.sessionId === FATIMA_TENANT_ID ? "\n\nSe preferir falar com a loja, é só responder *atendente*." : "");
 }
 
 function fallbackText(catalog: Catalog | null, hasCart: boolean): string {

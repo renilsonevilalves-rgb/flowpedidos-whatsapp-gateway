@@ -21,6 +21,8 @@ type Params = {
   sendMessage: (text: string) => Promise<void>;
   logger: Logger;
   now?: number;
+  /** Atendente de pedidos ativo: a 1ª mensagem não é engolida pela saudação; o atendente responde. */
+  passThroughFirstMessage?: boolean;
 };
 
 const STATE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
@@ -143,6 +145,10 @@ function saveState(logger: Logger, now: number) {
   });
 }
 
+// Com o atendente de pedidos, "2" pode ser quantidade ("quantos?" "2"): só palavras chamam atendente.
+const wantsHumanHere = (params: Params) => isHumanChoice(params.text, params.rawMessage) &&
+  !(params.passThroughFirstMessage && normalize(params.text) === "2");
+
 async function routeMessage(params: Params): Promise<boolean> {
   await loadState(params.logger);
   const now = params.now ?? Date.now();
@@ -150,7 +156,14 @@ async function routeMessage(params: Params): Promise<boolean> {
   const state = handoffs.get(key);
   const expired = !state || now < state.lastActivityAt || now - state.lastActivityAt >= FATIMA_INACTIVITY_MS;
 
-  if (expired) {
+  if (expired && params.passThroughFirstMessage) {
+    const fresh: ContactState = { mode: "menu", lastActivityAt: now };
+    handoffs.set(key, fresh);
+    if (!wantsHumanHere(params)) {
+      await saveState(params.logger, now);
+      return false;
+    }
+  } else if (expired) {
     await params.sendGreeting();
     handoffs.set(key, { mode: "menu", lastActivityAt: now });
     await saveState(params.logger, now);
@@ -158,13 +171,14 @@ async function routeMessage(params: Params): Promise<boolean> {
     return true;
   }
 
-  if (state.mode === "human") {
-    state.lastActivityAt = now;
+  const current = handoffs.get(key)!;
+  if (current.mode === "human") {
+    current.lastActivityAt = now;
     await saveState(params.logger, now);
     return true;
   }
 
-  if (isHumanChoice(params.text, params.rawMessage)) {
+  if (wantsHumanHere(params)) {
     // Record the handoff before sending the acknowledgment so no AI handler races it.
     handoffs.set(key, { mode: "human", lastActivityAt: now });
     await saveState(params.logger, now);
@@ -173,7 +187,7 @@ async function routeMessage(params: Params): Promise<boolean> {
     return true;
   }
 
-  state.lastActivityAt = now;
+  current.lastActivityAt = now;
   await saveState(params.logger, now);
   return false;
 }

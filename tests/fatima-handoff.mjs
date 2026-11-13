@@ -103,3 +103,17 @@ test("invalid interactive reply does not select a human", () => {
   assert.equal(extractFatimaChoice({ interactiveResponseMessage: { nativeFlowResponseMessage: { paramsJson: "{broken" } } }), "");
   assert.equal(isHumanChoice("2 pães"), false);
 });
+
+test("com o atendente de pedidos ativo, a 1ª mensagem não é engolida e '2' não chama atendente", async () => {
+  const { handleFatimaMessage, FATIMA_TENANT_ID } = await import("../dist/fatimaHandoff.js");
+  let greetings = 0; const sent = [];
+  const base = { sessionId: FATIMA_TENANT_ID, customerJid: "5531900001111@s.whatsapp.net", rawMessage: {},
+    sendGreeting: async () => { greetings += 1; }, sendMessage: async (t) => { sent.push(t); },
+    logger: { info() {}, warn() {} }, passThroughFirstMessage: true };
+  assert.equal(await handleFatimaMessage({ ...base, text: "Boa tarde, tem pão de sal?" }), false);
+  assert.equal(greetings, 0);
+  assert.equal(await handleFatimaMessage({ ...base, text: "2" }), false);
+  assert.equal(await handleFatimaMessage({ ...base, text: "atendente" }), true);
+  assert.match(sent.at(-1), /equipe da Padaria Fátima/);
+  assert.equal(await handleFatimaMessage({ ...base, text: "quero 5 pães" }), true, "em atendimento humano o robô fica quieto");
+});
