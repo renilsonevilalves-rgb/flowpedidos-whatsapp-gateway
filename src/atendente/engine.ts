@@ -2,7 +2,7 @@
 // O Gemini conversa e escolhe ferramentas; preço/taxa/total vêm do backend e a
 // confirmação ("sim" para o resumo mais recente) é decidida pelo código.
 import { chatOrder, backendConfigured } from "./backend.js";
-import { describeProduct, searchProducts, soldOutMatch, type Catalog } from "./catalog.js";
+import { describeProduct, resolveProduct, searchProducts, soldOutMatch, type Catalog } from "./catalog.js";
 import { generate, GeminiUnavailable, type GeminiContent, type GeminiPart } from "./gemini.js";
 import {
   addItem, changeItem, commitOrder, describeCart, makeSummary, missingForSummary, PAYMENT_NAMES,
@@ -115,7 +115,32 @@ const TOOLS = [
 
 type TurnFlags = { summary?: string; handoff?: boolean; reroute?: string };
 
-async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state: ConversationState; catalog: Catalog; flags: TurnFlags }): Promise<ToolOutcome> {
+// Correção do cliente ("eu pedi somente 1...", "na verdade...") nunca soma unidades.
+const CORRECTION_WORDS = /\b(somente|apenas|na verdade|corrig\w*|errad\w*|nao era|so (?:um|uma|\d+))\b/;
+const MORE_WORDS = /\b(mais|outr[oa]s?|de novo|tambem)\b/;
+
+/**
+ * Produto que JÁ está no carrinho só ganha unidades quando a mensagem atual do cliente
+ * pede de novo (cita o produto ou diz "mais um"). Evita a IA reprocessar pedidos de
+ * mensagens anteriores e dobrar a quantidade (1 hambúrguer virava 2).
+ */
+function repeatedAdd(state: ConversationState, catalog: Catalog, args: any, turnText: string): ToolOutcome | null {
+  if (!state.items.length) return null;
+  const { product } = resolveProduct(catalog, clean(args?.produto, 140));
+  if (!product) return null;
+  const inCart = state.items.find((item) => item.productId === product.id);
+  if (!inCart) return null;
+  const t = norm(turnText).replace(/[^a-z0-9 ]/g, " ");
+  const words = new Set(t.split(" ").filter(Boolean));
+  const named = (norm(product.name) + " " + norm(args?.produto)).replace(/[^a-z0-9 ]/g, " ").split(" ")
+    .some((w) => w.length >= 3 && !GENERIC_WORDS.has(w) && words.has(w));
+  if (!CORRECTION_WORDS.test(t) && (named || MORE_WORDS.test(t))) return null;
+  return { erro: "ja_no_carrinho", item: describeItemPlain(inCart),
+    dica: "Este produto JÁ está no carrinho e NÃO foi adicionado de novo. Não chame adicionar_item para ele. " +
+      "Se o cliente quiser outra quantidade, use alterar_item com a quantidade FINAL que ele disse." };
+}
+
+async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state: ConversationState; catalog: Catalog; flags: TurnFlags; turnText: string }): Promise<ToolOutcome> {
   const { p, state, catalog } = ctx;
   if (state.addToPlaced && name === "adicionar_item") name = "adicionar_ao_pedido_feito";
   switch (name) {
@@ -142,6 +167,8 @@ async function runTool(name: string, args: any, ctx: { p: AtendenteParams; state
       if (isOnlyQuestion(lastUser) && !state.addToPlaced) {
         return { erro: "cliente_so_perguntou", dica: "O cliente só perguntou se tem/quanto custa. NÃO adicione. Responda com o produto e o preço e pergunte se quer pedir." };
       }
+      const repeated = repeatedAdd(state, catalog, args, ctx.turnText);
+      if (repeated) return repeated;
       return addItem(state, catalog, args);
     }
     case "remover_item": return removeItem(state, args);
@@ -274,6 +301,7 @@ function systemPrompt(state: ConversationState, catalog: Catalog, firstName: str
     "10. Perguntas sobre horário, taxa, pagamento, pedido mínimo: responda com os dados da LOJA abaixo. Quem quiser ver o cardápio: mande o link exato.",
     "11. Cliente pediu atendente/pessoa: chame chamar_atendente. Desistiu do pedido: chame cancelar_rascunho.",
     "12. Mensagem confusa: interprete com bom senso (erros de digitação são normais); se continuar sem entender, pergunte de forma simples.",
+    "2c. Itens que já estão no CARRINHO já foram adicionados: nunca chame adicionar_item de novo para pedidos de mensagens anteriores. Ao adicionar um item, confirme em poucas palavras o que entrou (ex.: '✅ 1 Pudim adicionado!') e então faça a próxima pergunta. Se o produto pedido estiver esgotado e o cliente aceitar outro, use a mesma quantidade que ele tinha pedido.",
     "13. 'ela', 'ele', 'isso', 'esse', 'essa' se referem ao item já citado. Uma correção do cliente ('na verdade...', 'não, é...') NUNCA vira item novo; só aumente a quantidade quando ele pedir claramente mais unidades.",
     "14. Nunca chame chamar_atendente sem o cliente pedir para falar com uma pessoa.",
     "15. Só diga 'mais um'/'mais uma' se o item já estava no CARRINHO antes. Carrinho vazio = primeiro item.",
@@ -691,7 +719,7 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
       const responses: GeminiPart[] = [];
       for (const part of calls) {
         const call = part.functionCall!;
-        const result = await runTool(call.name, call.args || {}, { p, state, catalog, flags });
+        const result = await runTool(call.name, call.args || {}, { p, state, catalog, flags, turnText: text });
         p.logger.info({ sessionId: p.sessionId, tool: call.name, ok: !("erro" in result) }, "[Atendente] Ferramenta");
         responses.push({ functionResponse: { name: call.name, response: result } });
       }
@@ -727,6 +755,12 @@ async function processTurn(p: AtendenteParams, session: Session, text: string): 
     state.awaitingConfirm = true;
     // Texto da IA antes do resumo sem perguntas soltas (a pergunta final é a confirmação).
     const intro = lead.split("\n").filter((line) => !/\?\s*$/.test(line.trim())).join("\n").trim();
+    // Mesmo resumo da última mensagem: não manda o bloco repetido de novo.
+    const sameSummary = clean(flags.summary, 1500);
+    if (sameSummary && lastBot.includes(sameSummary)) {
+      await reply("O resumo está logo acima 👆 Posso confirmar o seu pedido?");
+      return;
+    }
     await reply((intro ? intro + "\n\n" : "") + flags.summary);
     return;
   }

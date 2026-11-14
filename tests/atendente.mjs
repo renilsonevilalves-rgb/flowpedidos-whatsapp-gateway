@@ -741,3 +741,41 @@ test("com itens, pergunta de taxa não vira link de endereço", async () => {
   assert.equal(lastFunctionResponses()[0].response.erro, "sem_itens");
   assert.doesNotMatch(r.last, /\/e\//);
 });
+
+test("vídeo 13/11: IA repetindo adicionar_item de mensagens anteriores não dobra a quantidade", async () => {
+  resetWorld();
+  const c = customer("5531990000099");
+  world.script.push([call("adicionar_item", { produto: "x salada" })], [say("Anotado! Quer bebida?")]);
+  await c.send("1 x salada");
+  // A IA reenvia o x salada junto com a coca (bug do vídeo): o x salada não pode virar 2.
+  world.script.push([call("adicionar_item", { produto: "x salada" }), call("adicionar_item", { produto: "coca 2l", quantidade: 2 })],
+    (body) => {
+      const res = body.contents[body.contents.length - 1].parts.map((p) => p.functionResponse?.response);
+      assert.equal(res[0].erro, "ja_no_carrinho");
+      return [say("✅ 2 Coca cola 2L adicionadas!")];
+    });
+  await c.send("Pode ser a de 2 litros");
+  const state = (await getSession(SID, "5531990000099@s.whatsapp.net")).state;
+  assert.deepEqual(state.items.map((i) => i.productId + ":" + i.quantity), ["x-sal:1", "c-2l:2"]);
+  // Correção do cliente nunca soma.
+  world.script.push([call("adicionar_item", { produto: "x salada" })], [say("Certo!")]);
+  await c.send("Eu pedi somente 1 x salada");
+  assert.equal(state.items.find((i) => i.productId === "x-sal").quantity, 1);
+  // Pedido claro de mais uma unidade continua funcionando.
+  world.script.push([call("adicionar_item", { produto: "x salada" })], [say("✅ Mais 1 X- Salada!")]);
+  await c.send("me vê mais um x salada");
+  assert.equal(state.items.find((i) => i.productId === "x-sal").quantity, 2);
+});
+
+test("vídeo 13/11: resumo idêntico ao último não é enviado duas vezes", async () => {
+  resetWorld();
+  const c = customer("5531990000098");
+  world.script.push([call("adicionar_item", { produto: "coca 2l" }), call("definir_entrega", { tipo: "retirada" }), call("definir_pagamento", { forma: "pix" }), call("gerar_resumo")]);
+  let r = await c.send("uma coca 2l pra retirar, pago no pix");
+  assert.match(r.last, /Resumo do seu pedido/);
+  world.script.push([call("gerar_resumo")]);
+  r = await c.send("uma coca 2l pra retirar, pago no pix");
+  assert.equal(r.replies.length, 1);
+  assert.doesNotMatch(r.last, /Resumo do seu pedido/);
+  assert.match(r.last, /Posso confirmar o seu pedido\?/);
+});
