@@ -45,3 +45,16 @@ oficiais do backend e só grava depois do "sim" do cliente ao resumo mais recent
 - Pedidos já feitos (acompanhar, alterar, cancelar) continuam no atendimento atual.
 - Opcionais: `ATENDENTE_DEBOUNCE_MS` (junta mensagens seguidas, padrão 1500), `ATENDENTE_STATE_TTL_MINUTES` (padrão 180).
 - Testes: `tests/atendente.mjs`.
+
+## Saúde da conexão (src/connectionHealth.ts)
+Evita a conexão "zumbi" (loja aparece conectada, mas o WhatsApp para de entregar mensagens).
+- Ao reconectar, o WhatsApp entrega as pendências em lotes; o gateway pede o próximo lote sempre que o anterior termina,
+  até a sincronização concluir. Sem isso, lojas com mais de 100 pendências ficavam sem receber nada.
+- Se a sincronização não terminar em 3 min, ou se uma mensagem recebida não for processada em 2 min, a loja é
+  reconectada sozinha (com espera crescente se travar de novo). Lojas sem movimento nunca são reconectadas à toa.
+- Mensagens que o cliente mandou durante quedas/reinícios (até 15 min) agora são respondidas; se a loja já respondeu
+  pelo celular nesse meio-tempo, o robô fica pausado para aquele cliente.
+- Opcionais: `WHATSAPP_HEALTH_WATCHDOG=false` desliga a vigilância; `WHATSAPP_REPLY_OFFLINE_MESSAGES=false` não responde
+  mensagens da queda; `WHATSAPP_OFFLINE_REPLY_MAX_AGE_MINUTES` (padrão 15); `WHATSAPP_HEALTH_OFFLINE_DEADLINE_MS`
+  (padrão 180000); `WHATSAPP_HEALTH_INBOUND_STALL_MS` (padrão 120000).
+- Logs: `[Health]` e `[Offline]`. Testes: `tests/connection-health.mjs`.
